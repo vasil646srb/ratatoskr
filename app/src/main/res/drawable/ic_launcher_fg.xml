@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- A tree of three linked nodes. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path android:strokeColor="#FFFFFF" android:strokeWidth="4" android:strokeLineCap="round"
+        android:pathData="M54,36 L38,68 M54,36 L70,68 M38,68 L70,68" />
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M54,29a7,7 0 1,0 0.01,0z M38,61a7,7 0 1,0 0.01,0z M70,61a7,7 0 1,0 0.01,0z" />
+</vector>

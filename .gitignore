@@ -1,0 +1,13 @@
+# build outputs
+/app/build/
+/build/
+.gradle/
+local.properties
+/app/src/main/jniLibs/
+target/
+# release files (attach to GitHub releases instead)
+*.apk
+/yggproxy-*
+# keys
+*.key
+*.keystore

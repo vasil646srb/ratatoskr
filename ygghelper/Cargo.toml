@@ -1,0 +1,29 @@
+[package]
+name = "ygghelper"
+version = "0.1.0"
+edition = "2024"
+description = "YggProxy helper: SOCKS5 + udpgw exit (server) and tun2proxy VPN side (client)"
+license = "MIT"
+
+[[bin]]
+name = "ygghelper"
+path = "src/main.rs"
+
+[dependencies]
+tun2proxy = { version = "=0.8.7", default-features = false, features = ["udpgw"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+tokio-util = "0.7"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+# used by the vendored udpgw server
+socks5-impl = { version = "0.10", default-features = false, features = ["tokio"] }
+nix = { version = "0.31", features = ["socket"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = 3

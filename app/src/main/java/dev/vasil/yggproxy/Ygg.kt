@@ -1,0 +1,294 @@
+package dev.vasil.yggproxy
+
+import org.json.JSONObject
+import java.io.File
+import java.io.InputStream
+import java.net.Inet6Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.URL
+import javax.net.ssl.HttpsURLConnection
+
+object Ygg {
+    // Local ports, all on 127.0.0.1.
+    const val CLIENT_SOCKS = 10808     // tcp_node --connect 10808:[server]:PORT
+    const val EXIT_SOCKS = 10800       // ygghelper server, exposed as --forward PORT:10800
+    const val UDPGW = 7300             // udpgw on the exit node (as seen by its SOCKS server)
+    const val SPEEDTEST = 7301         // speed test on the exit node (ygghelper server --speedtest)
+    const val API = 19080              // tcp_node --api
+    const val HTML_PORT = 1081         // tcp_node overlay status page (kept off the proxy port)
+
+    const val PUBLIC_PEERS_URL = "https://publicpeers.neilalexander.dev/publicnodes.json"
+
+    private val HEX64 = Regex("^[0-9a-fA-F]{64}$")
+    fun isKey(s: String) = HEX64.matches(s)
+
+    /** Yggdrasil address of a public key (yggdrasil-go address.AddrForKey). */
+    fun addrForKey(hex: String): Inet6Address {
+        val key = ByteArray(32) { hex.substring(it * 2, it * 2 + 2).toInt(16).toByte() }
+        val buf = ByteArray(32) { (key[it].toInt() xor 0xff).toByte() }
+        val temp = ArrayList<Byte>()
+        var done = false
+        var ones = 0
+        var bits = 0
+        var nBits = 0
+        for (idx in 0 until 256) {
+            val bit = (buf[idx / 8].toInt() shr (7 - idx % 8)) and 1
+            if (!done && bit != 0) { ones++; continue }
+            if (!done && bit == 0) { done = true; continue }
+            bits = ((bits shl 1) or bit) and 0xff
+            if (++nBits == 8) { nBits = 0; temp.add(bits.toByte()) }
+        }
+        val a = ByteArray(16)
+        a[0] = 0x02
+        a[1] = ones.toByte()
+        for (i in 0 until minOf(14, temp.size)) a[2 + i] = temp[i]
+        return InetAddress.getByAddress(a) as Inet6Address
+    }
+
+    fun isYgg(a: Inet6Address) = (a.address[0].toInt() and 0xfe) == 0x02
+
+    /** `addr`, `[addr]`, `[addr]:port` or a 64-hex key → (address, port or null). */
+    fun parseServer(input: String): Pair<Inet6Address, Int?>? {
+        val s = input.trim()
+        if (isKey(s)) return addrForKey(s) to null
+        var host = s
+        var port: Int? = null
+        if (s.startsWith("[")) {
+            val end = s.indexOf(']')
+            if (end < 0) return null
+            host = s.substring(1, end)
+            val rest = s.substring(end + 1)
+            if (rest.startsWith(":")) port = rest.substring(1).toIntOrNull() ?: return null
+        }
+        if (!host.contains(':') || !host.all { it.isLetterOrDigit() || it == ':' }) return null
+        val a = try { InetAddress.getByName(host) } catch (e: Exception) { return null }
+        if (a !is Inet6Address || !isYgg(a)) return null
+        return a to port
+    }
+
+    /** Overlay port of the proxy, the same on every server (not the common SOCKS 1080). */
+    const val PORT = 27080
+
+    /** Quick-connect link shown as a QR code: yggproxy://c?a=ADDR (the port is always [PORT]). */
+    fun connectLink(addr: String) = "yggproxy://c?a=$addr"
+
+    /** Server from a scanned QR / opened link: the yggproxy:// link, `[addr]:port`, `addr` or a key. */
+    fun serverFromText(text: String): String? {
+        val t = text.trim()
+        if (t.startsWith("yggproxy:", ignoreCase = true)) {
+            val u = android.net.Uri.parse(t)
+            val a = u.getQueryParameter("a") ?: return null
+            return parseServer(a)?.let { fmtAddr(it.first) }
+        }
+        return parseServer(t)?.let { fmtAddr(it.first) }
+    }
+
+    fun fmtAddr(a: Inet6Address): String = a.hostAddress!!.substringBefore('%').replace(Regex("(^|:)0+([0-9a-f])"), "$1$2")
+
+    fun human(b: Long): String = when {
+        b < 1024 -> "$b B"
+        b < 1024 * 1024 -> "%.1f KB".format(b / 1024.0)
+        b < 1024L * 1024 * 1024 -> "%.1f MB".format(b / 1048576.0)
+        else -> "%.2f GB".format(b / 1073741824.0)
+    }
+
+    fun dur(s: Long): String = when {
+        s < 60 -> "${s}с"
+        s < 3600 -> "${s / 60}м ${s % 60}с"
+        s < 86400 -> "${s / 3600}ч ${s % 3600 / 60}м"
+        else -> "${s / 86400}д ${s % 86400 / 3600}ч"
+    }
+
+    /** GET /api/stats from tcp_node (raw HTTP: no cleartext policy involved). */
+    fun fetchStats(): JSONObject? = fetchJson("/api/stats")
+
+    /** GET /api/peers: connected peers with session traffic, rates and share of traffic now. */
+    fun fetchPeers(): JSONObject? = fetchJson("/api/peers")
+
+    fun mbit(bytesPerSec: Long): String = when {
+        bytesPerSec < 125 -> "${bytesPerSec * 8} бит/с"
+        bytesPerSec < 125_000 -> "%.1f кбит/с".format(bytesPerSec * 8 / 1000.0)
+        else -> "%.1f Мбит/с".format(bytesPerSec * 8 / 1_000_000.0)
+    }
+
+    private fun fetchJson(path: String): JSONObject? = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", API), 1000)
+            s.soTimeout = 2000
+            s.getOutputStream().write("GET $path HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".toByteArray())
+            val body = s.getInputStream().readBytes().toString(Charsets.UTF_8).substringAfter("\r\n\r\n", "")
+            if (body.isEmpty()) null else JSONObject(body)
+        }
+    } catch (e: Exception) { null }
+
+    private fun readN(i: InputStream, n: Int): ByteArray {
+        val b = ByteArray(n)
+        var off = 0
+        while (off < n) {
+            val r = i.read(b, off, n - off)
+            if (r < 0) throw java.io.EOFException()
+            off += r
+        }
+        return b
+    }
+
+    /** SOCKS5 greeting through the client tunnel: proves the overlay path to the exit. ms or null. */
+    fun probeExit(): Long? = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", CLIENT_SOCKS), 1000)
+            s.soTimeout = 8000
+            val t0 = System.nanoTime()
+            s.getOutputStream().write(byteArrayOf(5, 1, 0))
+            val r = readN(s.getInputStream(), 2)
+            if (r[0].toInt() == 5 && r[1].toInt() == 0) (System.nanoTime() - t0) / 1_000_000 else null
+        }
+    } catch (e: Exception) { null }
+
+    /** Full check: CONNECT host:80 via the exit and fetch /generate_204. */
+    fun checkInternet(host: String = "cp.cloudflare.com"): String = try {
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", CLIENT_SOCKS), 1000)
+            s.soTimeout = 15000
+            val o = s.getOutputStream()
+            val i = s.getInputStream()
+            val t0 = System.nanoTime()
+            o.write(byteArrayOf(5, 1, 0))
+            val g = readN(i, 2)
+            if (g[1].toInt() != 0) return "сервер отверг приветствие SOCKS"
+            val tGreet = (System.nanoTime() - t0) / 1_000_000
+            val h = host.toByteArray()
+            o.write(byteArrayOf(5, 1, 0, 3, h.size.toByte()) + h + byteArrayOf(0, 80))
+            val rep = readN(i, 4)
+            if (rep[1].toInt() != 0) return "сервер: CONNECT отклонён (код ${rep[1]})"
+            when (rep[3].toInt()) { 1 -> readN(i, 6); 4 -> readN(i, 18); 3 -> readN(i, (i.read() and 0xff) + 2) }
+            o.write("GET /generate_204 HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n".toByteArray())
+            val status = i.bufferedReader().readLine() ?: return "нет ответа HTTP"
+            val tAll = (System.nanoTime() - t0) / 1_000_000
+            "OK: $status · рукопожатие $tGreet мс · всего $tAll мс"
+        }
+    } catch (e: Exception) { "нет связи: ${e.javaClass.simpleName} ${e.message ?: ""}" }
+
+    fun mbps(bytes: Long, ms: Long) = if (ms <= 0) 0.0 else bytes * 8.0 / ms / 1000.0
+
+    /**
+     * iperf-like test to the exit node through the client tunnel (SOCKS → Yggdrasil → server).
+     * `download`: the server sends for `secs`; else we send and the server reports what arrived.
+     * [progress] gets intermediate Mbit/s every ~0.5 s. Returns a one-line result.
+     */
+    fun speedTest(download: Boolean, secs: Int, progress: (Double) -> Unit): String {
+        val dir = if (download) "↓ приём" else "↑ отдача"
+        return try {
+            Socket().use { s ->
+                s.tcpNoDelay = true
+                s.connect(InetSocketAddress("127.0.0.1", CLIENT_SOCKS), 1000)
+                s.soTimeout = 15000
+                val o = s.getOutputStream()
+                val i = s.getInputStream()
+                o.write(byteArrayOf(5, 1, 0))
+                if (readN(i, 2)[1].toInt() != 0) return "$dir: сервер отверг SOCKS"
+                o.write(byteArrayOf(5, 1, 0, 1, 127, 0, 0, 1, (SPEEDTEST shr 8).toByte(), (SPEEDTEST and 0xff).toByte()))
+                val rep = readN(i, 10)
+                if (rep[1].toInt() != 0) return "$dir: сервер не поддерживает тест (код ${rep[1]}) — обновите приложение на сервере"
+                o.write(byteArrayOf((if (download) 'D' else 'U').code.toByte(), secs.toByte()))
+                o.flush()
+                if (download) download(i, secs, progress) else upload(s, secs, progress)
+            }.let { "$dir: $it" }
+        } catch (e: Exception) { "$dir: ошибка: ${e.javaClass.simpleName} ${e.message ?: ""}" }
+    }
+
+    private fun download(i: InputStream, secs: Int, progress: (Double) -> Unit): String {
+        val buf = ByteArray(64 * 1024)
+        var total = 0L
+        var t0 = 0L
+        var lastTick = 0L
+        var lastBytes = 0L
+        while (true) {
+            val n = i.read(buf)
+            if (n < 0) break
+            val now = System.nanoTime()
+            if (t0 == 0L) { t0 = now; lastTick = now }
+            total += n
+            if (now - lastTick >= 500_000_000L) {
+                progress(mbps(total - lastBytes, (now - lastTick) / 1_000_000))
+                lastTick = now; lastBytes = total
+            }
+        }
+        if (total == 0L) return "нет данных"
+        val ms = (System.nanoTime() - t0) / 1_000_000
+        return "%.1f Мбит/с · %s за %.1f с".format(mbps(total, ms), human(total), ms / 1000.0)
+    }
+
+    private fun upload(s: Socket, secs: Int, progress: (Double) -> Unit): String {
+        val o = s.getOutputStream()
+        val i = s.getInputStream()
+        // The server answers after `secs` from our first byte: read that on a side thread
+        // and keep sending until it arrives.
+        val report = java.util.concurrent.atomic.AtomicReference<ByteArray?>(null)
+        val failure = java.util.concurrent.atomic.AtomicReference<Exception?>(null)
+        s.soTimeout = (secs + 20) * 1000
+        val reader = Thread {
+            try { report.set(readN(i, 16)) } catch (e: Exception) { failure.set(e) }
+        }.apply { isDaemon = true; start() }
+        val buf = ByteArray(64 * 1024)
+        val t0 = System.nanoTime()
+        var sent = 0L
+        var lastTick = t0
+        var lastSent = 0L
+        val deadline = t0 + (secs + 20) * 1_000_000_000L
+        try {
+            while (report.get() == null && failure.get() == null && System.nanoTime() < deadline) {
+                o.write(buf)
+                sent += buf.size
+                val now = System.nanoTime()
+                if (now - lastTick >= 500_000_000L) {
+                    progress(mbps(sent - lastSent, (now - lastTick) / 1_000_000))
+                    lastTick = now; lastSent = sent
+                }
+            }
+        } catch (e: Exception) {
+            // The server closing after its report can break our last write.
+        }
+        reader.join(5000)
+        val r = report.get() ?: return "нет отчёта сервера" + (failure.get()?.let { ": ${it.message}" } ?: "")
+        val bb = java.nio.ByteBuffer.wrap(r)
+        val bytes = bb.long
+        val ms = bb.long
+        return "%.1f Мбит/с · %s за %.1f с".format(mbps(bytes, ms), human(bytes), ms / 1000.0)
+    }
+
+    /** Download the public peer list into `dst` (atomic). */
+    fun downloadPeers(dst: File) {
+        val c = URL(PUBLIC_PEERS_URL).openConnection() as HttpsURLConnection
+        c.connectTimeout = 15000
+        c.readTimeout = 30000
+        try {
+            if (c.responseCode != 200) throw IllegalStateException("HTTP ${c.responseCode}")
+            val body = c.inputStream.readBytes()
+            val text = String(body, Charsets.UTF_8)
+            if (!text.trimStart().startsWith("{") || !(text.contains("tls://") || text.contains("tcp://")))
+                throw IllegalStateException("неожиданный формат списка")
+            val tmp = File(dst.path + ".tmp")
+            tmp.writeBytes(body)
+            if (!tmp.renameTo(dst)) throw IllegalStateException("rename")
+        } finally { c.disconnect() }
+    }
+
+    private fun jsonStr(s: String) = JSONObject.quote(s)
+
+    /** tcp_node --peers file: custom peers plus the cached public list (scanner ignores structure). */
+    fun writePeerFile(dst: File, custom: List<String>, publicList: File?) {
+        val sb = StringBuilder("{\"custom\":{")
+        custom.forEachIndexed { i, u ->
+            if (i > 0) sb.append(',')
+            sb.append(jsonStr(u)).append(":{\"up\":true}")
+        }
+        sb.append('}')
+        if (publicList != null && publicList.isFile && publicList.length() > 2) {
+            sb.append(",\"public\":").append(publicList.readText())
+        }
+        sb.append('}')
+        dst.writeText(sb.toString())
+    }
+}

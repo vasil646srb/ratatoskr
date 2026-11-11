@@ -1,0 +1,551 @@
+//! Desktop window (egui): the same tabs as the Android app, talking to the yggproxy service.
+
+use crate::api::{self, dur, human, limit_text, mbit};
+use crate::config::{self, Config};
+use eframe::egui;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+#[derive(Default)]
+struct Data {
+    status: Option<Value>,
+    error: Option<String>,
+    logs: Vec<String>,
+    log_seq: u64,
+    toast: Option<(String, Instant)>,
+    speed: Vec<String>,
+    speed_running: bool,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Client,
+    Server,
+    Network,
+    Status,
+    Logs,
+}
+
+struct App {
+    data: Arc<Mutex<Data>>,
+    tab: Tab,
+    /// Editable copy of the settings (loaded from the service).
+    cfg: Option<Config>,
+    peers_text: String,
+    lim: [String; 4],
+    qr: Option<(String, egui::TextureHandle)>,
+    peer_detail: Option<Value>,
+    /// YGGPROXY_SHOT=DIR (development aid): screenshot every tab into DIR/*.ppm, then quit.
+    shot: Option<(String, usize, Instant)>,
+}
+
+fn poller(data: Arc<Mutex<Data>>, ctx: egui::Context) {
+    loop {
+        let st = api::status();
+        let since = data.lock().unwrap().log_seq;
+        let logs = api::request(json!({"cmd": "logs", "since": since}));
+        {
+            let mut d = data.lock().unwrap();
+            match st {
+                Ok(s) => {
+                    d.status = Some(s);
+                    d.error = None;
+                }
+                Err(e) => {
+                    d.status = None;
+                    d.error = Some(e);
+                }
+            }
+            if let Ok(l) = logs {
+                for x in l["lines"].as_array().into_iter().flatten() {
+                    d.logs.push(x.as_str().unwrap_or("").to_string());
+                }
+                if d.logs.len() > 3000 {
+                    let n = d.logs.len() - 3000;
+                    d.logs.drain(..n);
+                }
+                d.log_seq = l["seq"].as_u64().unwrap_or(d.log_seq);
+            }
+        }
+        ctx.request_repaint();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn mbit_field(kbit: u64) -> String {
+    if kbit % 1000 == 0 { (kbit / 1000).to_string() } else { format!("{:.1}", kbit as f64 / 1000.0) }
+}
+
+fn parse_mbit(s: &str) -> u64 {
+    (s.trim().replace(',', ".").parse::<f64>().unwrap_or(0.0).max(0.0) * 1000.0).round() as u64
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext) -> Self {
+        let data = Arc::new(Mutex::new(Data::default()));
+        let (d, ctx) = (data.clone(), cc.egui_ctx.clone());
+        std::thread::spawn(move || poller(d, ctx));
+        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None,
+            shot: std::env::var("YGGPROXY_SHOT").ok().map(|d| (d, 0, Instant::now())) };
+        app.reload_config();
+        app
+    }
+
+    fn reload_config(&mut self) {
+        if let Ok(c) = api::config() {
+            self.peers_text = c.network.peers.join("\n");
+            let l = c.server.limits;
+            self.lim = [l.total_down, l.total_up, l.client_down, l.client_up].map(mbit_field);
+            if c.server.enabled || c.client.enabled {
+                self.tab = Tab::Status;
+            }
+            self.cfg = Some(c);
+        }
+    }
+
+    fn toast(&self, msg: impl Into<String>) {
+        self.data.lock().unwrap().toast = Some((msg.into(), Instant::now()));
+    }
+
+    /// Send the edited settings to the service (off the UI thread).
+    fn apply(&mut self, msg: &'static str) {
+        let Some(c) = self.cfg.clone() else { return };
+        let data = self.data.clone();
+        std::thread::spawn(move || {
+            let t = match api::set(&c) {
+                Ok(()) => msg.to_string(),
+                Err(e) => format!("Ошибка: {e}"),
+            };
+            data.lock().unwrap().toast = Some((t, Instant::now()));
+        });
+    }
+
+    fn client_tab(&mut self, ui: &mut egui::Ui, st: Option<&Value>) {
+        ui.heading("Клиент: интернет через Yggdrasil");
+        ui.label("Весь трафик компьютера идёт через туннель и Yggdrasil на сервер выхода.");
+        let Some(c) = self.cfg.as_mut() else { return };
+        ui.add_space(6.0);
+        ui.label("Адрес сервера выхода (200:… или ссылка yggproxy://c?a=…):");
+        ui.add(egui::TextEdit::singleline(&mut c.client.server).desired_width(f32::INFINITY).hint_text("200:…"));
+        ui.checkbox(&mut c.client.udp, "UDP через udpgw (QUIC, игры, звонки)");
+        ui.checkbox(&mut c.client.ipv6, "IPv6-сайты через сервер");
+        ui.add_space(6.0);
+        let on = c.client.enabled;
+        if ui.add_sized([220.0, 32.0], egui::Button::new(if on { "Отключить VPN" } else { "Подключить VPN" })).clicked() {
+            if on {
+                c.client.enabled = false;
+                self.apply("VPN выключен");
+            } else if let Some(a) = config::parse_server(&c.client.server) {
+                c.client.server = a.to_string();
+                c.client.enabled = true;
+                self.apply("Подключаюсь…");
+            } else {
+                self.toast("Адрес сервера: IPv6 из 200::/7, например 200:…");
+            }
+        }
+        if let Some(s) = st {
+            let cl = &s["client"];
+            ui.add_space(6.0);
+            ui.monospace(if cl["enabled"].as_bool() != Some(true) {
+                "VPN выключен".to_string()
+            } else {
+                format!(
+                    "VPN {} → {}\n↓ {}  ↑ {}\nпинг до сервера: {}",
+                    if cl["active"].as_bool() == Some(true) { "работает" } else { "запускается…" },
+                    cl["server"].as_str().unwrap_or(""),
+                    human(cl["rx"].as_u64().unwrap_or(0)),
+                    human(cl["tx"].as_u64().unwrap_or(0)),
+                    cl["server_rtt"].as_str().unwrap_or("измеряю…")
+                )
+            });
+        }
+        ui.separator();
+        ui.heading("Тест скорости до сервера (iperf)");
+        let running = self.data.lock().unwrap().speed_running;
+        if ui.add_enabled(!running, egui::Button::new("Запустить тест (10 с приём, 10 с отдача)")).clicked() {
+            let data = self.data.clone();
+            {
+                let mut d = data.lock().unwrap();
+                d.speed_running = true;
+                d.speed.clear();
+            }
+            std::thread::spawn(move || {
+                for down in [true, false] {
+                    let dir = if down { "↓ приём" } else { "↑ отдача" };
+                    let idx = {
+                        let mut d = data.lock().unwrap();
+                        d.speed.push(format!("{dir}: …"));
+                        d.speed.len() - 1
+                    };
+                    let d2 = data.clone();
+                    let mut prog = move |v: f64| d2.lock().unwrap().speed[idx] = format!("{dir}: {v:.1} Мбит/с …");
+                    let r = api::speed_test(down, 10, &mut prog).unwrap_or_else(|e| format!("ошибка: {e}"));
+                    data.lock().unwrap().speed[idx] = format!("{dir}: {r}");
+                }
+                data.lock().unwrap().speed_running = false;
+            });
+        }
+        for l in self.data.lock().unwrap().speed.iter() {
+            ui.monospace(l);
+        }
+    }
+
+    fn server_tab(&mut self, ui: &mut egui::Ui, st: Option<&Value>) {
+        ui.heading("Сервер выхода");
+        ui.label(format!(
+            "Компьютер раздаёт свой интернет любому узлу Yggdrasil, который знает адрес, без ключей (порт {} у всех серверов одинаковый). Локальные сети закрыты.",
+            config::PORT
+        ));
+        let addr = st.and_then(|s| s["node"]["address"].as_str()).map(String::from);
+        if let Some(a) = &addr {
+            let link = config::connect_link(a);
+            if self.qr.as_ref().map(|q| &q.0) != Some(&link) {
+                if let Some((m, w)) = api::qr(&link) {
+                    let q = 2;
+                    let side = w + 2 * q;
+                    let mut px = vec![255u8; side * side];
+                    for y in 0..w {
+                        for x in 0..w {
+                            if m[y * w + x] {
+                                px[(y + q) * side + x + q] = 0;
+                            }
+                        }
+                    }
+                    let img = egui::ColorImage::from_gray([side, side], &px);
+                    self.qr = Some((link.clone(), ui.ctx().load_texture("qr", img, egui::TextureOptions::NEAREST)));
+                }
+            }
+            ui.add_space(4.0);
+            ui.monospace(format!("Адрес для клиентов: {a}"));
+            if let Some((_, tex)) = &self.qr {
+                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(220.0, 220.0)));
+            }
+            ui.horizontal(|ui| {
+                if ui.button("Копировать адрес").clicked() {
+                    ui.ctx().copy_text(a.clone());
+                    self.toast("Скопировано");
+                }
+                if ui.button("Копировать ссылку").clicked() {
+                    ui.ctx().copy_text(link.clone());
+                    self.toast("Скопировано");
+                }
+            });
+        } else {
+            ui.monospace("Адрес появится после запуска узла.");
+        }
+        let Some(c) = self.cfg.as_mut() else { return };
+        ui.checkbox(&mut c.server.allow_lan, "Разрешить клиентам доступ в мою LAN");
+        let on = c.server.enabled;
+        if ui.add_sized([220.0, 32.0], egui::Button::new(if on { "Остановить сервер" } else { "Запустить сервер" })).clicked() {
+            c.server.enabled = !on;
+            self.apply(if on { "Сервер остановлен" } else { "Сервер запускается" });
+        }
+        if let Some(s) = st.filter(|_| on) {
+            let sv = &s["server"];
+            ui.monospace(format!(
+                "{} · соединений {} (всего {}, отказов {})\nотдано {} · принято {}",
+                if sv["active"].as_bool() == Some(true) { "Работает" } else { "Запускается…" },
+                sv["active_conns"],
+                sv["total"],
+                sv["denied"],
+                human(sv["tx"].as_u64().unwrap_or(0)),
+                human(sv["rx"].as_u64().unwrap_or(0))
+            ));
+        }
+        ui.separator();
+        ui.heading("Ограничение скорости, Мбит/с (0 — без ограничения)");
+        egui::Grid::new("limits").num_columns(3).show(ui, |ui| {
+            ui.label("");
+            ui.label("к клиентам");
+            ui.label("от клиентов");
+            ui.end_row();
+            ui.label("Весь сервер");
+            ui.add(egui::TextEdit::singleline(&mut self.lim[0]).desired_width(80.0));
+            ui.add(egui::TextEdit::singleline(&mut self.lim[1]).desired_width(80.0));
+            ui.end_row();
+            ui.label("Каждый клиент");
+            ui.add(egui::TextEdit::singleline(&mut self.lim[2]).desired_width(80.0));
+            ui.add(egui::TextEdit::singleline(&mut self.lim[3]).desired_width(80.0));
+            ui.end_row();
+        });
+        if ui.button("Применить ограничения").clicked() {
+            if let Some(c) = self.cfg.as_mut() {
+                let l = &mut c.server.limits;
+                [l.total_down, l.total_up, l.client_down, l.client_up] = [0, 1, 2, 3].map(|i| parse_mbit(&self.lim[i]));
+            }
+            self.apply("Ограничения применены (без обрыва соединений)");
+        }
+        ui.separator();
+        ui.heading("Клиенты");
+        let list = st.and_then(|s| s["server"]["clients"].as_array().cloned()).unwrap_or_default();
+        if list.is_empty() {
+            ui.label("нет подключённых клиентов");
+        }
+        for cl in list {
+            ui.monospace(format!(
+                "{}\n  соединений {} · отдано ↓ {} · принято ↑ {}",
+                cl["address"].as_str().unwrap_or(""),
+                cl["active"],
+                human(cl["tx"].as_u64().unwrap_or(0)),
+                human(cl["rx"].as_u64().unwrap_or(0))
+            ));
+        }
+    }
+
+    fn network_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Сеть Yggdrasil");
+        let Some(c) = self.cfg.as_mut() else { return };
+        let n = &mut c.network;
+        ui.checkbox(&mut n.public_peers, "Публичный список пиров (publicpeers.neilalexander.dev)");
+        ui.label("Свои пиры, по одному в строке (tls://host:port, tcp://…, ?key=…):");
+        ui.add(egui::TextEdit::multiline(&mut self.peers_text).desired_rows(4).desired_width(f32::INFINITY).code_editor());
+        egui::Grid::new("net").num_columns(2).show(ui, |ui| {
+            ui.label("Сколько пиров держать (1–32)");
+            ui.add(egui::DragValue::new(&mut n.target).range(1..=32));
+            ui.end_row();
+            ui.label("Менять пиров, пока пинг до сервера выше, мс");
+            ui.add(egui::DragValue::new(&mut n.rtt_limit).range(10..=5000));
+            ui.end_row();
+            ui.label("Пауза между заменами пиров, с");
+            ui.add(egui::DragValue::new(&mut n.swap_interval).range(5..=3600));
+            ui.end_row();
+            ui.label("Сколько проверять нового пира до решения, с");
+            ui.add(egui::DragValue::new(&mut n.swap_settle).range(10..=3600));
+            ui.end_row();
+            ui.label("Слотов для LAN-пиров (0 = как выше)");
+            ui.add(egui::DragValue::new(&mut n.lan_target).range(0..=32));
+            ui.end_row();
+        });
+        ui.checkbox(&mut n.lan_discovery, "Искать пиры в локальной сети (yggdrasil-go, TLS)");
+        ui.label("Доп. аргументы tcp_node (для отладки):");
+        ui.text_edit_singleline(&mut n.extra_args);
+        ui.label("Узел пингует сервер каждые 10 с. Пока пинг выше порога, он заменяет самого медленного пира и проверяет нового заданное время; если пинг не упал хотя бы на 10 %, следующая замена ждёт вдвое дольше (до 10 мин).");
+        ui.horizontal(|ui| {
+            if ui.button("Сохранить и применить").clicked() {
+                if let Some(c) = self.cfg.as_mut() {
+                    c.network.peers = self.peers_text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                }
+                self.apply("Сохранено");
+            }
+            if ui.button("Обновить публичный список").clicked() {
+                let data = self.data.clone();
+                std::thread::spawn(move || {
+                    let t = api::request(json!({"cmd": "refresh_peers"})).map(|_| "Список обновляется".to_string()).unwrap_or_else(|e| e);
+                    data.lock().unwrap().toast = Some((t, Instant::now()));
+                });
+            }
+        });
+    }
+
+    fn status_tab(&mut self, ui: &mut egui::Ui, st: Option<&Value>) {
+        ui.heading("Статус");
+        let Some(s) = st else { return };
+        let n = &s["node"];
+        let mut t = format!("Узел Yggdrasil: {}\n", if n["running"].as_bool() == Some(true) { "работает" } else { "не запущен" });
+        if let Some(stats) = n["stats"].as_object() {
+            let nn = &stats["node"];
+            let (key, root) = (nn["public_key"].as_str().unwrap_or(""), nn["root"].as_str().unwrap_or(""));
+            let up = nn["peers_up"].as_u64().unwrap_or(0);
+            t += &format!(
+                "Сеть: {}\nАдрес:  {}\nКлюч:   {}\nКорень: {}…\nАптайм: {}\nПиров: {} · сессий {} · путей {}\n",
+                if up == 0 { "нет пиров ✖" } else if root == key { "только свой корень ⚠" } else { "подключено ✔" },
+                nn["address"].as_str().unwrap_or(""),
+                key,
+                root.get(..16).unwrap_or(root),
+                dur(stats.get("uptime_s").and_then(|v| v.as_u64()).unwrap_or(0)),
+                up,
+                nn["sessions"],
+                nn["paths"]
+            );
+        }
+        if let Some(l) = n["lan"].as_str() {
+            t += &format!("Поиск в LAN: {l}\n");
+        }
+        let c = &s["client"];
+        if c["enabled"].as_bool() == Some(true) {
+            t += &format!(
+                "\nVPN: {} → {}\nПинг до сервера: {}\n",
+                if c["active"].as_bool() == Some(true) { "работает" } else { "запускается" },
+                c["server"].as_str().unwrap_or(""),
+                c["server_rtt"].as_str().unwrap_or("измеряю…")
+            );
+            if let Some(sw) = c["last_swap"].as_str() {
+                t += &format!("Замена пира: {sw}\n");
+            }
+        }
+        let sv = &s["server"];
+        if sv["enabled"].as_bool() == Some(true) {
+            let l = &sv["limits"];
+            t += &format!(
+                "\nСервер выхода: {} · клиентов {}\nОграничения: сервер ↓ {} ↑ {} · клиент ↓ {} ↑ {}\n",
+                if sv["active"].as_bool() == Some(true) { "работает" } else { "запускается" },
+                sv["clients"].as_array().map(|a| a.len()).unwrap_or(0),
+                limit_text(l["total_down"].as_u64().unwrap_or(0)),
+                limit_text(l["total_up"].as_u64().unwrap_or(0)),
+                limit_text(l["client_down"].as_u64().unwrap_or(0)),
+                limit_text(l["client_up"].as_u64().unwrap_or(0))
+            );
+        }
+        if let Some(e) = s["last_error"].as_str() {
+            t += &format!("\nПоследняя ошибка: {e}\n");
+        }
+        ui.monospace(t);
+        ui.separator();
+        ui.heading("Пиры");
+        ui.label("Нажмите на пира — подробности. ★ — через него сейчас идёт больше всего трафика.");
+        let peers = &n["peers"];
+        ui.monospace(format!("Всего сейчас: ↓ {}  ↑ {}", mbit(peers["rx_bps"].as_u64().unwrap_or(0)), mbit(peers["tx_bps"].as_u64().unwrap_or(0))));
+        let list = peers["peers"].as_array().cloned().unwrap_or_default();
+        let busiest = list.iter().map(|p| p["rx_bps"].as_u64().unwrap_or(0) + p["tx_bps"].as_u64().unwrap_or(0)).max().unwrap_or(0);
+        for p in list {
+            let rate = p["rx_bps"].as_u64().unwrap_or(0) + p["tx_bps"].as_u64().unwrap_or(0);
+            let host = p["uri"].as_str().filter(|u| !u.is_empty()).map(|u| u.split("://").nth(1).unwrap_or(u).split('?').next().unwrap_or(u).to_string())
+                .unwrap_or_else(|| format!("входящий {}", p["address"].as_str().unwrap_or("")));
+            let text = format!(
+                "{} {host}  {}\n    ↓ {}  ↑ {}  · {} %",
+                if rate == busiest && rate > 500 { "★" } else { " " },
+                p["rtt_ms"].as_u64().map(|r| format!("{r} мс")).unwrap_or_default(),
+                mbit(p["rx_bps"].as_u64().unwrap_or(0)),
+                mbit(p["tx_bps"].as_u64().unwrap_or(0)),
+                p["share"]
+            );
+            if ui.add(egui::Button::new(egui::RichText::new(text).monospace()).frame(false)).clicked() {
+                self.peer_detail = Some(p.clone());
+            }
+        }
+    }
+
+    fn logs_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Копировать").clicked() {
+                ui.ctx().copy_text(self.data.lock().unwrap().logs.join("\n"));
+                self.toast("Скопировано");
+            }
+            if ui.button("Очистить").clicked() {
+                self.data.lock().unwrap().logs.clear();
+                let _ = api::request(json!({"cmd": "clear_logs"}));
+            }
+        });
+        let logs = self.data.lock().unwrap().logs.join("\n");
+        egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(logs).monospace().size(11.5)).wrap());
+        });
+    }
+}
+
+impl App {
+    fn shot_step(&mut self, ctx: &egui::Context) {
+        const TABS: [(Tab, &str); 5] = [(Tab::Client, "client"), (Tab::Server, "server"), (Tab::Network, "network"), (Tab::Status, "status"), (Tab::Logs, "logs")];
+        let Some((dir, i, at)) = self.shot.clone() else { return };
+        let got = ctx.input(|inp| {
+            inp.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = got {
+            let [w, h] = img.size;
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for p in &img.pixels {
+                out.extend_from_slice(&[p.r(), p.g(), p.b()]);
+            }
+            let _ = std::fs::write(format!("{dir}/{}.ppm", TABS[i].1), out);
+            if i + 1 == TABS.len() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            self.shot = Some((dir, i + 1, Instant::now()));
+        } else if i < TABS.len() && at.elapsed() > Duration::from_secs(if i == 0 { 4 } else { 1 }) {
+            self.tab = TABS[i].0;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            self.shot = Some((dir, i, Instant::now() + Duration::from_secs(3600)));
+        }
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.shot_step(ctx);
+        let (status, error, toast) = {
+            let d = self.data.lock().unwrap();
+            (d.status.clone(), d.error.clone(), d.toast.clone())
+        };
+        if self.cfg.is_none() && status.is_some() {
+            self.reload_config();
+        }
+        egui::TopBottomPanel::bottom("tabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (t, name) in [(Tab::Client, "Клиент"), (Tab::Server, "Сервер"), (Tab::Network, "Сеть"), (Tab::Status, "Статус"), (Tab::Logs, "Логи")] {
+                    if ui.selectable_label(self.tab == t, egui::RichText::new(name).size(16.0)).clicked() {
+                        self.tab = t;
+                    }
+                }
+            });
+        });
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if let Some(e) = &error {
+                ui.colored_label(egui::Color32::from_rgb(200, 60, 40), e);
+                if ui.button("Установить и запустить службу (pkexec)").clicked() {
+                    if let Ok(me) = std::env::current_exe() {
+                        let _ = std::process::Command::new("pkexec").arg(me).arg("install").spawn();
+                    }
+                }
+                ui.separator();
+            }
+            if self.tab == Tab::Logs {
+                self.logs_tab(ui);
+                return;
+            }
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
+                Tab::Client => self.client_tab(ui, status.as_ref()),
+                Tab::Server => self.server_tab(ui, status.as_ref()),
+                Tab::Network => self.network_tab(ui),
+                Tab::Status => self.status_tab(ui, status.as_ref()),
+                Tab::Logs => {}
+            });
+        });
+        if let Some(p) = self.peer_detail.clone() {
+            let mut open = true;
+            egui::Window::new("Пир").open(&mut open).collapsible(false).show(ctx, |ui| {
+                ui.monospace(format!(
+                    "Адрес пира: {}\nНаправление: {}{}\nПинг: {}\nСессия: {}\n\nСейчас: ↓ {}  ↑ {}\nДоля трафика узла: {} %\nЗа сессию: ↓ {}  ↑ {}\n\nYggdrasil-адрес: {}\nКлюч: {}",
+                    p["uri"].as_str().filter(|u| !u.is_empty()).unwrap_or("входящее соединение"),
+                    if p["dir"].as_str() == Some("out") { "исходящий" } else { "входящий" },
+                    if p["lan"].as_bool() == Some(true) { " · найден в LAN" } else { "" },
+                    p["rtt_ms"].as_u64().map(|r| format!("{r} мс")).unwrap_or("—".into()),
+                    dur(p["up_s"].as_u64().unwrap_or(0)),
+                    mbit(p["rx_bps"].as_u64().unwrap_or(0)),
+                    mbit(p["tx_bps"].as_u64().unwrap_or(0)),
+                    p["share"],
+                    human(p["rx"].as_u64().unwrap_or(0)),
+                    human(p["tx"].as_u64().unwrap_or(0)),
+                    p["address"].as_str().unwrap_or(""),
+                    p["key"].as_str().unwrap_or("")
+                ));
+                if ui.button("Копировать адрес пира").clicked() {
+                    ui.ctx().copy_text(p["uri"].as_str().filter(|u| !u.is_empty()).or(p["address"].as_str()).unwrap_or("").to_string());
+                }
+            });
+            if !open {
+                self.peer_detail = None;
+            }
+        }
+        if let Some((t, at)) = toast {
+            if at.elapsed() < Duration::from_secs(3) {
+                egui::Area::new(egui::Id::new("toast")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -60.0]).show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(t));
+                });
+                ctx.request_repaint_after(Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+pub fn run() -> Result<(), String> {
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title("YggProxy").with_inner_size([560.0, 760.0]),
+        ..Default::default()
+    };
+    eframe::run_native("YggProxy", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| format!("окно: {e}"))
+}

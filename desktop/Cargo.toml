@@ -1,0 +1,24 @@
+[package]
+name = "yggproxy"
+version = "0.1.0"
+edition = "2024"
+description = "YggProxy for Linux: internet through Yggdrasil (VPN client, exit server, console and GUI)"
+license = "MIT"
+
+[features]
+default = ["gui"]
+# The desktop window (egui). Servers can build without it: cargo build --no-default-features
+gui = ["dep:eframe"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+qrcode = { version = "0.14", default-features = false }
+eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = 3
