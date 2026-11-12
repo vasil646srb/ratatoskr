@@ -67,7 +67,12 @@ Network, tracker settings and logs are on the "Настройки" tab.
 
 ### Linux
 
+Prebuilt files are in the [releases](https://github.com/vasil646srb/ratatoskr/releases/latest): the APK, a static
+server build (any Ubuntu/Debian x86_64) and the desktop build with a window.
+
 ```sh
+wget -O yggproxy https://github.com/vasil646srb/ratatoskr/releases/latest/download/yggproxy-server-linux-x86_64
+chmod +x yggproxy
 sudo ./yggproxy install             # systemd service, yggproxy group for control without sudo
 yggproxy server on                  # share the internet connection
 yggproxy qr                         # address and QR code for clients

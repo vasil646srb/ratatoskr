@@ -67,7 +67,12 @@ Ratatoskr превращает любой телефон или компьюте
 
 ### Linux
 
+Готовые файлы — в [релизах](https://github.com/vasil646srb/ratatoskr/releases/latest): APK, статическая
+серверная сборка (любая Ubuntu/Debian x86_64) и версия с окном.
+
 ```sh
+wget -O yggproxy https://github.com/vasil646srb/ratatoskr/releases/latest/download/yggproxy-server-linux-x86_64
+chmod +x yggproxy
 sudo ./yggproxy install             # служба systemd, группа yggproxy для управления без sudo
 yggproxy server on                  # раздавать интернет
 yggproxy qr                         # адрес и QR-код для клиента
