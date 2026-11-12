@@ -71,6 +71,9 @@ class YggService : VpnService() {
     private val ctlPath get() = File(filesDir, "tun.sock").path
     private val limitsFile get() = File(filesDir, "limits.txt")
     private val monitorsFile get() = File(filesDir, "monitors.txt")
+    /** The exit server for the node (`--connect-file`): re-read live, so no restart on a switch. */
+    private val connectFile get() = File(filesDir, "connect.txt")
+    private var lastTarget: String? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -164,7 +167,16 @@ class YggService : VpnService() {
         refreshPeers(force = false)
 
         // 1. Yggdrasil node.
-        val nodeCmd = nodeArgs(if (wantVpn) target else null, wantExit)
+        // The server goes to the node through a file: switching servers or turning the VPN on and
+        // off keeps the node, its peers and its paths.
+        val connectLine = if (wantVpn) "[${target!!.first}]:${target.second}" else ""
+        if (connectLine != lastTarget) {
+            try { connectFile.writeText(connectLine) } catch (e: Exception) { State.error("vpn", "connect.txt: ${e.message}") }
+            if (lastTarget != null) State.serverRtt = null
+            lastTarget = connectLine
+            if (wantVpn) State.log("vpn", "сервер выхода: ${target!!.first} (узел не перезапускается)")
+        }
+        val nodeCmd = nodeArgs(wantExit)
         if (node?.cmd != nodeCmd) {
             node?.stop("новые параметры узла")
             node = ManagedProcess("node", nodeCmd, filesDir,
@@ -201,7 +213,9 @@ class YggService : VpnService() {
 
         // 3. VPN.
         if (wantVpn) {
-            val sig = "${target!!.first}|${target.second}|${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}"
+            // The server is not part of it: a switch needs no new VPN interface.
+            val sig = "${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}"
+            State.vpnTarget = target!!.first
             if (vpnPfd == null || sig != vpnSig) {
                 stopVpn()
                 startVpn(target)
@@ -212,7 +226,7 @@ class YggService : VpnService() {
         }
     }
 
-    private fun nodeArgs(target: Pair<String, Int>?, exit: Boolean): List<String> = buildList {
+    private fun nodeArgs(exit: Boolean): List<String> = buildList {
         add("$bin/libtcp_node.so")
         add("--key"); add(keyFile.path)
         add("--peers"); add(peerFile.path)
@@ -230,11 +244,10 @@ class YggService : VpnService() {
             add("--lan-upstream")
             if (prefs.lanTarget > 0) { add("--lan-target"); add(prefs.lanTarget.toString()) }
         }
-        if (target != null) {
-            add("--connect"); add("${Ygg.CLIENT_SOCKS}:[${target.first}]:${target.second}")
-            // Peer search keeps replacing peers while the ping to the server is above this.
-            add("--rtt-limit"); add(prefs.rttLimit.toString())
-        }
+        // Client SOCKS -> the server in connect.txt (empty: no VPN, connections refused).
+        add("--connect-file"); add("${Ygg.CLIENT_SOCKS}:${connectFile.path}")
+        // Peer search keeps replacing peers while the ping to the server is above this.
+        add("--rtt-limit"); add(prefs.rttLimit.toString())
         if (exit) {
             val p = Ygg.PORT
             // Public exit: any Yggdrasil node may use the port, clients need only the address.

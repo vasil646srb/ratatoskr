@@ -368,21 +368,21 @@ class SimpleActivity : Activity() {
     }
 
     /**
-     * Make [server] the VPN's exit and wait until the service has restarted the node and the VPN
-     * for it (true), so nothing measured afterwards belongs to the previous server.
+     * Make [server] the VPN's exit and wait until the VPN points at it (true). The node is not
+     * restarted: it reads the server from a file, keeps its peers and paths, and closes the
+     * connections through the previous server, so nothing measured afterwards belongs to it.
      */
     private fun useServer(server: String): Boolean {
-        val t0 = System.currentTimeMillis()
-        val same = prefs.vpnEnabled && Ygg.serverFromText(prefs.server) == server && State.vpnActive
         prefs.addServer(server)
         prefs.server = server
         prefs.vpnEnabled = true
         YggService.send(this, YggService.ACTION_RECONCILE)
-        if (same) return true
-        return waitFor(60) {
+        val ok = waitFor(60) {
             val target = State.vpnTarget?.let { Ygg.serverFromText(it) }
-            if (target == server && State.vpnActive && State.nodeRunning && State.nodeStartedAt >= t0) true else null
-        } ?: false
+            if (target == server && State.vpnActive) true else null
+        } != null
+        pause(1500) // the node re-reads the server file twice a second
+        return ok
     }
 
     // ------------------------------------------------------------------------------- helpers

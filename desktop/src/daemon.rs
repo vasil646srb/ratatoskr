@@ -606,7 +606,8 @@ fn vpn_down(st: &Shared, v: Vpn) {
 }
 
 fn vpn_sig(cfg: &Config) -> String {
-    format!("{}|{}|{}", cfg.client.server, cfg.client.udp, cfg.client.ipv6)
+    // The server is not part of it: the node switches servers by itself (connect.txt).
+    format!("{}|{}", cfg.client.udp, cfg.client.ipv6)
 }
 
 fn helper_line(st: &Shared, tag: &str, l: &str) {
@@ -701,16 +702,18 @@ impl Daemon {
                 a.extend(["--lan-target".into(), n.lan_target.to_string()]);
             }
         }
-        if client {
-            a.extend([
-                "--connect".into(),
-                format!("{}:[{}]:{}", config::CLIENT_SOCKS, cfg.client.server, config::PORT),
-                "--rtt-limit".into(),
-                n.rtt_limit.clamp(10, 5000).to_string(),
-                "--fwmark".into(),
-                format!("0x{:x}", config::FWMARK),
-            ]);
-        }
+        // The client's server comes from connect.txt (re-read live): switching servers or turning
+        // the VPN on and off keeps the node with its peers and paths. The fwmark (Windows: peer
+        // sockets on the default-route interface) is always on, so the VPN needs no restart either.
+        let _ = client;
+        a.extend([
+            "--connect-file".into(),
+            format!("{}:{}", config::CLIENT_SOCKS, d.join("connect.txt").display()),
+            "--rtt-limit".into(),
+            n.rtt_limit.clamp(10, 5000).to_string(),
+            "--fwmark".into(),
+            format!("0x{:x}", config::FWMARK),
+        ]);
         if cfg.server.enabled {
             let p = config::PORT.to_string();
             a.extend([
@@ -734,6 +737,15 @@ impl Daemon {
         let any = client || cfg.server.enabled || cfg.network.keep_node;
 
         write_monitors(&self.st, &self.dir, cfg);
+        let line = if client { format!("[{}]:{}", cfg.client.server.trim(), config::PORT) } else { String::new() };
+        let p = self.dir.join("connect.txt");
+        if std::fs::read_to_string(&p).ok().as_deref() != Some(line.as_str()) {
+            let _ = std::fs::write(&p, &line);
+            if client {
+                log(&self.st, "vpn", &format!("сервер выхода: {} (узел не перезапускается)", cfg.client.server));
+                self.st.lock().unwrap().server_rtt = None;
+            }
+        }
 
         // 1. Node.
         if any {
