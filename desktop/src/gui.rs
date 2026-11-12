@@ -489,6 +489,13 @@ impl App {
         if let Some(l) = n["lan"].as_str() {
             t += &format!("Поиск в LAN: {l}\n");
         }
+        let tp = crate::api::tracker_pings(s);
+        if !tp.is_empty() {
+            t += "\nТрекеры (пинг узла каждые 10 с):\n";
+            for (a, l, avg) in tp {
+                t += &format!("  {a}  {}\n", crate::api::ping_text(l, avg));
+            }
+        }
         let c = &s["client"];
         if c["enabled"].as_bool() == Some(true) {
             t += &format!(

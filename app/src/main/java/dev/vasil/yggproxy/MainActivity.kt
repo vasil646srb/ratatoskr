@@ -842,6 +842,20 @@ class MainActivity : Activity() {
                     else -> "✖ " + State.lanStatus
                 }).append('\n')
             sb.append("Пиров: ").append(peersUp).append(" · сессий ").append(n.optInt("sessions")).append(" · путей ").append(n.optInt("paths")).append('\n')
+            if (prefs.useTrackers) {
+                // The node pings every tracker every 10 s (that also keeps the route warm).
+                val byAddr = HashMap<String, JSONObject>()
+                lastRtt?.optJSONArray("servers")?.let { a ->
+                    for (k in 0 until a.length()) a.getJSONObject(k).let { o -> Ygg.serverFromText(o.optString("address"))?.let { byAddr[it] = o } }
+                }
+                sb.append("\nТрекеры (пинг узла):\n")
+                for (t in prefs.trackerList().mapNotNull { Ygg.serverFromText(it) }.distinct()) {
+                    val o = byAddr[t]
+                    sb.append("  ").append(t).append("  ").append(
+                        if (o == null || o.isNull("rtt_ms")) "нет ответа" else "${o.optLong("rtt_ms")} мс (сред. ${o.optLong("avg_ms")} мс)"
+                    ).append('\n')
+                }
+            }
         } else if (State.address != null) {
             sb.append("Адрес:  ").append(State.address).append('\n')
         }

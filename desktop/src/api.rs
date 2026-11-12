@@ -46,6 +46,35 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Result<Config, String> {
     Ok(c)
 }
 
+/// Trackers with the node's ping to them: (address, last ms, average ms). Empty when trackers
+/// are off. The node pings every tracker every 10 s, which also keeps the route to it warm.
+pub fn tracker_pings(s: &Value) -> Vec<(String, Option<u64>, Option<u64>)> {
+    if s["trackers"]["enabled"].as_bool() != Some(true) {
+        return Vec::new();
+    }
+    let saved: Vec<String> = s["trackers"]["list"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
+    let rtt = s["rtt"]["servers"].as_array().cloned().unwrap_or_default();
+    let mut out: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
+    for t in crate::tracker::with_defaults(&saved) {
+        let Some(a) = config::parse_server(&t) else { continue };
+        if out.iter().any(|o| o.0 == a.to_string()) {
+            continue;
+        }
+        let e = rtt.iter().find(|e| e["address"].as_str().and_then(config::parse_server) == Some(a));
+        out.push((a.to_string(), e.and_then(|e| e["rtt_ms"].as_u64()), e.and_then(|e| e["avg_ms"].as_u64())));
+    }
+    out
+}
+
+/// "N мс (сред. M мс)" or "нет ответа".
+pub fn ping_text(last: Option<u64>, avg: Option<u64>) -> String {
+    match (last, avg) {
+        (Some(l), Some(a)) => format!("{l} мс (сред. {a} мс)"),
+        (Some(l), None) => format!("{l} мс"),
+        _ => "нет ответа".into(),
+    }
+}
+
 pub fn human(b: u64) -> String {
     match b {
         b if b < 1024 => format!("{b} B"),

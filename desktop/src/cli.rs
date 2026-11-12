@@ -84,6 +84,13 @@ fn status() -> Result<(), String> {
     if let Some(l) = n["lan"].as_str() {
         println!("  поиск в LAN: {l}");
     }
+    let tp = api::tracker_pings(&s);
+    if !tp.is_empty() {
+        println!("Трекеры (пинг узла):");
+        for (a, l, avg) in tp {
+            println!("  {a}  {}", api::ping_text(l, avg));
+        }
+    }
     let sv = &s["server"];
     if sv["enabled"].as_bool() == Some(true) {
         println!(
