@@ -341,7 +341,7 @@ class MainActivity : Activity() {
         addView(label("Слотов для LAN-пиров (0 = как выше)"))
         etLanTarget = edit("0", prefs.lanTarget.toString(), number = true).also { addView(it) }
         addView(label("Клиент: менять пиров, пока пинг до сервера выше, мс (10–5000)"))
-        etRttLimit = edit("100", prefs.rttLimit.toString(), number = true).also { addView(it) }
+        etRttLimit = edit("250", prefs.rttLimit.toString(), number = true).also { addView(it) }
         addView(label("Пауза между заменами пиров, с (5–3600)"))
         etSwapInterval = edit("30", prefs.swapInterval.toString(), number = true).also { addView(it) }
         addView(label("Сколько проверять нового пира до решения, с (10–3600)"))
@@ -410,7 +410,7 @@ class MainActivity : Activity() {
         prefs.target = etTarget.text.toString().toIntOrNull() ?: 3
         prefs.lanDiscovery = cbLanDisc.isChecked
         prefs.lanTarget = etLanTarget.text.toString().toIntOrNull() ?: 0
-        prefs.rttLimit = etRttLimit.text.toString().toIntOrNull() ?: 100
+        prefs.rttLimit = etRttLimit.text.toString().toIntOrNull() ?: 250
         prefs.swapInterval = etSwapInterval.text.toString().toIntOrNull() ?: 30
         prefs.swapSettle = etSwapSettle.text.toString().toIntOrNull() ?: 60
         prefs.extraArgs = etExtra.text.toString()

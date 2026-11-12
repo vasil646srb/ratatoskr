@@ -88,6 +88,15 @@ class YggService : VpnService() {
     private val journalTimer = Executors.newSingleThreadScheduledExecutor()
     private val journal by lazy { PeerJournal(File(filesDir, "peer-journal.json")) }
     private val preferFile get() = File(filesDir, "prefer.txt")
+    private val searchFile get() = File(filesDir, "search.txt")
+
+    /** The trackers, for the node's peer search while no server is used (re-read live). */
+    private fun writeSearchFile() {
+        try {
+            val text = if (prefs.useTrackers) prefs.trackerList().joinToString("\n") else ""
+            if (!searchFile.exists() || searchFile.readText() != text) searchFile.writeText(text)
+        } catch (_: Exception) {}
+    }
     private var journalTicks = 0L
 
     /**
@@ -105,6 +114,7 @@ class YggService : VpnService() {
                 journalTicks++
                 if (journalTicks % 6 == 0L) {
                     journal.save()
+                    writeSearchFile() // trackers learned meanwhile
                     val tp = try { org.json.JSONObject(File(filesDir, "tracker-peers.json").readText()) } catch (_: Exception) { null }
                     val list = journal.preferList(if (prefs.useTrackers) tp else null).joinToString("\n")
                     if (!preferFile.exists() || preferFile.readText() != list) {
@@ -295,6 +305,9 @@ class YggService : VpnService() {
         add("--connect-file"); add("${Ygg.CLIENT_SOCKS}:${connectFile.path}")
         // Peers ranked by how well they carried our traffic and by the trackers (re-read live).
         add("--prefer-file"); add(preferFile.path)
+        // Without a server, peers are picked by the ping to the trackers (not the root).
+        writeSearchFile()
+        add("--search-file"); add(searchFile.path)
         // Peer search keeps replacing peers while the ping to the server is above this.
         add("--rtt-limit"); add(prefs.rttLimit.toString())
         if (exit) {

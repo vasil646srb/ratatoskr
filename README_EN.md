@@ -105,7 +105,7 @@ connections from any node and gives the proxy a PROXY v1 line with the client's 
 (verified against its key). Per-client limits and statistics are keyed on it.
 
 **Peer selection.** The client's node pings the server every 10 s. While the ping is above the
-threshold (100 ms by default) it replaces the slowest peer, measures the new one for a while and,
+threshold (250 ms by default) it replaces the slowest peer, measures the new one for a while and,
 if the swap did not help, waits twice as long before the next one. Threshold, pause and
 measuring time are configurable.
 

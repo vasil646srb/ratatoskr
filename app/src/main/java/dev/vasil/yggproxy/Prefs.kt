@@ -63,7 +63,8 @@ class Prefs(ctx: Context) {
     /** --lan-target: outbound slots for LAN peers; 0 = same as target. */
     var lanTarget: Int get() = i("lan_target", 0); set(v) = put { putInt("lan_target", v.coerceIn(0, 32)) }
     /** Client: tcp_node --rtt-limit, replace peers while the ping to the server is above this. */
-    var rttLimit: Int get() = i("rtt_limit", 100); set(v) = put { putInt("rtt_limit", v.coerceIn(10, 5000)) }
+    /** Peer search threshold: 250 ms (100 ms, the old default, swapped peers too eagerly). */
+    var rttLimit: Int get() = i("rtt_limit", 250).let { if (it == 100) 250 else it }; set(v) = put { putInt("rtt_limit", v.coerceIn(10, 5000)) }
     /** tcp_node --swap-interval: seconds between two peer replacements. */
     var swapInterval: Int get() = i("swap_interval", 30); set(v) = put { putInt("swap_interval", v.coerceIn(5, 3600)) }
     /** tcp_node --swap-settle: seconds a new peer is measured before the replacement is judged. */

@@ -290,6 +290,11 @@ fn write_monitors(st: &Shared, dir: &Path, cfg: &Config) {
     let mut seen = std::collections::HashSet::new();
     all.retain(|a| seen.insert(a.clone()));
     let _ = std::fs::write(dir.join("monitors.txt"), all.join("\n"));
+    // The trackers drive the peer search while no exit server is in use.
+    let search = if cfg.network.use_trackers { crate::tracker::with_defaults(&cfg.network.trackers).join("\n") } else { String::new() };
+    if std::fs::read_to_string(dir.join("search.txt")).ok().as_deref() != Some(search.as_str()) {
+        let _ = std::fs::write(dir.join("search.txt"), search);
+    }
 }
 
 /// Ask the trackers for exits and more trackers (and, hourly, checked public peers).
@@ -767,6 +772,9 @@ impl Daemon {
             // Peers ranked by how well they carried our traffic (and by the trackers' reports).
             "--prefer-file".into(),
             d.join("prefer.txt").display().to_string(),
+            // Without a server, peers are picked by the ping to the trackers (not the root).
+            "--search-file".into(),
+            d.join("search.txt").display().to_string(),
             "--rtt-limit".into(),
             n.rtt_limit.clamp(10, 5000).to_string(),
             "--fwmark".into(),

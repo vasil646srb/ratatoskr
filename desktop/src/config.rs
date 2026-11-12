@@ -137,7 +137,7 @@ impl Default for Network {
             target: 3,
             lan_discovery: true,
             lan_target: 0,
-            rtt_limit: 100,
+            rtt_limit: 250,
             swap_interval: 30,
             swap_settle: 60,
             extra_args: String::new(),
@@ -158,7 +158,12 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Config {
-        std::fs::read_to_string(config_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+        let mut c: Config = std::fs::read_to_string(config_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        // 100 ms was the old default: it swapped peers too eagerly on longer paths.
+        if c.network.rtt_limit == 100 {
+            c.network.rtt_limit = 250;
+        }
+        c
     }
 
     pub fn save(&self) -> std::io::Result<()> {
