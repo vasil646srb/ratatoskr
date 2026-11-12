@@ -1,6 +1,6 @@
 [package]
 name = "yggproxy"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "YggProxy for Linux and Windows: internet through Yggdrasil (VPN client, exit server, console and GUI)"
 license = "MIT"
