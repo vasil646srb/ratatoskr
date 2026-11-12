@@ -19,7 +19,7 @@ object Ygg {
     const val NODE_SOCKS = 10810       // tcp_node --socks: SOCKS5 into Yggdrasil (tracker requests)
     const val TRACKER_PORT = 27081     // tracker API on the overlay
     /** Built-in tracker (the project's server); more are learned from its /trackers. */
-    val DEFAULT_TRACKERS = listOf("200:fbf3:4681:219d:8a88:4f:9770:ece5", "227:30c5:d080:c75f:9588:130b:f3f1:1fa8")
+    val DEFAULT_TRACKERS = listOf("200:379c:ac8b:ad9f:2fbd:c38c:4be:51a0")
     const val API = 19080              // tcp_node --api
     const val HTML_PORT = 1081         // tcp_node overlay status page (kept off the proxy port)
 

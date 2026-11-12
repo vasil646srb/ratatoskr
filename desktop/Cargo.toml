@@ -16,6 +16,11 @@ serde_json = "1"
 qrcode = { version = "0.14", default-features = false }
 # Public peer list download: HTTPS in-process (rustls + Mozilla roots), no curl/wget.
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+# Tracker: an embedded Yggdrasil node (yggdrasil-ng as a library, pinned) and a TCP stack of
+# its own on top of it, so the tracker needs no yggdrasil-go, TUN or root.
+yggdrasil = { git = "https://github.com/Revertron/Yggdrasil-ng", rev = "c3a3aa65e2eb14687f087adae9e0a35a7d7ce915", default-features = false }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv6", "socket-tcp"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

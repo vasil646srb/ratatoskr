@@ -14,6 +14,7 @@ mod install;
 mod install;
 mod platform;
 mod tracker;
+mod ygg_net;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

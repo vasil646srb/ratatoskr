@@ -109,8 +109,9 @@ threshold (100 ms by default) it replaces the slowest peer, measures the new one
 if the swap did not help, waits twice as long before the next one. Threshold, pause and
 measuring time are configurable.
 
-**Trackers.** A tracker runs next to a regular yggdrasil-go node. Using the admin API
-(`debug_remotegetpeers`) it crawls the whole network starting from its own peers and checks port
+**Trackers.** A tracker runs its own Yggdrasil node — [yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng)
+as a library, with a TCP stack of its own: no yggdrasil-go, TUN or root. With the remote getPeers
+request it crawls the whole network starting from its own peers and checks port
 27080 on every node (SOCKS5 plus an allowed CONNECT to the speed-test port, which is how a
 Ratatoskr exit is told apart from other proxies) and the tracker port 27081. The list is served
 over HTTP: `GET /exits`, `GET /trackers`, `GET /peers` (public peers checked by the tracker, so a

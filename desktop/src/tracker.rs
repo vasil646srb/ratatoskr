@@ -1,10 +1,11 @@
 //! `yggproxy tracker`: finds Ratatoskr exit nodes (and other trackers) in Yggdrasil and serves
 //! the list to clients.
 //!
-//! Runs next to a regular yggdrasil-go node (TUN + admin socket):
-//! - crawl: from our peers and tree, `debug_remotegetpeers` on every node, breadth first, so the
-//!   public peers and everything connected to them get visited;
-//! - probe: TCP to `[addr]:27080` through the TUN, a SOCKS5 greeting and a CONNECT to the exit's
+//! Runs its own Yggdrasil node (yggdrasil-ng as a library, see `ygg_net`): no yggdrasil-go, TUN or
+//! root needed, and it coexists with any other Yggdrasil node on the host.
+//! - crawl: from our peers and tree, the remote getPeers request on every node, breadth first, so
+//!   the public peers and everything connected to them get visited;
+//! - probe: TCP (our own stack) to `[addr]:27080`, a SOCKS5 greeting and a CONNECT to the exit's
 //!   speed-test port (only Ratatoskr exits allow that) — an exit; `[addr]:27081 /info` — a tracker;
 //! - sync: other trackers' lists are fetched and every entry is probed again before it is listed;
 //! - public peers: the public peer list (plus our own working peers), checked from here, served as
@@ -17,14 +18,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex};
+use crate::ygg_net::Net;
+use std::net::{Ipv6Addr, SocketAddr, TcpStream};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 /// Overlay port of the tracker API.
 pub const TRACKER_PORT: u16 = 27081;
 /// Built-in tracker(s): the project's own server; others are found and synced.
-pub const DEFAULT_TRACKERS: &[&str] = &["200:fbf3:4681:219d:8a88:4f:9770:ece5", "227:30c5:d080:c75f:9588:130b:f3f1:1fa8"];
+pub const DEFAULT_TRACKERS: &[&str] = &["200:379c:ac8b:ad9f:2fbd:c38c:4be:51a0"];
 
 /// `list` with the built-in trackers added (they are always asked, also on old configs).
 pub fn with_defaults(list: &[String]) -> Vec<String> {
@@ -42,7 +44,10 @@ pub fn with_defaults(list: &[String]) -> Vec<String> {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct TrackerConfig {
-    pub admin_socket: String,
+    /// Peers of the tracker's own node; empty = the fastest checked public peers.
+    pub node_peers: Vec<String>,
+    /// How many of the fastest public peers the node takes when `node_peers` is empty.
+    pub node_peer_count: usize,
     pub crawl_interval_min: u64,
     pub recheck_interval_min: u64,
     pub sync_interval_min: u64,
@@ -62,8 +67,8 @@ pub struct TrackerConfig {
 impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
-            // yggdrasil-go's AdminListen default: a unix socket on Linux, TCP on Windows.
-            admin_socket: if cfg!(windows) { "tcp://localhost:9001".into() } else { "/var/run/yggdrasil/yggdrasil.sock".into() },
+            node_peers: Vec::new(),
+            node_peer_count: 6,
             crawl_interval_min: 30,
             recheck_interval_min: 5,
             sync_interval_min: 5,
@@ -153,70 +158,38 @@ fn parse_hex_key(s: &str) -> Option<[u8; 32]> {
 }
 
 // ------------------------------------------------------------------------------------------
-// yggdrasil-go admin API
+// The tracker's own node
 
-fn admin(sock: &str, request: &str, args: Value) -> Result<Value, String> {
-    let req = json!({"request": request, "arguments": args, "keepalive": false});
-    let reader: Box<dyn std::io::Read> = if let Some(hp) = sock.strip_prefix("tcp://") {
-        let mut s = std::net::TcpStream::connect(hp).map_err(|e| format!("admin {hp}: {e}"))?;
-        s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-        s.write_all(req.to_string().as_bytes()).map_err(|e| e.to_string())?;
-        Box::new(s)
-    } else {
-        #[cfg(unix)]
-        {
-            let path = sock.strip_prefix("unix://").unwrap_or(sock);
-            let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("admin {path}: {e}"))?;
-            s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-            s.write_all(req.to_string().as_bytes()).map_err(|e| e.to_string())?;
-            Box::new(s)
-        }
-        #[cfg(windows)]
-        return Err(format!("admin {sock}: на Windows нужен tcp://адрес:порт (AdminListen yggdrasil-go)"));
-    };
-    let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader)).into_iter::<Value>();
-    let v = de.next().ok_or("admin: empty reply")?.map_err(|e| format!("admin: {e}"))?;
-    if v["status"].as_str() == Some("success") {
-        Ok(v["response"].clone())
-    } else {
-        Err(v["error"].as_str().unwrap_or("admin error").to_string())
-    }
+static NET: OnceLock<Arc<Net>> = OnceLock::new();
+
+fn net() -> &'static Arc<Net> {
+    NET.get().expect("tracker node not started")
 }
 
-/// Keys to start the crawl from: our peers and the known tree.
-fn seed_keys(sock: &str) -> Result<(String, Vec<String>), String> {
-    let me = admin(sock, "getself", json!({}))?;
-    let own = me["key"].as_str().unwrap_or("").to_string();
-    let mut keys = Vec::new();
-    if let Ok(p) = admin(sock, "getpeers", json!({})) {
-        for e in p["peers"].as_array().into_iter().flatten() {
-            if e["up"].as_bool() != Some(false) {
-                if let Some(k) = e["key"].as_str().filter(|k| k.len() == 64) {
-                    keys.push(k.to_string());
-                }
-            }
-        }
-    }
-    if let Ok(t) = admin(sock, "gettree", json!({})) {
-        for e in t["tree"].as_array().into_iter().flatten() {
-            if let Some(k) = e["key"].as_str().filter(|k| k.len() == 64) {
-                keys.push(k.to_string());
-            }
-        }
-    }
-    Ok((own, keys))
+/// yggdrasil-ng (c3a3aa6) panics on `tls://[IPv6]:port` (the SNI fallback cannot parse the
+/// bracketed host), so such peers are not given to the tracker's node.
+fn node_can_use(uri: &str) -> bool {
+    !(uri.starts_with("tls://[") || uri.starts_with("quic://["))
+}
+
+fn key_hex(k: &[u8; 32]) -> String {
+    k.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Breadth-first walk of the network with remote getPeers; returns every key seen.
 fn crawl(cfg: &TrackerConfig) -> Result<Vec<String>, String> {
-    let (own, seeds) = seed_keys(&cfg.admin_socket)?;
+    let seeds: Vec<String> = net().seed_keys().iter().map(key_hex).collect();
+    if seeds.is_empty() {
+        return Err("у узла трекера нет пиров".into());
+    }
+    let own = net().public_key_hex();
     let seen: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(seeds.iter().cloned().chain([own]).collect()));
     let queue: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(seeds.into_iter().collect()));
     let busy = Arc::new(Mutex::new(0usize));
     let t0 = Instant::now();
     let mut handles = Vec::new();
     for _ in 0..cfg.crawl_workers.max(1) {
-        let (seen, queue, busy, sock, max) = (seen.clone(), queue.clone(), busy.clone(), cfg.admin_socket.clone(), cfg.max_nodes);
+        let (seen, queue, busy, max) = (seen.clone(), queue.clone(), busy.clone(), cfg.max_nodes);
         handles.push(std::thread::spawn(move || loop {
             let next = {
                 let mut q = queue.lock().unwrap();
@@ -233,20 +206,14 @@ fn crawl(cfg: &TrackerConfig) -> Result<Vec<String>, String> {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             };
-            if let Ok(r) = admin(&sock, "debug_remotegetpeers", json!({"key": key})) {
-                let found: Vec<String> = r
-                    .as_object()
-                    .into_iter()
-                    .flat_map(|m| m.values())
-                    .flat_map(|v| v["keys"].as_array().cloned().unwrap_or_default())
-                    .filter_map(|k| k.as_str().map(String::from))
-                    .filter(|k| k.len() == 64)
-                    .collect();
-                let mut s = seen.lock().unwrap();
-                let mut q = queue.lock().unwrap();
-                for k in found {
-                    if s.len() < max && s.insert(k.clone()) {
-                        q.push_back(k);
+            if let Some(k) = parse_hex_key(&key) {
+                if let Ok(found) = net().remote_peers(k) {
+                    let mut s = seen.lock().unwrap();
+                    let mut q = queue.lock().unwrap();
+                    for k in found.iter().map(key_hex) {
+                        if s.len() < max && s.insert(k.clone()) {
+                            q.push_back(k);
+                        }
                     }
                 }
             }
@@ -262,15 +229,14 @@ fn crawl(cfg: &TrackerConfig) -> Result<Vec<String>, String> {
 }
 
 // ------------------------------------------------------------------------------------------
-// Probes (kernel TCP through the yggdrasil-go TUN)
+// Probes (TCP over the tracker's own node)
 
 /// A Ratatoskr exit: SOCKS5 on 27080 that lets us CONNECT to its speed-test port. Connect time (ms).
-pub fn probe_exit(addr: Ipv6Addr) -> Option<u64> {
-    let sa = SocketAddr::from((addr, config::PORT));
+fn probe_exit(addr: Ipv6Addr) -> Option<u64> {
     let t0 = Instant::now();
-    let mut s = TcpStream::connect_timeout(&sa, Duration::from_secs(5)).ok()?;
+    let mut s = net().connect(addr, config::PORT, Duration::from_secs(10)).ok()?;
     let rtt = t0.elapsed().as_millis() as u64;
-    s.set_read_timeout(Some(Duration::from_secs(10))).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10)));
     s.write_all(&[5, 1, 0]).ok()?;
     let mut b = [0u8; 10];
     s.read_exact(&mut b[..2]).ok()?;
@@ -284,8 +250,8 @@ pub fn probe_exit(addr: Ipv6Addr) -> Option<u64> {
 }
 
 fn http_get(addr: Ipv6Addr, port: u16, path: &str) -> Option<Value> {
-    let mut s = TcpStream::connect_timeout(&SocketAddr::from((addr, port)), Duration::from_secs(5)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    let mut s = net().connect(addr, port, Duration::from_secs(10)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(15)));
     s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{addr}]\r\n\r\n").as_bytes()).ok()?;
     let mut body = Vec::new();
     s.take(4 * 1024 * 1024).read_to_end(&mut body).ok()?;
@@ -481,14 +447,13 @@ fn refresh_peers(db: &Mutex<Db>, cfg: &TrackerConfig, others: &[Ipv6Addr]) {
             }
         }
     }
-    // Our own yggdrasil-go peers that are up work for sure.
-    if let Ok(p) = admin(&cfg.admin_socket, "getpeers", json!({})) {
-        for e in p["peers"].as_array().into_iter().flatten().filter(|e| e["up"].as_bool() == Some(true) && e["inbound"].as_bool() != Some(true)) {
-            if let (Some(u), Some(k)) = (e["remote"].as_str(), e["key"].as_str()) {
-                if u.starts_with("tcp://") || u.starts_with("tls://") {
-                    let full = if u.contains('?') { u.to_string() } else { format!("{u}?key={k}") };
-                    cands.push((full, k.into(), String::new(), "tracker".into()));
-                }
+    // Our own node's peers that are up work for sure.
+    if let Some(n) = NET.get() {
+        for p in n.peers().into_iter().filter(|p| p.up && !p.inbound) {
+            let k = key_hex(&p.key);
+            if p.uri.starts_with("tcp://") || p.uri.starts_with("tls://") {
+                let full = if p.uri.contains('?') { p.uri.clone() } else { format!("{}?key={k}", p.uri) };
+                cands.push((full, k, String::new(), "tracker".into()));
             }
         }
     }
@@ -539,15 +504,18 @@ fn list_json(map: &HashMap<String, Entry>, cfg: &TrackerConfig, key: &str) -> Va
     json!({"service": "ratatoskr-tracker", "port": config::PORT, key: items, "updated": now()})
 }
 
-fn serve(listener: TcpListener, db: Arc<Mutex<Db>>, cfg: TrackerConfig, me: Ipv6Addr) {
-    for conn in listener.incoming().flatten() {
+fn serve(listener: crate::ygg_net::NetListener, db: Arc<Mutex<Db>>, cfg: TrackerConfig, me: Ipv6Addr) {
+    while let Some(conn) = listener.accept() {
         let (db, cfg) = (db.clone(), cfg.clone());
         std::thread::spawn(move || {
             let mut c = conn;
-            let _ = c.set_read_timeout(Some(Duration::from_secs(10)));
+            c.set_read_timeout(Some(Duration::from_secs(10)));
             let mut line = String::new();
-            if BufReader::new(&c).take(4096).read_line(&mut line).is_err() {
-                return;
+            {
+                let mut r = BufReader::new(&mut c);
+                if (&mut r).take(4096).read_line(&mut line).is_err() {
+                    return;
+                }
             }
             let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
             let (status, body) = {
@@ -595,13 +563,35 @@ pub fn main() -> Result<(), String> {
         let _ = std::fs::write(tracker_config_path(), serde_json::to_string_pretty(&cfg).unwrap() + "\n");
     }
     let _ = std::fs::create_dir_all(config::state_dir());
-    let me_v = admin(&cfg.admin_socket, "getself", json!({}))
-        .map_err(|e| format!("нет доступа к yggdrasil-go ({e}): нужен запущенный yggdrasil и права на его admin-сокет"))?;
-    let me: Ipv6Addr = me_v["address"].as_str().and_then(|a| a.parse().ok()).ok_or("getself: нет адреса")?;
-    log(&format!("трекер {} на [{me}]:{TRACKER_PORT}, выходы ищутся на порту {}", env!("CARGO_PKG_VERSION"), config::PORT));
-
-    let listener = TcpListener::bind((me, TRACKER_PORT)).map_err(|e| format!("[{me}]:{TRACKER_PORT}: {e}"))?;
     let db = Arc::new(Mutex::new(Db::load()));
+
+    // The tracker's own node: configured peers, else the fastest checked public peers (checked
+    // right now when there are none yet).
+    let mut peers = cfg.node_peers.clone();
+    if peers.is_empty() {
+        if db.lock().unwrap().peers.is_empty() {
+            log("проверяю публичные пиры для узла трекера…");
+            refresh_peers(&db, &cfg, &[]);
+        }
+        peers = db.lock().unwrap().peers.iter().filter_map(|p| p["uri"].as_str().map(String::from)).filter(|u| node_can_use(u)).take(cfg.node_peer_count.max(1)).collect();
+    }
+    if peers.is_empty() {
+        return Err("нет пиров для узла трекера: задайте node_peers в tracker.json или проверьте доступ в интернет".into());
+    }
+    let n = Net::start(&config::state_dir().join("tracker-node.key"), peers.clone())?;
+    let me = n.address();
+    let _ = NET.set(n);
+    log(&format!("трекер {} на [{me}]:{TRACKER_PORT} (свой узел yggdrasil-ng, пиров {}), выходы ищутся на порту {}", env!("CARGO_PKG_VERSION"), peers.len(), config::PORT));
+    // The first crawl needs peers that are up.
+    for _ in 0..60 {
+        if net().peers().iter().any(|p| p.up) {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    log(&format!("пиров на связи: {}", net().peers().iter().filter(|p| p.up).count()));
+
+    let listener = net().listen(TRACKER_PORT).map_err(|e| format!("[{me}]:{TRACKER_PORT}: {e}"))?;
     {
         let (db, cfg) = (db.clone(), cfg.clone());
         std::thread::spawn(move || serve(listener, db, cfg, me));

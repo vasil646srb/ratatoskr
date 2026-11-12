@@ -90,8 +90,8 @@ pub fn install() -> Result<(), String> {
 const TRACKER_UNIT: &str = "/etc/systemd/system/yggproxy-tracker.service";
 const TRACKER_UNIT_TEXT: &str = "[Unit]
 Description=Ratatoskr tracker: finds Yggdrasil exit nodes and serves the list (port 27081)
-After=yggdrasil.service network-online.target
-Wants=yggdrasil.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 ExecStart=/usr/local/bin/yggproxy tracker
@@ -102,7 +102,7 @@ RestartSec=10
 WantedBy=multi-user.target
 ";
 
-/// `sudo yggproxy install-tracker`: the tracker service (needs yggdrasil-go on this host).
+/// `sudo yggproxy install-tracker`: the tracker service (it runs its own Yggdrasil node).
 pub fn install_tracker() -> Result<(), String> {
     need_root()?;
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -116,8 +116,8 @@ pub fn install_tracker() -> Result<(), String> {
     sh(&["systemctl", "enable", "yggproxy-tracker"])?;
     sh(&["systemctl", "restart", "yggproxy-tracker"])?;
     println!("Трекер установлен и запущен: journalctl -u yggproxy-tracker -f");
-    println!("Чтобы клиенты и другие трекеры его видели, откройте порт 27081 на интерфейсе Yggdrasil, например:");
-    println!("  sudo ufw allow in on tun0 to any port 27081 proto tcp");
+    println!("У трекера свой узел Yggdrasil (yggdrasil-ng): yggdrasil-go и открытые порты не нужны.");
+    println!("Его адрес — в журнале (строка «трекер … на [адрес]:27081») и в /var/lib/yggproxy/tracker-node.key (ключ).");
     Ok(())
 }
 

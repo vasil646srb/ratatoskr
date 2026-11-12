@@ -66,20 +66,23 @@ DNS — через systemd-resolved (`resolvectl dns yggproxy0 10.111.222.53`, �
 
 ## Трекер
 
-Трекер ищет серверы выхода Ratatoskr по всей сети Yggdrasil и раздаёт их список клиентам. Ему
-нужен обычный yggdrasil-go на той же машине (TUN и admin-сокет).
+Трекер ищет серверы выхода Ratatoskr по всей сети Yggdrasil и раздаёт их список клиентам. У него
+свой узел Yggdrasil — [yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng), встроенный как
+библиотека, и свой стек TCP (smoltcp): не нужны ни yggdrasil-go, ни TUN, ни открытые порты, а
+рядом может работать любой другой узел Yggdrasil. Ключ узла — `/var/lib/yggproxy/tracker-node.key`
+(адрес трекера от него и зависит), адрес печатается в журнале при старте.
 
 ```sh
 sudo yggproxy install-tracker                        # служба yggproxy-tracker
-sudo ufw allow in on tun0 to any port 27081 proto tcp   # чтобы трекер был виден из сети
 journalctl -u yggproxy-tracker -f
 yggproxy exits [ТРЕКЕР]                              # список серверов от трекера
 yggproxy trackers [ТРЕКЕР]                           # известные трекеры
 ```
 
-Как работает: через admin API (`debug_remotegetpeers`) обходит сеть от своих пиров, у каждого
-узла проверяет порт 27080 (SOCKS5 и CONNECT на порт теста скорости) и порт трекера 27081.
-API на `[адрес Yggdrasil]:27081`: `GET /exits`, `GET /trackers`, `GET /info`. Списки других
+Как работает: удалённым запросом getPeers (как `debug_remotegetpeers` в yggdrasil-go) обходит сеть
+от своих пиров, у каждого узла проверяет порт 27080 (SOCKS5 и CONNECT на порт теста скорости) и
+порт трекера 27081. API на `[адрес трекера]:27081`: `GET /exits`, `GET /trackers`, `GET /peers`,
+`GET /info`. Списки других
 трекеров забираются и перепроверяются. Настройки и расписание — `/etc/yggproxy/tracker.json`:
 
 | Ключ | По умолчанию | Что |
@@ -91,10 +94,13 @@ API на `[адрес Yggdrasil]:27081`: `GET /exits`, `GET /trackers`, `GET /in
 | `expire_hours` | 24 | сколько держать сервер, который не отвечает |
 | `crawl_workers` / `probe_workers` | 24 / 64 | параллельность обхода и проверки |
 | `trackers` | сервер проекта | с кого начинать синхронизацию |
+| `node_peers` | пусто | пиры узла трекера; пусто — самые быстрые из проверенных публичных |
+| `node_peer_count` | 6 | сколько быстрых публичных пиров брать |
 
-Если обход находит всего пару десятков узлов, у yggdrasil-go плохие пиры: удалённые запросы через
-них не проходят. Поменяйте `Peers` в `/etc/yggdrasil/yggdrasil.conf` на быстрые узлы из
-[публичного списка](https://publicpeers.neilalexander.dev/).
+Если обход находит всего пару десятков узлов, у узла трекера плохие пиры: удалённые запросы через
+них не проходят. Задайте `node_peers` вручную (быстрые узлы из
+[публичного списка](https://publicpeers.neilalexander.dev/)). Отладка сети узла:
+`YGGPROXY_NET_DEBUG=1 yggproxy tracker`.
 
 ## Windows
 
@@ -107,7 +113,7 @@ API на `[адрес Yggdrasil]:27081`: `GET /exits`, `GET /trackers`, `GET /in
 | программа | `/usr/local/bin/yggproxy` | `C:\Program Files\Ratatoskr\yggproxy.exe` (папка добавляется в PATH), ярлык в «Пуске» |
 | настройки и ключ | `/etc/yggproxy`, `/var/lib/yggproxy` | `C:\ProgramData\Ratatoskr` |
 | управление службой | unix-сокет, группа `yggproxy` | `127.0.0.1:27079` |
-| трекер | `sudo yggproxy install-tracker` | `yggproxy install-tracker` → служба **RatatoskrTracker**, порт 27081 открывается в брандмауэре; журнал `C:\ProgramData\Ratatoskr\state\tracker.log` |
+| трекер | `sudo yggproxy install-tracker` | `yggproxy install-tracker` → служба **RatatoskrTracker**; журнал `C:\ProgramData\Ratatoskr\state\tracker.log` |
 | удаление | `sudo yggproxy uninstall` | `yggproxy uninstall` |
 
 VPN на Windows: `ygghelper tun` создаёт адаптер Wintun `yggproxy0` (`wintun.dll` встроен в
@@ -116,9 +122,6 @@ VPN на Windows: `ygghelper tun` создаёт адаптер Wintun `yggproxy
 `8.8.8.8` (так узел получает настоящие адреса пиров). Соединения узла с пирами привязаны к
 интерфейсу основного маршрута (`IP_UNICAST_IF`) и идут мимо туннеля. Маршруты и DNS живут, пока
 жив адаптер: при выключении VPN или остановке службы они исчезают сами.
-
-Трекеру на Windows нужен yggdrasil-go: он обращается к его admin API по
-`tcp://localhost:9001` (`admin_socket` в `tracker.json`).
 
 Ограничения Windows-версии: программа не подписана (SmartScreen предупредит при первом
 запуске); DNS-запросы к серверу в локальной сети могут идти мимо туннеля; сервер выхода и VPN на

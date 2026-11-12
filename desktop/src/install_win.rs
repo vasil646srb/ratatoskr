@@ -165,12 +165,7 @@ pub fn install_tracker() -> Result<(), String> {
         stop_service(&m, TRACKER_SERVICE);
         let exe = copy_self()?;
         create_or_update(&m, TRACKER_SERVICE, "Ratatoskr tracker", "Ищет серверы выхода Ratatoskr в Yggdrasil и раздаёт их список (порт 27081)", "tracker-service", &exe)?;
-        let _ = command("netsh").args(["advfirewall", "firewall", "delete", "rule", "name=Ratatoskr tracker"]).status();
-        let _ = command("netsh")
-            .args(["advfirewall", "firewall", "add", "rule", "name=Ratatoskr tracker", "dir=in", "action=allow", "protocol=TCP", "localport=27081"])
-            .status();
-        println!("Трекер установлен и запущен (служба {TRACKER_SERVICE}); порт 27081 открыт в брандмауэре Windows.");
-        println!("Нужен yggdrasil-go с AdminListen tcp://localhost:9001 (так он настроен по умолчанию на Windows).");
+        println!("Трекер установлен и запущен (служба {TRACKER_SERVICE}). У него свой узел Yggdrasil: yggdrasil-go не нужен.");
         println!("Журнал: {}", crate::config::state_dir().join("tracker.log").display());
         Ok(())
     })();
