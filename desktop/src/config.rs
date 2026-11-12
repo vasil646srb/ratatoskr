@@ -11,6 +11,8 @@ pub const UDPGW: u16 = 7300;
 pub const SPEEDTEST: u16 = 7301;
 pub const API: u16 = 19080;
 pub const HTML_PORT: u16 = 1081;
+/// tcp_node --socks: local SOCKS5 into Yggdrasil (tracker requests).
+pub const NODE_SOCKS: u16 = 10810;
 /// SO_MARK of the node's peer connections; policy routing keeps them out of the VPN.
 pub const FWMARK: u32 = 0x2a7;
 /// Routing table of the VPN default route.

@@ -16,6 +16,10 @@ object Ygg {
     const val EXIT_SOCKS = 10800       // ygghelper server, exposed as --forward PORT:10800
     const val UDPGW = 7300             // udpgw on the exit node (as seen by its SOCKS server)
     const val SPEEDTEST = 7301         // speed test on the exit node (ygghelper server --speedtest)
+    const val NODE_SOCKS = 10810       // tcp_node --socks: SOCKS5 into Yggdrasil (tracker requests)
+    const val TRACKER_PORT = 27081     // tracker API on the overlay
+    /** Built-in tracker (the project's server); more are learned from its /trackers. */
+    val DEFAULT_TRACKERS = listOf("200:fbf3:4681:219d:8a88:4f:9770:ece5")
     const val API = 19080              // tcp_node --api
     const val HTML_PORT = 1081         // tcp_node overlay status page (kept off the proxy port)
 
@@ -103,6 +107,26 @@ object Ygg {
 
     /** GET /api/stats from tcp_node (raw HTTP: no cleartext policy involved). */
     fun fetchStats(): JSONObject? = fetchJson("/api/stats")
+
+    /** GET [tracker]:27081/PATH through tcp_node --socks (the app itself is outside the VPN). */
+    fun fetchTracker(tracker: String, path: String): JSONObject? = try {
+        val a = (InetAddress.getByName(tracker) as Inet6Address).address
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
+            s.soTimeout = 20000
+            val o = s.getOutputStream()
+            val i = s.getInputStream()
+            o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
+            o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((TRACKER_PORT shr 8).toByte(), (TRACKER_PORT and 0xff).toByte()))
+            if (readN(i, 22)[1].toInt() != 0) return null
+            o.write("GET $path HTTP/1.0\r\nHost: [$tracker]\r\n\r\n".toByteArray())
+            val body = i.readBytes().toString(Charsets.UTF_8).substringAfter("\r\n\r\n", "")
+            if (body.isEmpty()) null else JSONObject(body)
+        }
+    } catch (e: Exception) { null }
+
+    /** GET /api/rtt: ping to the saved servers (monitor list) and to the root. */
+    fun fetchRtt(): JSONObject? = fetchJson("/api/rtt")
 
     /** GET /api/peers: connected peers with session traffic, rates and share of traffic now. */
     fun fetchPeers(): JSONObject? = fetchJson("/api/peers")

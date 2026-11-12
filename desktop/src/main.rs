@@ -7,6 +7,7 @@ mod daemon;
 #[cfg(feature = "gui")]
 mod gui;
 mod install;
+mod tracker;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -15,6 +16,8 @@ fn main() {
     let res = match cmd {
         "daemon" => daemon::main(),
         "install" => install::install(),
+        "tracker" => tracker::main(),
+        "install-tracker" => install::install_tracker(),
         "uninstall" => install::uninstall(),
         "gui" => gui(),
         "version" | "--version" => {

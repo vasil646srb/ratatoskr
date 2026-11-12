@@ -19,6 +19,19 @@ class Prefs(ctx: Context) {
     var udp: Boolean get() = b("udp", true); set(v) = put { putBoolean("udp", v) }
     var ipv6: Boolean get() = b("ipv6", true); set(v) = put { putBoolean("ipv6", v) }
     var excludedApps: String get() = s("excluded", ""); set(v) = put { putString("excluded", v) }
+    /** Saved exit servers (Yggdrasil addresses, one per line); [server] is the selected one. */
+    var servers: String get() = s("servers", server); set(v) = put { putString("servers", v) }
+
+    /** Trackers to ask for exit servers (one per line); new ones are learned from their lists. */
+    var trackers: String get() = s("trackers", Ygg.DEFAULT_TRACKERS.joinToString("\n")); set(v) = put { putString("trackers", v) }
+    /** Keep the Yggdrasil node running in the background (pings servers and root) without VPN/server. */
+    var keepNode: Boolean get() = b("keep_node", true); set(v) = put { putBoolean("keep_node", v) }
+    var useTrackers: Boolean get() = b("use_trackers", true); set(v) = put { putBoolean("use_trackers", v) }
+    fun trackerList(): List<String> = trackers.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }.distinct()
+
+    fun serverList(): List<String> = servers.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    fun addServer(addr: String) { if (addr !in serverList()) servers = (serverList() + addr).joinToString("\n") }
+    fun removeServer(addr: String) { servers = serverList().filter { it != addr }.joinToString("\n") }
 
     // Exit server
     var serverEnabled: Boolean get() = b("srv", false); set(v) = put { putBoolean("srv", v) }

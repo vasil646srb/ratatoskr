@@ -491,6 +491,8 @@ impl Daemon {
             format!("127.0.0.1:{}", config::API),
             "--html-port".into(),
             config::HTML_PORT.to_string(),
+            "--socks".into(),
+            format!("127.0.0.1:{}", config::NODE_SOCKS),
         ];
         if n.lan_discovery {
             a.push("--lan-upstream".into());

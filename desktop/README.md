@@ -1,5 +1,7 @@
 # yggproxy для Linux
 
+[← Ratatoskr](../README.md)
+
 Один бинарник: служба (сервер выхода и VPN-клиент), консольные команды и окно (egui).
 `tcp_node` и `ygghelper` встроены в него и при запуске службы распаковываются в
 `/var/lib/yggproxy/bin`. Порт прокси в Yggdrasil у всех серверов один — **27080**, поэтому
@@ -54,6 +56,37 @@ DNS — через systemd-resolved (`resolvectl dns yggproxy0 10.111.222.53`, �
 
 Клиент сам ищет пиров с наименьшим пингом до сервера: `yggproxy set rtt_limit 100`,
 `swap_interval 30`, `swap_settle 60` (то же — вкладка «Сеть»).
+
+## Трекер
+
+Трекер ищет серверы выхода Ratatoskr по всей сети Yggdrasil и раздаёт их список клиентам. Ему
+нужен обычный yggdrasil-go на той же машине (TUN и admin-сокет).
+
+```sh
+sudo yggproxy install-tracker                        # служба yggproxy-tracker
+sudo ufw allow in on tun0 to any port 27081 proto tcp   # чтобы трекер был виден из сети
+journalctl -u yggproxy-tracker -f
+yggproxy exits [ТРЕКЕР]                              # список серверов от трекера
+yggproxy trackers [ТРЕКЕР]                           # известные трекеры
+```
+
+Как работает: через admin API (`debug_remotegetpeers`) обходит сеть от своих пиров, у каждого
+узла проверяет порт 27080 (SOCKS5 и CONNECT на порт теста скорости) и порт трекера 27081.
+API на `[адрес Yggdrasil]:27081`: `GET /exits`, `GET /trackers`, `GET /info`. Списки других
+трекеров забираются и перепроверяются. Настройки и расписание — `/etc/yggproxy/tracker.json`:
+
+| Ключ | По умолчанию | Что |
+|---|---|---|
+| `crawl_interval_min` | 30 | полный обход сети и проверка портов |
+| `recheck_interval_min` | 5 | перепроверка найденных серверов |
+| `sync_interval_min` | 5 | обмен списками с другими трекерами |
+| `expire_hours` | 24 | сколько держать сервер, который не отвечает |
+| `crawl_workers` / `probe_workers` | 24 / 64 | параллельность обхода и проверки |
+| `trackers` | сервер проекта | с кого начинать синхронизацию |
+
+Если обход находит всего пару десятков узлов, у yggdrasil-go плохие пиры: удалённые запросы через
+них не проходят. Поменяйте `Peers` в `/etc/yggdrasil/yggdrasil.conf` на быстрые узлы из
+[публичного списка](https://publicpeers.neilalexander.dev/).
 
 ## Сборка
 

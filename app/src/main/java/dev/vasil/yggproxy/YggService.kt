@@ -39,6 +39,9 @@ class YggService : VpnService() {
         private const val CHANNEL = "ygg"
         private const val PEERS_MAX_AGE = 6 * 3600 * 1000L
 
+        /** The running service (same process), for calls that must not start it. */
+        @Volatile var instance: YggService? = null
+
         fun send(ctx: Context, action: String) {
             val i = Intent(ctx, YggService::class.java).setAction(action)
             if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(i) else ctx.startService(i)
@@ -67,11 +70,13 @@ class YggService : VpnService() {
     private val peerFile get() = File(filesDir, "peers.json")
     private val ctlPath get() = File(filesDir, "tun.sock").path
     private val limitsFile get() = File(filesDir, "limits.txt")
+    private val monitorsFile get() = File(filesDir, "monitors.txt")
 
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
         State.serviceRunning = true
+        instance = this
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -79,7 +84,11 @@ class YggService : VpnService() {
         State.log("service", "команда: ${intent?.action?.substringAfterLast('.') ?: "перезапуск системой (START_STICKY)"}")
         when (intent?.action) {
             SERVICE_INTERFACE -> if (VpnService.prepare(this) == null) prefs.vpnEnabled = true // always-on VPN
-            ACTION_STOP -> { State.log("service", "«Остановить» в уведомлении"); prefs.vpnEnabled = false; prefs.serverEnabled = false }
+            ACTION_STOP -> {
+                State.log("service", "«Остановить» в уведомлении")
+                prefs.vpnEnabled = false; prefs.serverEnabled = false
+                State.stoppedByUser = true
+            }
             ACTION_REFRESH_PEERS -> exec.execute { refreshPeers(force = true); restartNode() }
         }
         exec.execute { reconcile() }
@@ -107,10 +116,16 @@ class YggService : VpnService() {
         stopAll("сервис завершён (onDestroy)")
         exec.shutdownNow()
         State.serviceRunning = false
+        instance = null
         super.onDestroy()
     }
 
     // ---------------------------------------------------------------------------------------
+
+    /** Re-apply the settings from the UI thread without (re)starting the service. */
+    fun requestReconcile() {
+        try { exec.execute { reconcile() } } catch (_: Exception) {}
+    }
 
     private fun reconcile() {
         try {
@@ -136,9 +151,11 @@ class YggService : VpnService() {
         val wantVpn = prefs.vpnEnabled && target != null
         val wantExit = prefs.serverEnabled
 
-        if (!wantVpn && !wantExit) {
+        // With the app on screen the node runs anyway: it pings the saved servers and the root.
+        val wantNode = State.uiVisible || (prefs.keepNode && !State.stoppedByUser)
+        if (!wantVpn && !wantExit && !wantNode) {
             State.log("service", "нет включённых ролей (VPN и сервер выключены) — сервис завершается")
-            stopAll("VPN и сервер выключены")
+            stopAll("VPN и сервер выключены, приложение закрыто")
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -205,6 +222,10 @@ class YggService : VpnService() {
         add("--swap-settle"); add(prefs.swapSettle.toString())
         add("--api"); add("127.0.0.1:${Ygg.API}")
         add("--html-port"); add(Ygg.HTML_PORT.toString())
+        // Ping list for the server list's ping column (re-read live, no restart on changes).
+        monitorsFile.writeText((prefs.serverList() + State.trackerExits.map { it.first }).distinct().joinToString("\n"))
+        add("--monitor-file"); add(monitorsFile.path)
+        add("--socks"); add("127.0.0.1:${Ygg.NODE_SOCKS}")
         if (prefs.lanDiscovery) {
             add("--lan-upstream")
             if (prefs.lanTarget > 0) { add("--lan-target"); add(prefs.lanTarget.toString()) }
@@ -466,6 +487,7 @@ class YggService : VpnService() {
         val parts = mutableListOf<String>()
         if (vpnPfd != null) parts += "VPN → ${State.vpnTarget}"
         if (exitProc != null) parts += "сервер выхода"
+        if (parts.isEmpty() && node != null) parts += "проверка серверов"
         if (parts.isEmpty()) return
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIF_ID, notification(parts.joinToString(" · ")))

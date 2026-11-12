@@ -26,6 +26,11 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy disconnect          отключиться
   yggproxy speedtest           тест скорости до сервера (10 с приём, 10 с отдача)
 
+Трекеры (поиск выходных серверов в сети Yggdrasil):
+  yggproxy exits [ТРЕКЕР]      список выходных серверов от трекера
+  yggproxy trackers [ТРЕКЕР]   известные трекеры
+  sudo yggproxy install-tracker  запустить трекер на этой машине (нужен yggdrasil-go)
+
 Общее:
   yggproxy status              состояние узла, сервера и VPN
   yggproxy peers               пиры Yggdrasil и трафик через них
@@ -230,6 +235,13 @@ fn set(key: &str, val: &str) -> Result<(), String> {
     Ok(())
 }
 
+struct SystemTimeNow;
+impl SystemTimeNow {
+    fn secs() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+    }
+}
+
 pub fn run(args: &[String]) -> Result<(), String> {
     let a = |i: usize| args.get(i);
     match a(0).map(|s| s.as_str()).unwrap_or("status") {
@@ -311,6 +323,19 @@ pub fn run(args: &[String]) -> Result<(), String> {
             (Some(k), Some(v)) => set(k, v),
             _ => Err("yggproxy set КЛЮЧ ЗНАЧЕНИЕ".into()),
         },
+        "exits" | "trackers" => {
+            let t = a(1).and_then(|s| config::parse_server(s)).or_else(|| crate::tracker::DEFAULT_TRACKERS[0].parse().ok()).unwrap();
+            let what = if a(0).map(|s| s.as_str()) == Some("exits") { "exits" } else { "trackers" };
+            let v = crate::tracker::fetch(t, &format!("/{what}"))?;
+            let list = v[what].as_array().cloned().unwrap_or_default();
+            println!("трекер {t}: {} {}", list.len(), if what == "exits" { "выходных серверов" } else { "трекеров" });
+            for e in list {
+                let ago = e["last_seen"].as_u64().map(|t| SystemTimeNow::secs().saturating_sub(t)).unwrap_or(0);
+                println!("  {}  {}  проверен {} назад", e["address"].as_str().unwrap_or("?"),
+                    e["rtt_ms"].as_u64().map(|r| format!("{r} мс")).unwrap_or_default(), dur(ago));
+            }
+            Ok(())
+        }
         "refresh-peers" => api::request(json!({"cmd": "refresh_peers"})).map(|_: Value| println!("список пиров обновляется, узел перезапустится")),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");

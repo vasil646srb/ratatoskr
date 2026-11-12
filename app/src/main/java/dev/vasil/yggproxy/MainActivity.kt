@@ -39,6 +39,7 @@ class MainActivity : Activity() {
 
     private val REQ_VPN = 10
     private val REQ_SCAN = 11
+    private val REQ_EXPORT = 12
     private lateinit var prefs: Prefs
     private val ui = Handler(Looper.getMainLooper())
     private val bg = Executors.newSingleThreadExecutor()
@@ -52,8 +53,12 @@ class MainActivity : Activity() {
     private lateinit var etServer: EditText
     private lateinit var cbUdp: CheckBox
     private lateinit var cbIpv6: CheckBox
-    private lateinit var etExcluded: EditText
     private lateinit var btnVpn: Button
+    private lateinit var btnApps: Button
+    private lateinit var serversBox: LinearLayout
+    private lateinit var tvRoot: TextView
+    private var serversSig: String? = null
+    @Volatile private var lastRtt: JSONObject? = null
     private lateinit var tvClientState: TextView
 
     // Server
@@ -81,6 +86,11 @@ class MainActivity : Activity() {
     private lateinit var etSwapInterval: EditText
     private lateinit var etSwapSettle: EditText
     private lateinit var etExtra: EditText
+    private lateinit var cbUseTrackers: CheckBox
+    private lateinit var cbKeepNode: CheckBox
+    private lateinit var etTrackers: EditText
+    private lateinit var tvTrackers: TextView
+    @Volatile private var trackerBusy = false
 
     // Status / logs
     private lateinit var tvStatus: TextView
@@ -90,6 +100,11 @@ class MainActivity : Activity() {
     @Volatile private var speedRunning = false
     private lateinit var tvLogs: TextView
     private lateinit var logScroll: ScrollView
+    // Settings page: 0 = network, 1 = logs
+    private var settingsSub = 0
+    private lateinit var netPage: View
+    private lateinit var logsPage: View
+    private val subButtons = mutableListOf<Button>()
 
     @Volatile private var lastStats: JSONObject? = null
     @Volatile private var lastPeers: JSONObject? = null
@@ -112,10 +127,9 @@ class MainActivity : Activity() {
 
         pages += scrollPage(buildClient())
         pages += scrollPage(buildServer())
-        pages += scrollPage(buildNetwork())
         pages += scrollPage(buildStatus())
-        pages += buildLogs()
-        listOf("Клиент", "Сервер", "Сеть", "Статус", "Логи").forEachIndexed { i, t ->
+        pages += buildSettings()
+        listOf("Клиент", "Сервер", "Статус", "Настройки").forEachIndexed { i, t ->
             val b = Button(this, null, android.R.attr.borderlessButtonStyle).apply {
                 text = t; setTextColor(Color.WHITE); isAllCaps = false; textSize = 13f
                 minHeight = dp(56); minimumHeight = dp(56); setPadding(0, 0, 0, 0)
@@ -125,7 +139,7 @@ class MainActivity : Activity() {
             tabs.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         }
         pages.forEach { content.addView(it, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT)) }
-        select(if (prefs.vpnEnabled || prefs.serverEnabled) 3 else 0)
+        select(if (prefs.serverEnabled && !prefs.vpnEnabled) 1 else 0)
         handleLink(intent)
 
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
@@ -159,12 +173,31 @@ class MainActivity : Activity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        // The node runs while the app is on screen (pings the servers and the root); this also
+        // brings back a service that was killed or stopped by an app update.
+        State.uiVisible = true
+        State.stoppedByUser = false
+        try { YggService.send(this, YggService.ACTION_RECONCILE) } catch (e: Exception) { State.log("ui", "сервис не запустился: ${e.message}") }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        State.uiVisible = false
+        YggService.instance?.requestReconcile() // stops the node unless VPN or server is on
+    }
+
+    @Deprecated("Activity API")
+    override fun onBackPressed() {
+        if (current == 3 && settingsSub == 1) { showSettingsSub(0); return }
+        if (current != 0) { select(0); return }
+        @Suppress("DEPRECATION")
+        super.onBackPressed()
+    }
+
     override fun onResume() {
         super.onResume()
-        // A role is on but the service is gone (killed, app updated): bring it back.
-        if ((prefs.vpnEnabled || prefs.serverEnabled) && !State.serviceRunning) {
-            try { YggService.send(this, YggService.ACTION_RECONCILE) } catch (e: Exception) { State.log("ui", "сервис не запустился: ${e.message}") }
-        }
         ui.post(tick)
     }
 
@@ -187,16 +220,20 @@ class MainActivity : Activity() {
     // --------------------------------------------------------------------------------------- pages
 
     private fun buildClient(): LinearLayout = page().apply {
-        addView(h1("Клиент: интернет через Yggdrasil"))
-        addView(note("Весь трафик телефона идёт в системный VPN-слот, оттуда через Yggdrasil на сервер выхода."))
+        addView(h1("Клиент"))
         addView(bigButton("Сканировать QR сервера") { scanQr() })
-        addView(label("Адрес сервера выхода: 200:… (или отсканируйте QR)"))
-        etServer = edit("200:abcd:…", prefs.server).also { addView(it) }
-        cbUdp = check("UDP через udpgw (QUIC, игры, звонки)", prefs.udp).also { addView(it) }
-        cbIpv6 = check("IPv6-сайты через сервер", prefs.ipv6).also { addView(it) }
-        addView(label("Не пускать в VPN (пакеты через запятую)"))
-        etExcluded = edit("com.example.bank, …", prefs.excludedApps).also { addView(it) }
+        etServer = edit("адрес сервера 200:…", "")
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(etServer, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(smallButton("Добавить") { addServerFromInput() })
+        })
+        addView(h2("Серверы"))
+        addView(note("Нажмите на сервер — подключиться к нему, долгое нажатие — меню. Пинг меряет узел Yggdrasil каждые 10 с."))
+        serversBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
+        tvRoot = mono("Корень сети: …").also { addView(it) }
         btnVpn = bigButton("") { toggleVpn() }.also { addView(it) }
+        btnApps = smallButton("Приложения без VPN") { pickApps() }.also { addView(it) }
         tvClientState = mono("").also { addView(it) }
     }
 
@@ -231,7 +268,51 @@ class MainActivity : Activity() {
         addView(smallButton("Не ограничивать в фоне (батарея)") { askBattery() })
     }
 
+    /** Separate page: network settings and logs, switched at the top. */
+    private fun buildSettings(): View {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val sw = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(dp(8), dp(4), dp(8), 0) }
+        listOf("Сеть", "Логи").forEachIndexed { i, t ->
+            val b = Button(this, null, android.R.attr.borderlessButtonStyle).apply {
+                text = t; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
+                setOnClickListener { showSettingsSub(i) }
+            }
+            subButtons += b
+            sw.addView(b, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }
+        box.addView(sw)
+        val frame = FrameLayout(this)
+        netPage = scrollPage(buildNetwork())
+        logsPage = buildLogs()
+        frame.addView(netPage, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        frame.addView(logsPage, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        box.addView(frame, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        showSettingsSub(0)
+        return box
+    }
+
+    private fun showSettingsSub(i: Int) {
+        settingsSub = i
+        netPage.visibility = if (i == 0) View.VISIBLE else View.GONE
+        logsPage.visibility = if (i == 1) View.VISIBLE else View.GONE
+        subButtons.forEachIndexed { j, b -> b.alpha = if (i == j) 1f else 0.5f; b.setTypeface(null, if (i == j) Typeface.BOLD else Typeface.NORMAL) }
+        if (::tvStatus.isInitialized) refreshNow()
+    }
+
     private fun buildNetwork(): LinearLayout = page().apply {
+        addView(h1("VPN-клиент"))
+        cbUdp = check("UDP через udpgw (QUIC, игры, звонки)", prefs.udp).also { addView(it) }
+        cbIpv6 = check("IPv6-сайты через сервер", prefs.ipv6).also { addView(it) }
+        addView(h1("Узел Yggdrasil"))
+        cbKeepNode = check("Работать в фоне: пинговать серверы и корень, когда приложение свёрнуто", prefs.keepNode).also { addView(it) }
+        addView(note("Без VPN и сервера узел работает в фоне с уведомлением. Выключите, чтобы экономить батарею: тогда он работает только при открытом приложении."))
+        addView(h1("Трекеры"))
+        addView(note("Трекеры обходят сеть Yggdrasil и собирают работающие серверы выхода. Их список появляется на странице «Клиент»; новые трекеры добавляются сами."))
+        cbUseTrackers = check("Получать серверы от трекеров", prefs.useTrackers).also { addView(it) }
+        addView(label("Трекеры, по одному в строке (адрес Yggdrasil, порт ${Ygg.TRACKER_PORT})"))
+        etTrackers = edit("200:…", prefs.trackers, lines = 3).also { addView(it) }
+        tvTrackers = mono("").also { addView(it) }
+        addView(smallButton("Обновить список серверов сейчас") { saveAll(); refreshTrackers(force = true) })
         addView(h1("Сеть Yggdrasil"))
         cbPublic = check("Публичный список пиров (publicpeers.neilalexander.dev)", prefs.usePublicPeers).also { addView(it) }
         addView(label("Свои пиры, по одному в строке (tls://host:port, tcp://…, ?key=…)"))
@@ -283,6 +364,7 @@ class MainActivity : Activity() {
     private fun buildLogs(): View {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(8), dp(8), dp(8), dp(8)) }
         box.addView(row(smallButton("Копировать") { copy(State.logsText()) },
+            smallButton("Экспорт в файл") { exportLogs() },
             smallButton("Очистить") { State.clearLogs(); tvLogs.text = "" }))
         tvLogs = mono("").apply { textSize = 11f; setTextIsSelectable(true) }
         logScroll = ScrollView(this).apply { addView(tvLogs) }
@@ -294,10 +376,11 @@ class MainActivity : Activity() {
 
     private fun saveAll() {
         if (!::etServer.isInitialized) return
-        prefs.server = etServer.text.toString()
         prefs.udp = cbUdp.isChecked
+        prefs.useTrackers = cbUseTrackers.isChecked
+        prefs.keepNode = cbKeepNode.isChecked
+        prefs.trackers = etTrackers.text.toString()
         prefs.ipv6 = cbIpv6.isChecked
-        prefs.excludedApps = etExcluded.text.toString()
         prefs.limTotalDown = kbit(etLimTotalDown)
         prefs.limTotalUp = kbit(etLimTotalUp)
         prefs.limClientDown = kbit(etLimClientDown)
@@ -324,7 +407,11 @@ class MainActivity : Activity() {
             return
         }
         if (Ygg.parseServer(prefs.server) == null) {
-            toast("Адрес сервера: IPv6 из 200::/7, например 200:…"); return
+            // Nothing selected yet: take what was typed, else the first saved server.
+            val typed = Ygg.serverFromText(etServer.text.toString())
+            val pick = typed ?: prefs.serverList().firstOrNull()
+            if (pick == null) { toast("Добавьте сервер: отсканируйте QR или введите адрес 200:…"); return }
+            prefs.addServer(pick); prefs.server = pick; writeMonitors()
         }
         val i = VpnService.prepare(this)
         if (i != null) startActivityForResult(i, REQ_VPN) else startVpn()
@@ -333,7 +420,7 @@ class MainActivity : Activity() {
     private fun startVpn() {
         prefs.vpnEnabled = true
         YggService.send(this, YggService.ACTION_RECONCILE)
-        select(3)
+        refreshNow()
     }
 
     @Deprecated("Activity API")
@@ -347,6 +434,13 @@ class MainActivity : Activity() {
             val text = data?.getStringExtra(ScanActivity.EXTRA_TEXT) ?: return
             val server = Ygg.serverFromText(text)
             if (server == null) toast("Это не адрес сервера YggProxy") else connectTo(server)
+        }
+        if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) {
+            val uri = data?.data ?: return
+            try {
+                contentResolver.openOutputStream(uri)?.use { it.write(State.logsText().toByteArray()) }
+                toast("Логи сохранены")
+            } catch (e: Exception) { toast("Не удалось сохранить: ${e.message}") }
         }
     }
 
@@ -374,12 +468,15 @@ class MainActivity : Activity() {
 
     /** Quick connect: remember the server and bring the VPN up (or switch it to this server). */
     private fun connectTo(server: String) {
-        etServer.setText(server)
         saveAll()
+        prefs.addServer(server)
+        prefs.server = server
+        writeMonitors()
+        serversSig = null
         if (prefs.vpnEnabled) {
             YggService.send(this, YggService.ACTION_RECONCILE)
-            select(3)
             toast("Переключено на $server")
+            refreshNow()
             return
         }
         val i = VpnService.prepare(this)
@@ -401,6 +498,181 @@ class MainActivity : Activity() {
             .setPositiveButton("Подключить") { _, _ -> connectTo(server) }
             .setNegativeButton("Отмена", null)
             .show()
+    }
+
+    /** The node re-reads this ping list on its own (no restart, the VPN stays up). */
+    private fun writeMonitors() {
+        val all = (prefs.serverList() + State.trackerExits.map { it.first }).distinct()
+        try { java.io.File(filesDir, "monitors.txt").writeText(all.joinToString("\n")) } catch (_: Exception) {}
+    }
+
+    private fun addServerFromInput() {
+        val s = Ygg.serverFromText(etServer.text.toString())
+        if (s == null) { toast("Адрес сервера: IPv6 из 200::/7, например 200:…"); return }
+        prefs.addServer(s)
+        if (Ygg.parseServer(prefs.server) == null) prefs.server = s
+        writeMonitors()
+        etServer.setText("")
+        serversSig = null
+        refreshNow()
+        toast("Сервер добавлен")
+    }
+
+    /**
+     * Ask the trackers (through the node's SOCKS) for exit servers and for more trackers.
+     * Every 2 min while the app is open; [force] right now.
+     */
+    private fun refreshTrackers(force: Boolean = false) {
+        if (!prefs.useTrackers || trackerBusy) return
+        if (!force && System.currentTimeMillis() - State.trackerAt < 120_000) return
+        if (!State.nodeRunning) { if (force) toast("Узел ещё не запущен"); return }
+        trackerBusy = true
+        State.trackerAt = System.currentTimeMillis()
+        State.trackerStatus = "запрашиваю…"
+        bg.execute {
+            val exits = LinkedHashMap<String, Long>()
+            val newTrackers = mutableListOf<String>()
+            val ok = mutableListOf<String>()
+            for (t in prefs.trackerList()) {
+                val e = Ygg.fetchTracker(t, "/exits") ?: continue
+                ok += t
+                e.optJSONArray("exits")?.let { a ->
+                    for (k in 0 until a.length()) a.getJSONObject(k).let { o ->
+                        Ygg.serverFromText(o.optString("address"))?.let { addr -> exits.putIfAbsent(addr, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms")) }
+                    }
+                }
+                Ygg.fetchTracker(t, "/trackers")?.optJSONArray("trackers")?.let { a ->
+                    for (k in 0 until a.length()) Ygg.serverFromText(a.getJSONObject(k).optString("address"))?.let { newTrackers += it }
+                }
+            }
+            val known = prefs.trackerList()
+            val add = newTrackers.distinct().filter { it !in known }
+            if (add.isNotEmpty()) prefs.trackers = (known + add).joinToString("\n")
+            if (ok.isNotEmpty()) State.trackerExits = exits.map { it.key to it.value }.take(50)
+            val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date())
+            State.trackerStatus = if (ok.isEmpty()) "$time: трекеры недоступны"
+                else "$time: серверов ${exits.size} от ${ok.size} трекер(ов)" + if (add.isNotEmpty()) ", новых трекеров ${add.size}" else ""
+            State.log("trackers", State.trackerStatus)
+            writeMonitors()
+            trackerBusy = false
+            ui.post {
+                serversSig = null
+                if (add.isNotEmpty() && ::etTrackers.isInitialized) etTrackers.setText(prefs.trackers)
+                refreshNow()
+            }
+        }
+    }
+
+    private fun serverMenu(addr: String) {
+        val items = arrayOf("Подключиться", "Копировать адрес", "Удалить из списка")
+        AlertDialog.Builder(this).setTitle(addr).setItems(items) { _, w ->
+            when (w) {
+                0 -> connectTo(addr)
+                1 -> copy(addr)
+                2 -> {
+                    if (prefs.vpnEnabled && prefs.server == addr) { toast("Сначала отключите VPN от этого сервера"); return@setItems }
+                    prefs.removeServer(addr)
+                    if (prefs.server == addr) prefs.server = prefs.serverList().firstOrNull() ?: ""
+                    writeMonitors(); serversSig = null; refreshNow()
+                }
+            }
+        }.show()
+    }
+
+    /** Server list with ping (from tcp_node /api/rtt); the selected one is marked. */
+    private fun renderServers() {
+        val rtt = lastRtt
+        val byAddr = HashMap<String, JSONObject>()
+        rtt?.optJSONArray("servers")?.let { a -> for (k in 0 until a.length()) a.getJSONObject(k).let { byAddr[it.optString("address")] = it } }
+        val list = prefs.serverList()
+        val fromTrackers = State.trackerExits.filter { it.first !in list }
+        val sig = list.joinToString() + "|" + fromTrackers.joinToString { it.first } + "|" + prefs.server + "|" + prefs.vpnEnabled + State.vpnActive + "|" +
+            list.joinToString { byAddr[it]?.let { o -> o.opt("rtt_ms").toString() + o.opt("avg_ms") } ?: "-" }
+        if (sig != serversSig) {
+            serversSig = sig
+            serversBox.removeAllViews()
+            if (list.isEmpty()) serversBox.addView(note("Список пуст: отсканируйте QR сервера или введите адрес."))
+            for (a in list) {
+                val o = byAddr[a]
+                val ping = when {
+                    !State.nodeRunning -> "узел не запущен"
+                    o == null || o.isNull("rtt_ms") -> "нет ответа"
+                    else -> "${o.optLong("rtt_ms")} мс (сред. ${o.optLong("avg_ms")} мс)"
+                }
+                val sel = a == prefs.server
+                val mark = when { sel && prefs.vpnEnabled && State.vpnActive -> "● подключено"; sel && prefs.vpnEnabled -> "◐ подключается"; sel -> "○ выбран"; else -> "" }
+                serversBox.addView(mono("$a\n    пинг: $ping  $mark").apply {
+                    setTextIsSelectable(false)
+                    if (sel) setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+                    setBackgroundResource(android.R.drawable.list_selector_background)
+                    setPadding(dp(4), dp(8), dp(4), dp(8))
+                    setOnClickListener { connectTo(a) }
+                    setOnLongClickListener { serverMenu(a); true }
+                })
+            }
+            if (fromTrackers.isNotEmpty()) {
+                serversBox.addView(h2("От трекеров"))
+                for ((a, trackerRtt) in fromTrackers) {
+                    val o = byAddr[a]
+                    val ping = when {
+                        o != null && !o.isNull("rtt_ms") -> "${o.optLong("rtt_ms")} мс"
+                        trackerRtt >= 0 -> "нет ответа (у трекера $trackerRtt мс)"
+                        else -> "нет ответа"
+                    }
+                    serversBox.addView(mono("$a\n    пинг: $ping").apply {
+                        setTextIsSelectable(false)
+                        setTextColor(Color.DKGRAY)
+                        setBackgroundResource(android.R.drawable.list_selector_background)
+                        setPadding(dp(4), dp(8), dp(4), dp(8))
+                        setOnClickListener { connectTo(a) }
+                        setOnLongClickListener { copy(a); true }
+                    })
+                }
+            }
+        }
+        if (::tvTrackers.isInitialized) tvTrackers.text = "Трекеры: " + (if (prefs.useTrackers) State.trackerStatus else "выключены")
+        val root = rtt?.optJSONObject("root")
+        tvRoot.text = "Корень сети: " + when {
+            !State.nodeRunning -> "узел не запущен"
+            root == null || root.isNull("rtt_ms") -> "нет ответа" + (root?.optString("key")?.take(16)?.let { " ($it…)" } ?: "")
+            else -> "${root.optLong("rtt_ms")} мс (сред. ${root.optLong("avg_ms")} мс)"
+        }
+        btnApps.text = "Приложения без VPN (${prefs.excludedAppList().size})"
+    }
+
+    /** Multi-choice list of installed apps whose traffic bypasses the VPN. */
+    private fun pickApps() {
+        toast("Загружаю список приложений…")
+        bg.execute {
+            val pm = packageManager
+            val excluded = prefs.excludedAppList().toSet()
+            val apps = pm.getInstalledApplications(0)
+                .filter { it.packageName != packageName && (it.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM == 0 || pm.getLaunchIntentForPackage(it.packageName) != null) }
+                .map { it.packageName to (pm.getApplicationLabel(it).toString()) }
+                .sortedWith(compareBy({ it.first !in excluded }, { it.second.lowercase() }))
+            ui.post {
+                val checked = BooleanArray(apps.size) { apps[it].first in excluded }
+                AlertDialog.Builder(this)
+                    .setTitle("Не пускать в VPN")
+                    .setMultiChoiceItems(apps.map { "${it.second}\n${it.first}" }.toTypedArray(), checked) { _, w, on -> checked[w] = on }
+                    .setPositiveButton("Сохранить") { _, _ ->
+                        prefs.excludedApps = apps.filterIndexed { i, _ -> checked[i] }.joinToString(",") { it.first }
+                        if (prefs.vpnEnabled) YggService.send(this, YggService.ACTION_RECONCILE)
+                        serversSig = null; refreshNow()
+                        toast("Сохранено: ${prefs.excludedAppList().size}")
+                    }
+                    .setNegativeButton("Отмена", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun exportLogs() {
+        val stamp = java.text.SimpleDateFormat("yyyyMMdd-HHmm", java.util.Locale.US).format(java.util.Date())
+        val i = Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("text/plain")
+            .putExtra(Intent.EXTRA_TITLE, "ratatoskr-log-$stamp.txt")
+        @Suppress("DEPRECATION")
+        try { startActivityForResult(i, REQ_EXPORT) } catch (e: Exception) { toast("Нет приложения для сохранения файлов") }
     }
 
     private fun shareAddress() {
@@ -461,16 +733,20 @@ class MainActivity : Activity() {
     private fun refreshNow() {
         if (!::tvStatus.isInitialized) return
         renderButtons()
-        if (current == 3 || current == 1) {
-            val doProbe = prefs.vpnEnabled && (probeCounter++ % 3 == 0)
+        refreshTrackers()
+        if (current <= 2) {
+            val doProbe = current == 2 && prefs.vpnEnabled && (probeCounter++ % 3 == 0)
             bg.execute {
-                lastStats = Ygg.fetchStats()
-                lastPeers = Ygg.fetchPeers()
+                lastRtt = Ygg.fetchRtt()
+                if (current != 0) {
+                    lastStats = Ygg.fetchStats()
+                    lastPeers = Ygg.fetchPeers()
+                }
                 if (doProbe) { lastProbe = Ygg.probeExit(); probeDone = true }
-                ui.post { renderStatus() }
+                ui.post { renderServers(); renderStatus() }
             }
         }
-        if (current == 4) {
+        if (current == 3 && settingsSub == 1) {
             val atBottom = !logScroll.canScrollVertically(1)
             tvLogs.text = State.logsText()
             if (atBottom) logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
@@ -542,6 +818,9 @@ class MainActivity : Activity() {
             sb.append("Ключ:   ").append(key).append('\n')
             sb.append("Корень: ").append(root.take(16)).append("…\n")
             sb.append("Коорд.: [").append(c).append("]\n")
+            lastRtt?.optJSONObject("root")?.let { r ->
+                sb.append("Пинг до корня: ").append(if (r.isNull("rtt_ms")) "нет ответа" else "${r.optLong("rtt_ms")} мс (сред. ${r.optLong("avg_ms")} мс)").append('\n')
+            }
             sb.append("Поиск в LAN: ").append(
                 when {
                     !prefs.lanDiscovery -> "выключен"

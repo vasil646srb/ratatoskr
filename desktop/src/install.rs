@@ -87,10 +87,45 @@ pub fn install() -> Result<(), String> {
     Ok(())
 }
 
+const TRACKER_UNIT: &str = "/etc/systemd/system/yggproxy-tracker.service";
+const TRACKER_UNIT_TEXT: &str = "[Unit]
+Description=Ratatoskr tracker: finds Yggdrasil exit nodes and serves the list (port 27081)
+After=yggdrasil.service network-online.target
+Wants=yggdrasil.service
+
+[Service]
+ExecStart=/usr/local/bin/yggproxy tracker
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+";
+
+/// `sudo yggproxy install-tracker`: the tracker service (needs yggdrasil-go on this host).
+pub fn install_tracker() -> Result<(), String> {
+    need_root()?;
+    let me = std::env::current_exe().map_err(|e| e.to_string())?;
+    if me != std::path::Path::new(BIN) {
+        let tmp = format!("{BIN}.new");
+        std::fs::copy(&me, &tmp).map_err(|e| format!("{tmp}: {e}"))?;
+        std::fs::rename(&tmp, BIN).map_err(|e| format!("{BIN}: {e}"))?;
+    }
+    std::fs::write(TRACKER_UNIT, TRACKER_UNIT_TEXT).map_err(|e| format!("{TRACKER_UNIT}: {e}"))?;
+    sh(&["systemctl", "daemon-reload"])?;
+    sh(&["systemctl", "enable", "yggproxy-tracker"])?;
+    sh(&["systemctl", "restart", "yggproxy-tracker"])?;
+    println!("Трекер установлен и запущен: journalctl -u yggproxy-tracker -f");
+    println!("Чтобы клиенты и другие трекеры его видели, откройте порт 27081 на интерфейсе Yggdrasil, например:");
+    println!("  sudo ufw allow in on tun0 to any port 27081 proto tcp");
+    Ok(())
+}
+
 pub fn uninstall() -> Result<(), String> {
     need_root()?;
     let _ = sh(&["systemctl", "disable", "--now", "yggproxy"]);
-    for p in [UNIT, DESKTOP, BIN] {
+    let _ = sh(&["systemctl", "disable", "--now", "yggproxy-tracker"]);
+    for p in [UNIT, TRACKER_UNIT, DESKTOP, BIN] {
         let _ = std::fs::remove_file(p);
     }
     let _ = sh(&["systemctl", "daemon-reload"]);
