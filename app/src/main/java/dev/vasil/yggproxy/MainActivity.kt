@@ -181,14 +181,14 @@ class MainActivity : Activity() {
         super.onStart()
         // The node runs while the app is on screen (pings the servers and the root); this also
         // brings back a service that was killed or stopped by an app update.
-        State.uiVisible = true
+        State.uiShown()
         State.stoppedByUser = false
         try { YggService.send(this, YggService.ACTION_RECONCILE) } catch (e: Exception) { State.log("ui", "сервис не запустился: ${e.message}") }
     }
 
     override fun onStop() {
         super.onStop()
-        State.uiVisible = false
+        State.uiHidden()
         YggService.instance?.requestReconcile() // stops the node unless VPN or server is on
     }
 
@@ -304,6 +304,12 @@ class MainActivity : Activity() {
     }
 
     private fun buildNetwork(): LinearLayout = page().apply {
+        addView(smallButton("Простой режим: одна кнопка «Подключиться»") {
+            saveAll()
+            prefs.advancedMode = false
+            startActivity(Intent(this@MainActivity, SimpleActivity::class.java))
+            finish()
+        })
         addView(h1("VPN-клиент"))
         cbUdp = check("UDP через udpgw (QUIC, игры, звонки)", prefs.udp).also { addView(it) }
         cbIpv6 = check("IPv6-сайты через сервер", prefs.ipv6).also { addView(it) }

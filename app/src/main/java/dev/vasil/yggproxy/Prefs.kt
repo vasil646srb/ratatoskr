@@ -26,6 +26,8 @@ class Prefs(ctx: Context) {
     var trackers: String get() = s("trackers", Ygg.DEFAULT_TRACKERS.joinToString("\n")); set(v) = put { putString("trackers", v) }
     /** Keep the Yggdrasil node running in the background (pings servers and root) without VPN/server. */
     var keepNode: Boolean get() = b("keep_node", true); set(v) = put { putBoolean("keep_node", v) }
+    /** The full app instead of the one-button simple screen. */
+    var advancedMode: Boolean get() = b("advanced", false); set(v) = put { putBoolean("advanced", v) }
     var useTrackers: Boolean get() = b("use_trackers", true); set(v) = put { putBoolean("use_trackers", v) }
     /** Saved trackers plus the built-in ones (always asked, also on lists saved by older versions). */
     fun trackerList(): List<String> =

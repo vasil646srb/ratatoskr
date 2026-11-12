@@ -13,6 +13,10 @@ object State {
     @Volatile var serviceRunning = false
     /** The app's window is on screen: the node runs to ping the saved servers and the root. */
     @Volatile var uiVisible = false
+    /** Screens of the app currently started (the simple and the full one hand over to each other). */
+    private val uiCount = java.util.concurrent.atomic.AtomicInteger(0)
+    fun uiShown() { uiCount.incrementAndGet(); uiVisible = true }
+    fun uiHidden() { uiVisible = uiCount.decrementAndGet().coerceAtLeast(0) > 0 }
     /** «Остановить» in the notification: no background node until the app is opened again. */
     @Volatile var stoppedByUser = false
     /** Exit servers from the trackers: address -> rtt as the tracker measured it (ms, -1 unknown). */
