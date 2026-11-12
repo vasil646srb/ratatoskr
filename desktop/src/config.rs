@@ -16,15 +16,34 @@ pub const NODE_SOCKS: u16 = 10810;
 /// SO_MARK of the node's peer connections; policy routing keeps them out of the VPN.
 pub const FWMARK: u32 = 0x2a7;
 /// Routing table of the VPN default route.
+#[cfg_attr(windows, allow(dead_code))]
 pub const TABLE: u32 = 2701;
 pub const TUN_NAME: &str = "yggproxy0";
+/// Windows: control channel of the service on 127.0.0.1 (Linux uses a unix socket).
+#[allow(dead_code)]
+pub const CTL_PORT: u16 = 27079;
+
+/// Windows: everything lives in %ProgramData%\Ratatoskr.
+#[cfg(windows)]
+fn win_dir() -> PathBuf {
+    PathBuf::from(std::env::var("ProgramData").unwrap_or_else(|_| r"C:\ProgramData".into())).join("Ratatoskr")
+}
 
 pub fn config_path() -> PathBuf {
-    std::env::var("YGGPROXY_CONFIG").map(PathBuf::from).unwrap_or_else(|_| "/etc/yggproxy/config.json".into())
+    #[cfg(windows)]
+    let def = win_dir().join("config.json");
+    #[cfg(unix)]
+    let def = PathBuf::from("/etc/yggproxy/config.json");
+    std::env::var("YGGPROXY_CONFIG").map(PathBuf::from).unwrap_or(def)
 }
 pub fn state_dir() -> PathBuf {
-    std::env::var("YGGPROXY_STATE").map(PathBuf::from).unwrap_or_else(|_| "/var/lib/yggproxy".into())
+    #[cfg(windows)]
+    let def = win_dir().join("state");
+    #[cfg(unix)]
+    let def = PathBuf::from("/var/lib/yggproxy");
+    std::env::var("YGGPROXY_STATE").map(PathBuf::from).unwrap_or(def)
 }
+#[cfg_attr(windows, allow(dead_code))]
 pub fn socket_path() -> PathBuf {
     std::env::var("YGGPROXY_SOCKET").map(PathBuf::from).unwrap_or_else(|_| "/run/yggproxy/ctl.sock".into())
 }

@@ -2,7 +2,7 @@
 name = "yggproxy"
 version = "0.1.3"
 edition = "2024"
-description = "YggProxy for Linux: internet through Yggdrasil (VPN client, exit server, console and GUI)"
+description = "YggProxy for Linux and Windows: internet through Yggdrasil (VPN client, exit server, console and GUI)"
 license = "MIT"
 
 [features]
@@ -13,9 +13,16 @@ gui = ["dep:eframe"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-libc = "0.2"
 qrcode = { version = "0.14", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
+
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "default_fonts"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+windows-service = "0.8"
 
 [profile.release]
 strip = true

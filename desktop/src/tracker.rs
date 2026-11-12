@@ -18,7 +18,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv6Addr, SocketAddr, TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -63,7 +62,8 @@ pub struct TrackerConfig {
 impl Default for TrackerConfig {
     fn default() -> Self {
         Self {
-            admin_socket: "/var/run/yggdrasil/yggdrasil.sock".into(),
+            // yggdrasil-go's AdminListen default: a unix socket on Linux, TCP on Windows.
+            admin_socket: if cfg!(windows) { "tcp://localhost:9001".into() } else { "/var/run/yggdrasil/yggdrasil.sock".into() },
             crawl_interval_min: 30,
             recheck_interval_min: 5,
             sync_interval_min: 5,
@@ -93,6 +93,18 @@ fn now() -> u64 {
 
 fn log(msg: &str) {
     eprintln!("[tracker] {msg}");
+    // Windows service: no journal, so a log file next to the database.
+    #[cfg(windows)]
+    {
+        use std::io::Write as _;
+        let p = config::state_dir().join("tracker.log");
+        if std::fs::metadata(&p).map(|m| m.len() > 5 << 20).unwrap_or(false) {
+            let _ = std::fs::rename(&p, p.with_extension("log.old"));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
+            let _ = writeln!(f, "{} {msg}", crate::platform::now_hms());
+        }
+    }
 }
 
 // ------------------------------------------------------------------------------------------
@@ -144,12 +156,25 @@ fn parse_hex_key(s: &str) -> Option<[u8; 32]> {
 // yggdrasil-go admin API
 
 fn admin(sock: &str, request: &str, args: Value) -> Result<Value, String> {
-    let path = sock.strip_prefix("unix://").unwrap_or(sock);
-    let mut s = UnixStream::connect(path).map_err(|e| format!("admin {path}: {e}"))?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
     let req = json!({"request": request, "arguments": args, "keepalive": false});
-    s.write_all(req.to_string().as_bytes()).map_err(|e| e.to_string())?;
-    let mut de = serde_json::Deserializer::from_reader(BufReader::new(s)).into_iter::<Value>();
+    let reader: Box<dyn std::io::Read> = if let Some(hp) = sock.strip_prefix("tcp://") {
+        let mut s = std::net::TcpStream::connect(hp).map_err(|e| format!("admin {hp}: {e}"))?;
+        s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        s.write_all(req.to_string().as_bytes()).map_err(|e| e.to_string())?;
+        Box::new(s)
+    } else {
+        #[cfg(unix)]
+        {
+            let path = sock.strip_prefix("unix://").unwrap_or(sock);
+            let mut s = std::os::unix::net::UnixStream::connect(path).map_err(|e| format!("admin {path}: {e}"))?;
+            s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+            s.write_all(req.to_string().as_bytes()).map_err(|e| e.to_string())?;
+            Box::new(s)
+        }
+        #[cfg(windows)]
+        return Err(format!("admin {sock}: на Windows нужен tcp://адрес:порт (AdminListen yggdrasil-go)"));
+    };
+    let mut de = serde_json::Deserializer::from_reader(BufReader::new(reader)).into_iter::<Value>();
     let v = de.next().ok_or("admin: empty reply")?.map_err(|e| format!("admin: {e}"))?;
     if v["status"].as_str() == Some("success") {
         Ok(v["response"].clone())
@@ -414,8 +439,11 @@ fn parse_public_list(text: &str) -> Vec<(String, String, String)> {
 }
 
 fn download(url: &str) -> Option<String> {
-    let out = std::process::Command::new("curl").args(["-fsSL", "--max-time", "30", url]).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned()).filter(|t| t.trim_start().starts_with('{'))
+    let tmp = config::state_dir().join("download.tmp");
+    let ok = crate::platform::download(url, &tmp);
+    let text = std::fs::read_to_string(&tmp).ok();
+    let _ = std::fs::remove_file(&tmp);
+    text.filter(|t| ok && t.trim_start().starts_with('{'))
 }
 
 /// TCP connect time from here (ms), as a liveness check of a peer URI.
@@ -648,7 +676,14 @@ pub fn main() -> Result<(), String> {
 
 /// This host has a Yggdrasil address (a yggdrasil-go TUN): the kernel can reach 200::/7 itself.
 fn have_ygg_route() -> bool {
-    std::fs::read_to_string("/proc/net/if_inet6").map(|t| t.lines().any(|l| l.starts_with("02") || l.starts_with("03"))).unwrap_or(false)
+    #[cfg(unix)]
+    return std::fs::read_to_string("/proc/net/if_inet6").map(|t| t.lines().any(|l| l.starts_with("02") || l.starts_with("03"))).unwrap_or(false);
+    // Windows: the source address the system would pick for 200::/7 is a Yggdrasil one.
+    #[cfg(windows)]
+    {
+        let Ok(u) = std::net::UdpSocket::bind("[::]:0") else { return false };
+        u.connect("[200::1]:9").is_ok() && u.local_addr().map(|a| matches!(a.ip(), std::net::IpAddr::V6(v) if (v.octets()[0] & 0xfe) == 0x02)).unwrap_or(false)
+    }
 }
 
 fn io_text(e: &std::io::Error, tracker: Ipv6Addr, secs: u64) -> String {

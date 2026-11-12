@@ -1,4 +1,4 @@
-# yggproxy для Linux
+# yggproxy для Linux и Windows
 
 [← Ratatoskr](../README.md)
 
@@ -96,6 +96,34 @@ API на `[адрес Yggdrasil]:27081`: `GET /exits`, `GET /trackers`, `GET /in
 них не проходят. Поменяйте `Peers` в `/etc/yggdrasil/yggdrasil.conf` на быстрые узлы из
 [публичного списка](https://publicpeers.neilalexander.dev/).
 
+## Windows
+
+То же, что на Linux: служба, консольные команды, окно, трекер.
+
+| | Linux | Windows |
+|---|---|---|
+| установка | `sudo ./yggproxy install` | запустить `yggproxy-windows-x86_64.exe` → «Установить и запустить службу» (или `yggproxy install` — спросит права администратора) |
+| служба | systemd `yggproxy` | служба Windows **Ratatoskr** (LocalSystem, автозапуск, перезапуск при сбое) |
+| программа | `/usr/local/bin/yggproxy` | `C:\Program Files\Ratatoskr\yggproxy.exe` (папка добавляется в PATH), ярлык в «Пуске» |
+| настройки и ключ | `/etc/yggproxy`, `/var/lib/yggproxy` | `C:\ProgramData\Ratatoskr` |
+| управление службой | unix-сокет, группа `yggproxy` | `127.0.0.1:27079` |
+| трекер | `sudo yggproxy install-tracker` | `yggproxy install-tracker` → служба **RatatoskrTracker**, порт 27081 открывается в брандмауэре; журнал `C:\ProgramData\Ratatoskr\state\tracker.log` |
+| удаление | `sudo yggproxy uninstall` | `yggproxy uninstall` |
+
+VPN на Windows: `ygghelper tun` создаёт адаптер Wintun `yggproxy0` (`wintun.dll` встроен в
+программу и кладётся рядом с `ygghelper.exe`). Служба даёт адаптеру маршруты `0.0.0.0/1`,
+`128.0.0.0/1`, `::/1`, `8000::/1` и DNS `10.0.0.1`; DNS-запросы уходят по TCP через туннель на
+`8.8.8.8` (так узел получает настоящие адреса пиров). Соединения узла с пирами привязаны к
+интерфейсу основного маршрута (`IP_UNICAST_IF`) и идут мимо туннеля. Маршруты и DNS живут, пока
+жив адаптер: при выключении VPN или остановке службы они исчезают сами.
+
+Трекеру на Windows нужен yggdrasil-go: он обращается к его admin API по
+`tcp://localhost:9001` (`admin_socket` в `tracker.json`).
+
+Ограничения Windows-версии: программа не подписана (SmartScreen предупредит при первом
+запуске); DNS-запросы к серверу в локальной сети могут идти мимо туннеля; сервер выхода и VPN на
+одном компьютере одновременно не разделены (трафик сервера пойдёт в туннель).
+
 ## Сборка
 
 ```sh
@@ -106,7 +134,9 @@ cargo build --release                                            # с окном
 cargo build --release --no-default-features --target-dir target/server   # для серверов, без GUI
 ```
 
-Пути к встраиваемым бинарникам можно задать: `TCP_NODE_BIN=… YGGHELPER_BIN=…`.
+Пути к встраиваемым бинарникам можно задать: `TCP_NODE_BIN=… YGGHELPER_BIN=…` (для Windows ещё
+`WINTUN_DLL=…`). Сборка для Windows — `cargo build --release --target x86_64-pc-windows-gnu`
+(нужны `mingw-w64` и Windows-сборки `tcp_node.exe` и `ygghelper.exe`).
 Для проверки окна без экрана: `YGGPROXY_SHOT=папка yggproxy gui` снимает все вкладки в PPM и
 закрывается. Для запуска нескольких экземпляров (тесты в netns): `YGGPROXY_CONFIG`,
 `YGGPROXY_STATE`, `YGGPROXY_SOCKET`.

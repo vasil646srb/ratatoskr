@@ -1,6 +1,6 @@
 # Ratatoskr
 
-**Интернет через сеть [Yggdrasil](https://yggdrasil-network.github.io/): VPN-клиент и сервер выхода для Android и Linux.**
+**Интернет через сеть [Yggdrasil](https://yggdrasil-network.github.io/): VPN-клиент и сервер выхода для Android, Linux и Windows.**
 
 *Рататоск — белка из скандинавской мифологии, которая бегает по стволу мирового древа Иггдрасиль
 и носит вести между его ветвями и корнями. Здесь она носит ваш трафик.*
@@ -50,7 +50,7 @@ Ratatoskr превращает любой телефон или компьюте
 |---|---|---|
 | Android-приложение **YggProxy** | `app/` | клиент, сервер, статус, настройки (Kotlin, без сторонних UI-библиотек) |
 | `ygghelper` | `ygghelper/` | сервер выхода (SOCKS5, udpgw, лимиты, тест скорости) и сторона tun2proxy для клиента (Rust) |
-| `yggproxy` для Linux | `desktop/` | служба systemd, консольные команды, окно (egui), трекер — один бинарник ([подробнее](desktop/README.md)) |
+| `yggproxy` для Linux и Windows | `desktop/` | служба (systemd / служба Windows), консольные команды, окно (egui), трекер — один файл ([подробнее](desktop/README.md)) |
 | `tcp_node` | [yggdrasil-lite, ветка `ratatoskr`](https://github.com/vasil646srb/yggdrasil-lite/tree/ratatoskr) | узел Yggdrasil в пространстве пользователя |
 
 ## Быстрый старт
@@ -83,13 +83,22 @@ yggproxy gui                        # окно
 
 Подробно — [desktop/README.md](desktop/README.md).
 
+### Windows
+
+Скачайте `yggproxy-windows-x86_64.exe` из [релизов](https://github.com/vasil646srb/ratatoskr/releases/latest)
+и запустите его. Откроется окно; нажмите «Установить и запустить службу» и подтвердите запрос
+администратора. Программа скопируется в `C:\Program Files\Ratatoskr`, служба **Ratatoskr** будет
+стартовать вместе с Windows, в меню «Пуск» появится ярлык. Те же консольные команды работают в
+командной строке: `yggproxy status`, `yggproxy connect`, `yggproxy server on`. Нужна Windows 10/11 x64.
+
 ## Как это работает
 
 **Клиент.** VPN-интерфейс отдаёт пакеты в tun2proxy, тот превращает соединения в SOCKS5-запросы к
 `127.0.0.1:10808`. `tcp_node` переносит их по Yggdrasil на `[сервер]:27080`. DNS виртуальный:
 имена разрешает сервер. UDP идёт внутри того же туннеля через udpgw. На Android само приложение
 исключено из VPN, поэтому связи узла с пирами идут мимо туннеля; на Linux для этого служат
-пометка `fwmark` и правила маршрутизации.
+пометка `fwmark` и правила маршрутизации, на Windows — привязка сокетов пиров к основному
+интерфейсу (`IP_UNICAST_IF`), а туннель (Wintun) получает маршруты `0.0.0.0/1` и `128.0.0.0/1`.
 
 **Сервер.** `tcp_node --forward 27080:10800 --open 27080 --proxy-protocol 27080` принимает
 соединения от любого узла и передаёт прокси строку PROXY v1 с Yggdrasil-адресом клиента
@@ -152,6 +161,12 @@ export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724
 TCP_NODE_SRC=~/yggdrasil-lite ./build-native.sh     # tcp_node + ygghelper → app/src/main/jniLibs
 gradle assembleRelease                              # подпись: KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
 
+# Windows (кросс-сборка на Linux: rustup target add x86_64-pc-windows-gnu, пакет mingw-w64;
+# wintun.dll из https://www.wintun.net, путь — WINTUN_DLL)
+(cd ~/yggdrasil-lite && cargo build --release --target x86_64-pc-windows-gnu --bin tcp_node --features upstream-tls,html)
+(cd ygghelper && cargo build --release --target x86_64-pc-windows-gnu)
+(cd desktop && cargo build --release --target x86_64-pc-windows-gnu)
+
 # Linux
 (cd ~/yggdrasil-lite && cargo build --release --bin tcp_node --features upstream-tls,html)
 (cd ygghelper && cargo build --release)
@@ -164,16 +179,15 @@ gradle assembleRelease                              # подпись: KEYSTORE_F
 ```
 app/            Android-приложение (Kotlin)
 ygghelper/      сервер выхода и tun2proxy-сторона клиента (Rust)
-desktop/        yggproxy для Linux: служба, консоль, окно, трекер (Rust)
+desktop/        yggproxy для Linux и Windows: служба, консоль, окно, трекер (Rust)
 build-native.sh сборка нативных частей для Android
 ```
 
 ## Планы
 
-- Windows-версия.
 - Статическая сборка для старых Linux-серверов (musl).
 
 ## Благодарности
 
 [Yggdrasil Network](https://yggdrasil-network.github.io/), [tun2proxy](https://github.com/tun2proxy/tun2proxy),
-[zxing](https://github.com/zxing/zxing), [egui](https://github.com/emilk/egui).
+[zxing](https://github.com/zxing/zxing), [egui](https://github.com/emilk/egui), [Wintun](https://www.wintun.net/).

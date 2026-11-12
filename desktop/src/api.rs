@@ -3,16 +3,15 @@
 use crate::config::{self, Config};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 pub fn request(req: Value) -> Result<Value, String> {
-    let path = config::socket_path();
-    let s = UnixStream::connect(&path).map_err(|e| match e.kind() {
+    let s = crate::platform::connect().map_err(|e| match e.kind() {
         std::io::ErrorKind::PermissionDenied => format!(
             "нет доступа к {} — добавьте себя в группу yggproxy (sudo usermod -aG yggproxy $USER, затем перелогиньтесь) или запустите через sudo",
-            path.display()
+            crate::platform::ctl_name()
         ),
+        _ if cfg!(windows) => format!("служба Ratatoskr не запущена ({e}). Установите её: yggproxy install (от администратора) или кнопкой в окне"),
         _ => format!("служба yggproxy не запущена ({e}). Установите и запустите: sudo yggproxy install"),
     })?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();

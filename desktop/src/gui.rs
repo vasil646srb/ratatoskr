@@ -623,10 +623,15 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(e) = &error {
                 ui.colored_label(egui::Color32::from_rgb(200, 60, 40), e);
+                #[cfg(unix)]
                 if ui.button("Установить и запустить службу (pkexec)").clicked() {
                     if let Ok(me) = std::env::current_exe() {
                         let _ = std::process::Command::new("pkexec").arg(me).arg("install").spawn();
                     }
+                }
+                #[cfg(windows)]
+                if ui.button("Установить и запустить службу (нужны права администратора)").clicked() {
+                    crate::install::install_elevated_detached();
                 }
                 ui.separator();
             }

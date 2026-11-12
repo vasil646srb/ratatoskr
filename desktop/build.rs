@@ -1,5 +1,5 @@
-// Embed tcp_node and ygghelper (Linux builds) into the yggproxy binary: one file to install.
-// Paths: TCP_NODE_BIN / YGGHELPER_BIN, else the usual build outputs next to this repo.
+// Embed tcp_node and ygghelper (and wintun.dll on Windows) into the yggproxy binary: one file to
+// install. Paths: TCP_NODE_BIN / YGGHELPER_BIN / WINTUN_DLL, else the usual build outputs.
 use std::path::PathBuf;
 
 fn pick(var: &str, default: &str) -> PathBuf {
@@ -16,9 +16,19 @@ fn pick(var: &str, default: &str) -> PathBuf {
 }
 
 fn main() {
-    let node = pick("TCP_NODE_BIN", "~/yggdrasil-lite/target/release/tcp_node");
-    let helper = pick("YGGHELPER_BIN", "../ygghelper/target/release/ygghelper");
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    std::fs::copy(&node, out.join("tcp_node")).unwrap();
-    std::fs::copy(&helper, out.join("ygghelper")).unwrap();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let t = "x86_64-pc-windows-gnu";
+        let node = pick("TCP_NODE_BIN", &format!("~/yggdrasil-lite/target/{t}/release/tcp_node.exe"));
+        let helper = pick("YGGHELPER_BIN", &format!("../ygghelper/target/{t}/release/ygghelper.exe"));
+        let wintun = pick("WINTUN_DLL", "~/.cache/ratatoskr-win/wintun/x/wintun/bin/amd64/wintun.dll");
+        std::fs::copy(&node, out.join("tcp_node")).unwrap();
+        std::fs::copy(&helper, out.join("ygghelper")).unwrap();
+        std::fs::copy(&wintun, out.join("wintun.dll")).unwrap();
+    } else {
+        let node = pick("TCP_NODE_BIN", "~/yggdrasil-lite/target/release/tcp_node");
+        let helper = pick("YGGHELPER_BIN", "../ygghelper/target/release/ygghelper");
+        std::fs::copy(&node, out.join("tcp_node")).unwrap();
+        std::fs::copy(&helper, out.join("ygghelper")).unwrap();
+    }
 }

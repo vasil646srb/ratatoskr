@@ -21,6 +21,10 @@
 //!     `--udpgw` is the udpgw address as seen by the exit node. Exits when the control
 //!     connection closes.
 //!
+//! `ygghelper tun --name NAME --socks 127.0.0.1:10808 [--udpgw ...] [--mtu 1500] [--ipv6]` (Windows)
+//!     Client: creates the Wintun adapter NAME (wintun.dll next to the exe) and runs tun2proxy on
+//!     it. The caller sets routes and DNS. Exits when stdin closes.
+//!
 //! Status lines on stdout, for the app: `STAT tun tx=N rx=N`,
 //! `STAT server active=N total=N denied=N tx=N rx=N`, `READY ...`, `ERROR ...`.
 
@@ -29,6 +33,7 @@ mod udpgw_server;
 
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
+#[cfg(unix)]
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,6 +68,12 @@ struct Opts {
     limits: Option<String>,
     fwmark: u32,
     ctl: Option<String>,
+    name: Option<String>,
+    /// tun2proxy DNS mode: `virtual` (the exit resolves names) or `over-tcp` (real answers from
+    /// --dns-addr over TCP through the tunnel; needed where the node resolves peer hostnames
+    /// through the same system DNS).
+    dns: String,
+    dns_addr: String,
     mtu: u16,
     ipv6: bool,
     allow_lan: bool,
@@ -70,7 +81,7 @@ struct Opts {
 }
 
 fn parse(args: &[String]) -> Opts {
-    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, fwmark: 0, ctl: None, mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
+    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
     let mut it = args.iter();
     let addr = |v: Option<&String>, f: &str| -> SocketAddr {
         v.and_then(|s| s.parse().ok()).unwrap_or_else(|| die(&format!("{f}: want IP:PORT")))
@@ -89,6 +100,9 @@ fn parse(args: &[String]) -> Opts {
             }
             "--limits" => o.limits = Some(it.next().cloned().unwrap_or_else(|| die("--limits: want FILE"))),
             "--ctl" => o.ctl = Some(it.next().cloned().unwrap_or_else(|| die("--ctl: want PATH"))),
+            "--dns" => o.dns = it.next().cloned().filter(|d| d == "virtual" || d == "over-tcp").unwrap_or_else(|| die("--dns: virtual or over-tcp")),
+            "--dns-addr" => o.dns_addr = it.next().cloned().filter(|a| a.parse::<IpAddr>().is_ok()).unwrap_or_else(|| die("--dns-addr: want IP")),
+            "--name" => o.name = Some(it.next().cloned().unwrap_or_else(|| die("--name: want NAME"))),
             "--mtu" => o.mtu = it.next().and_then(|s| s.parse().ok()).filter(|m| *m >= 576).unwrap_or_else(|| die("--mtu: want >= 576")),
             "--ipv6" => o.ipv6 = true,
             "--allow-lan" => o.allow_lan = true,
@@ -146,6 +160,7 @@ async fn server_main(o: Opts) -> Result<(), String> {
             listen_addr: gw,
             udp_mtu: 10240,
             udp_timeout: 3,
+            #[cfg(unix)]
             daemonize: false,
             verbosity: log::LevelFilter::Info,
         };
@@ -522,6 +537,7 @@ async fn speedtest_session(mut c: TcpStream) -> std::io::Result<()> {
 // ------------------------------------------------------------------------------------------
 
 /// Receive one fd over a connected unix stream (SCM_RIGHTS).
+#[cfg(unix)]
 fn recv_fd(sock: RawFd) -> std::io::Result<RawFd> {
     unsafe {
         let mut data = [0u8; 16];
@@ -564,11 +580,76 @@ unsafe extern "C" fn traffic_cb(st: *const tun2proxy::TrafficStatus, _ctx: *mut 
     }
 }
 
+/// tun2proxy options shared by both platforms; `dev` selects the device.
+fn tun2proxy_args(o: &Opts, socks: SocketAddr, dev: &[String]) -> Result<tun2proxy::Args, String> {
+    let mut cli: Vec<String> = vec!["tun2proxy".into()];
+    cli.extend(dev.iter().cloned());
+    cli.extend([
+        "--proxy".into(),
+        format!("socks5://{socks}"),
+        "--dns".into(),
+        o.dns.clone(),
+        "--dns-addr".into(),
+        o.dns_addr.clone(),
+        "--mtu".into(),
+        o.mtu.to_string(),
+        "--max-sessions".into(),
+        "2000".into(),
+        "--verbosity".into(),
+        o.verbosity.clone(),
+    ]);
+    if o.ipv6 {
+        cli.push("--ipv6-enabled".into());
+    }
+    if let Some(gw) = o.udpgw {
+        cli.push("--udpgw-server".into());
+        cli.push(gw.to_string());
+    }
+    <tun2proxy::Args as clap::Parser>::try_parse_from(&cli).map_err(|e| format!("tun2proxy args: {e}"))
+}
+
+#[cfg(windows)]
+fn tun_main(rt: &tokio::runtime::Runtime, o: Opts) -> Result<(), String> {
+    let socks = o.socks.ok_or("tun: --socks required")?;
+    let name = o.name.clone().unwrap_or_else(|| "yggproxy0".into());
+    let args = tun2proxy_args(&o, socks, &["--tun".into(), name.clone()])?;
+    unsafe { tun2proxy::tun2proxy_set_traffic_status_callback(2, Some(traffic_cb), std::ptr::null_mut()) };
+    let token = CancellationToken::new();
+    // The service closes our stdin to stop us (the adapter is removed on a clean exit).
+    {
+        let t = token.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut b = [0u8; 64];
+            let mut stdin = std::io::stdin();
+            loop {
+                match stdin.read(&mut b) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            t.cancel();
+        });
+    }
+    {
+        let t = token.clone();
+        rt.spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            t.cancel();
+        });
+    }
+    out(&format!("STATE tun running name={name}"));
+    let r = rt.block_on(tun2proxy::general_run_async(args, o.mtu, false, token));
+    out("STATE tun stopped");
+    r.map(|_| ()).map_err(|e| format!("tun2proxy: {e}"))
+}
+
+#[cfg(unix)]
 fn tun_main(rt: &tokio::runtime::Runtime, o: Opts) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
-    let ctl = o.ctl.ok_or("tun: --ctl required")?;
+    let ctl = o.ctl.clone().ok_or("tun: --ctl required")?;
     let socks = o.socks.ok_or("tun: --socks required")?;
     let _ = std::fs::remove_file(&ctl);
     let listener = UnixListener::bind(&ctl).map_err(|e| format!("bind {ctl}: {e}"))?;
@@ -578,31 +659,7 @@ fn tun_main(rt: &tokio::runtime::Runtime, o: Opts) -> Result<(), String> {
     let fd = recv_fd(stream.as_raw_fd()).map_err(|e| format!("recv fd: {e}"))?;
     out(&format!("STATE tun fd={fd}"));
 
-    let mut cli: Vec<String> = vec![
-        "tun2proxy".into(),
-        "--tun-fd".into(),
-        fd.to_string(),
-        "--close-fd-on-drop".into(),
-        "true".into(),
-        "--proxy".into(),
-        format!("socks5://{socks}"),
-        "--dns".into(),
-        "virtual".into(),
-        "--mtu".into(),
-        o.mtu.to_string(),
-        "--max-sessions".into(),
-        "2000".into(),
-        "--verbosity".into(),
-        o.verbosity.clone(),
-    ];
-    if o.ipv6 {
-        cli.push("--ipv6-enabled".into());
-    }
-    if let Some(gw) = o.udpgw {
-        cli.push("--udpgw-server".into());
-        cli.push(gw.to_string());
-    }
-    let args = <tun2proxy::Args as clap::Parser>::try_parse_from(&cli).map_err(|e| format!("tun2proxy args: {e}"))?;
+    let args = tun2proxy_args(&o, socks, &["--tun-fd".into(), fd.to_string(), "--close-fd-on-drop".into(), "true".into()])?;
 
     unsafe { tun2proxy::tun2proxy_set_traffic_status_callback(2, Some(traffic_cb), std::ptr::null_mut()) };
 

@@ -1,6 +1,6 @@
 # Ratatoskr
 
-**Internet over the [Yggdrasil](https://yggdrasil-network.github.io/) network: a VPN client and an exit server for Android and Linux.**
+**Internet over the [Yggdrasil](https://yggdrasil-network.github.io/) network: a VPN client and an exit server for Android, Linux and Windows.**
 
 *Ratatoskr is the squirrel of Norse mythology that runs up and down the world tree Yggdrasil,
 carrying messages between its branches and its roots. Here it carries your traffic.*
@@ -50,7 +50,7 @@ apps → VPN (TUN) → tun2proxy ─SOCKS5→ tcp_node ══ Yggdrasil ══ t
 |---|---|---|
 | **YggProxy** Android app | `app/` | client, server, status, settings (Kotlin, no third-party UI libraries) |
 | `ygghelper` | `ygghelper/` | exit server (SOCKS5, udpgw, limits, speed test) and the client's tun2proxy side (Rust) |
-| `yggproxy` for Linux | `desktop/` | systemd service, console commands, a window (egui), the tracker — one binary ([details](desktop/README.md)) |
+| `yggproxy` for Linux and Windows | `desktop/` | service (systemd / Windows service), console commands, a window (egui), the tracker — one file ([details](desktop/README.md)) |
 | `tcp_node` | [yggdrasil-lite, branch `ratatoskr`](https://github.com/vasil646srb/yggdrasil-lite/tree/ratatoskr) | userspace Yggdrasil node |
 
 ## Quick start
@@ -83,13 +83,22 @@ yggproxy gui                        # window
 
 Details: [desktop/README.md](desktop/README.md).
 
+### Windows
+
+Download `yggproxy-windows-x86_64.exe` from the [releases](https://github.com/vasil646srb/ratatoskr/releases/latest)
+and run it. A window opens; press "Установить и запустить службу" and confirm the administrator
+prompt. The program is copied to `C:\Program Files\Ratatoskr`, the **Ratatoskr** service starts
+with Windows, and a Start menu shortcut appears. The same console commands work in a command
+prompt: `yggproxy status`, `yggproxy connect`, `yggproxy server on`. Windows 10/11 x64.
+
 ## How it works
 
 **Client.** The VPN interface hands packets to tun2proxy, which turns connections into SOCKS5
 requests to `127.0.0.1:10808`. `tcp_node` carries them over Yggdrasil to `[server]:27080`. DNS is
 virtual: the server resolves names. UDP travels inside the same tunnel through udpgw. On Android
 the app itself is excluded from the VPN, so the node's peer links bypass the tunnel; on Linux an
-`fwmark` and policy routing rules do the same.
+`fwmark` and policy routing rules do the same; on Windows the peer sockets are bound to the main
+interface (`IP_UNICAST_IF`) while the tunnel (Wintun) gets the routes `0.0.0.0/1` and `128.0.0.0/1`.
 
 **Server.** `tcp_node --forward 27080:10800 --open 27080 --proxy-protocol 27080` accepts
 connections from any node and gives the proxy a PROXY v1 line with the client's Yggdrasil address
@@ -155,6 +164,12 @@ export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.3.13750724
 TCP_NODE_SRC=~/yggdrasil-lite ./build-native.sh     # tcp_node + ygghelper → app/src/main/jniLibs
 gradle assembleRelease                              # signing: KEYSTORE_FILE, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD
 
+# Windows (cross-build on Linux: rustup target add x86_64-pc-windows-gnu, the package mingw-w64;
+# wintun.dll from https://www.wintun.net, path in WINTUN_DLL)
+(cd ~/yggdrasil-lite && cargo build --release --target x86_64-pc-windows-gnu --bin tcp_node --features upstream-tls,html)
+(cd ygghelper && cargo build --release --target x86_64-pc-windows-gnu)
+(cd desktop && cargo build --release --target x86_64-pc-windows-gnu)
+
 # Linux
 (cd ~/yggdrasil-lite && cargo build --release --bin tcp_node --features upstream-tls,html)
 (cd ygghelper && cargo build --release)
@@ -167,16 +182,15 @@ gradle assembleRelease                              # signing: KEYSTORE_FILE, KE
 ```
 app/            Android app (Kotlin)
 ygghelper/      exit server and the client's tun2proxy side (Rust)
-desktop/        yggproxy for Linux: service, console, window, tracker (Rust)
+desktop/        yggproxy for Linux and Windows: service, console, window, tracker (Rust)
 build-native.sh builds the native parts for Android
 ```
 
 ## Roadmap
 
-- Windows version.
 - Static build for older Linux servers (musl).
 
 ## Thanks
 
 [Yggdrasil Network](https://yggdrasil-network.github.io/), [tun2proxy](https://github.com/tun2proxy/tun2proxy),
-[zxing](https://github.com/zxing/zxing), [egui](https://github.com/emilk/egui).
+[zxing](https://github.com/zxing/zxing), [egui](https://github.com/emilk/egui), [Wintun](https://www.wintun.net/).

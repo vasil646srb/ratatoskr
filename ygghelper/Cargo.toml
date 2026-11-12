@@ -16,9 +16,11 @@ tokio-util = "0.7"
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["auto-color"] }
 clap = { version = "4", features = ["derive"] }
-libc = "0.2"
 # used by the vendored udpgw server
 socks5-impl = { version = "0.10", default-features = false, features = ["tokio"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 nix = { version = "0.31", features = ["socket"] }
 
 [profile.release]

@@ -1,22 +1,33 @@
-//! `yggproxy daemon`: runs as root (systemd). Keeps tcp_node, the exit (ygghelper server) and the
-//! VPN (TUN + ygghelper tun + policy routing) in line with the config, and answers the control
-//! socket used by the console commands and the GUI.
+//! `yggproxy daemon`: runs as root (systemd) or as the Windows service. Keeps tcp_node, the exit
+//! (ygghelper server) and the VPN in line with the config, and answers the control channel used
+//! by the console commands and the GUI.
+//!
+//! VPN on Linux: TUN + `ygghelper tun` (fd passed over a unix socket) + policy routing by fwmark.
+//! VPN on Windows: `ygghelper tun --name` creates a Wintun adapter; 0.0.0.0/1 + 128.0.0.0/1 (and
+//! ::/1 + 8000::/1) go to it, while tcp_node binds its peer sockets to the default-route
+//! interface (IP_UNICAST_IF), so they bypass the tunnel.
 
 use crate::config::{self, Config};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use crate::platform::{self, command};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 const TCP_NODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tcp_node"));
 const YGGHELPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ygghelper"));
+#[cfg(windows)]
+const WINTUN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wintun.dll"));
 const PUBLIC_PEERS_URL: &str = "https://publicpeers.neilalexander.dev/publicnodes.json";
 const PEERS_MAX_AGE: Duration = Duration::from_secs(6 * 3600);
 const MAX_LOG: usize = 3000;
@@ -53,12 +64,7 @@ pub struct St {
 type Shared = Arc<Mutex<St>>;
 
 fn now_hms() -> String {
-    let t = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
-    // Local time via libc (the daemon has no tz crate).
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let tt = t as libc::time_t;
-    unsafe { libc::localtime_r(&tt, &mut tm) };
-    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    platform::now_hms()
 }
 
 fn log(st: &Shared, tag: &str, msg: &str) {
@@ -97,8 +103,10 @@ impl Proc {
         std::thread::spawn(move || {
             let mut backoff = 1u64;
             while !stop2.load(Ordering::Relaxed) {
-                let short: Vec<&str> = cmd2.iter().map(|a| a.rsplit('/').next().unwrap_or(a)).collect();
-                match Command::new(&cmd2[0]).args(&cmd2[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+                let short: Vec<&str> = cmd2.iter().map(|a| a.rsplit(['/', '\\']).next().unwrap_or(a)).collect();
+                // Windows: stdin stays open while the child runs; closing it is the stop request.
+                let stdin = if cfg!(windows) { Stdio::piped() } else { Stdio::null() };
+                match command(&cmd2[0]).args(&cmd2[1..]).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
                     Ok(mut c) => {
                         log(&st2, tag, &format!("запущен: {}", short.join(" ")));
                         let started = Instant::now();
@@ -147,9 +155,9 @@ impl Proc {
     fn stop(&self, st: &Shared, tag: &str, why: &str) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(c) = self.child.lock().unwrap().as_mut() {
-            unsafe { libc::kill(c.id() as i32, libc::SIGTERM) };
+            platform::soft_stop(c);
             let t0 = Instant::now();
-            while t0.elapsed() < Duration::from_secs(2) {
+            while t0.elapsed() < Duration::from_secs(3) {
                 if matches!(c.try_wait(), Ok(Some(_))) {
                     break;
                 }
@@ -166,10 +174,11 @@ impl Proc {
 // Helpers
 
 fn run(st: &Shared, args: &[&str]) -> bool {
-    match Command::new(args[0]).args(&args[1..]).stdout(Stdio::null()).stderr(Stdio::piped()).output() {
+    match command(args[0]).args(&args[1..]).stdout(Stdio::piped()).stderr(Stdio::piped()).output() {
         Ok(o) if o.status.success() => true,
         Ok(o) => {
-            let e = String::from_utf8_lossy(&o.stderr).trim().to_string();
+            // netsh reports errors on stdout.
+            let e = format!("{} {}", String::from_utf8_lossy(&o.stderr).trim(), String::from_utf8_lossy(&o.stdout).trim());
             log(st, "net", &format!("{}: {e}", args.join(" ")));
             false
         }
@@ -181,25 +190,31 @@ fn run(st: &Shared, args: &[&str]) -> bool {
 }
 
 fn quiet(args: &[&str]) {
-    let _ = Command::new(args[0]).args(&args[1..]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = command(args[0]).args(&args[1..]).stdout(Stdio::null()).stderr(Stdio::null()).status();
 }
 
+#[cfg(unix)]
 fn have(cmd: &str) -> bool {
     Command::new("sh").args(["-c", &format!("command -v {cmd}")]).stdout(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
 
 /// Write the embedded binaries to state/bin (only when they changed).
 fn install_bins(dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin)?;
     let mut out = Vec::new();
-    for (name, data) in [("tcp_node", TCP_NODE), ("ygghelper", YGGHELPER)] {
+    #[cfg(unix)]
+    let files = [("tcp_node", TCP_NODE), ("ygghelper", YGGHELPER)];
+    // wintun.dll next to ygghelper.exe, where the tun crate loads it from.
+    #[cfg(windows)]
+    let files = [("tcp_node.exe", TCP_NODE), ("ygghelper.exe", YGGHELPER), ("wintun.dll", WINTUN)];
+    for (name, data) in files {
         let p = bin.join(name);
         if std::fs::read(&p).map(|d| d != data).unwrap_or(true) {
             let tmp = bin.join(format!("{name}.tmp"));
             std::fs::write(&tmp, data)?;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
+            platform::make_executable(&tmp)?;
+            let _ = std::fs::remove_file(&p);
             std::fs::rename(&tmp, &p)?;
         }
         out.push(p);
@@ -230,8 +245,7 @@ fn refresh_public(st: &Shared, dir: &Path, force: bool) {
         return;
     }
     let tmp = dir.join("public-peers.json.tmp");
-    let ok = Command::new("curl").args(["-fsSL", "--max-time", "30", "-o"]).arg(&tmp).arg(PUBLIC_PEERS_URL).status().map(|s| s.success()).unwrap_or(false)
-        || Command::new("wget").args(["-q", "-T", "30", "-O"]).arg(&tmp).arg(PUBLIC_PEERS_URL).status().map(|s| s.success()).unwrap_or(false);
+    let ok = platform::download(PUBLIC_PEERS_URL, &tmp);
     let valid = ok && std::fs::read_to_string(&tmp).map(|t| t.trim_start().starts_with('{') && (t.contains("tls://") || t.contains("tcp://"))).unwrap_or(false);
     if valid {
         let _ = std::fs::rename(&tmp, &p);
@@ -337,6 +351,7 @@ fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peer
 // ------------------------------------------------------------------------------------------
 // VPN: TUN + routing + ygghelper tun
 
+#[cfg(unix)]
 struct Vpn {
     tun: std::fs::File,
     helper: Proc,
@@ -345,6 +360,7 @@ struct Vpn {
     sig: String,
 }
 
+#[cfg(unix)]
 fn open_tun(name: &str) -> std::io::Result<std::fs::File> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
     #[repr(C)]
@@ -365,6 +381,7 @@ fn open_tun(name: &str) -> std::io::Result<std::fs::File> {
     Ok(f)
 }
 
+#[cfg(unix)]
 /// Send `fd` over a unix socket connection (SCM_RIGHTS) with one data byte.
 fn send_fd(sock: &UnixStream, fd: i32) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
@@ -390,6 +407,7 @@ fn send_fd(sock: &UnixStream, fd: i32) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn routes(st: &Shared, add: bool, ipv6: bool) {
     let t = config::TABLE.to_string();
     let mark = format!("0x{:x}", config::FWMARK);
@@ -419,6 +437,7 @@ fn routes(st: &Shared, add: bool, ipv6: bool) {
     }
 }
 
+#[cfg(unix)]
 fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vpn, String> {
     let tun = open_tun(config::TUN_NAME).map_err(|e| format!("TUN {}: {e}", config::TUN_NAME))?;
     let dev = config::TUN_NAME;
@@ -475,6 +494,7 @@ fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vp
     Ok(Vpn { tun, helper, ctl, ipv6: cfg.client.ipv6, sig: vpn_sig(cfg) })
 }
 
+#[cfg(unix)]
 fn vpn_down(st: &Shared, v: Vpn) {
     *v.ctl.lock().unwrap() = None;
     v.helper.stop(st, "tun", "VPN выключен");
@@ -485,6 +505,103 @@ fn vpn_down(st: &Shared, v: Vpn) {
     drop(v.tun); // closes the TUN device
     let mut s = st.lock().unwrap();
     s.vpn_active = false;
+}
+
+#[cfg(windows)]
+struct Vpn {
+    helper: Proc,
+    sig: String,
+}
+
+/// Interface index of the adapter with this alias (0 while it does not exist).
+#[cfg(windows)]
+fn if_index(alias: &str) -> u32 {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex};
+    let w: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut luid = unsafe { std::mem::zeroed() };
+    let mut idx = 0u32;
+    unsafe {
+        if ConvertInterfaceAliasToLuid(w.as_ptr(), &mut luid) != 0 || ConvertInterfaceLuidToIndex(&luid, &mut idx) != 0 {
+            return 0;
+        }
+    }
+    idx
+}
+
+/// Routes and DNS for the Wintun adapter once it exists. They are bound to the adapter, so
+/// Windows drops them by itself when ygghelper removes it.
+#[cfg(windows)]
+fn win_net_setup(st: &Shared) {
+    let dev = config::TUN_NAME;
+    let t0 = Instant::now();
+    let idx = loop {
+        let i = if_index(dev);
+        if i != 0 {
+            break i;
+        }
+        if t0.elapsed() > Duration::from_secs(30) {
+            error(st, "vpn", &format!("адаптер {dev} не появился (нужен wintun.dll и права администратора)"));
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    };
+    let i = idx.to_string();
+    run(st, &["netsh", "interface", "ipv4", "set", "interface", &i, "metric=1"]);
+    for p in ["0.0.0.0/1", "128.0.0.0/1"] {
+        run(st, &["netsh", "interface", "ipv4", "add", "route", &format!("prefix={p}"), &format!("interface={i}"), "nexthop=10.0.0.1", "metric=1", "store=active"]);
+    }
+    // IPv6 too: with IPv6 off tun2proxy drops it (no leak past the tunnel; apps use IPv4).
+    for p in ["::/1", "8000::/1"] {
+        quiet(&["netsh", "interface", "ipv6", "add", "route", &format!("prefix={p}"), &format!("interface={i}"), "metric=1", "store=active"]);
+    }
+    // DNS to the adapter; tun2proxy sends it over TCP through the tunnel to 8.8.8.8.
+    run(st, &["netsh", "interface", "ipv4", "set", "dnsservers", &format!("name={i}"), "source=static", "address=10.0.0.1", "register=none", "validate=no"]);
+    quiet(&["ipconfig", "/flushdns"]);
+    st.lock().unwrap().vpn_active = true;
+    log(st, "vpn", &format!("адаптер {dev} (#{idx}): маршруты и DNS настроены"));
+}
+
+#[cfg(windows)]
+fn vpn_up(st: &Shared, _dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vpn, String> {
+    let mut cmd = vec![
+        helper_bin.display().to_string(),
+        "tun".into(),
+        "--name".into(),
+        config::TUN_NAME.into(),
+        "--socks".into(),
+        format!("127.0.0.1:{}", config::CLIENT_SOCKS),
+        "--dns".into(),
+        "over-tcp".into(),
+        "--dns-addr".into(),
+        "8.8.8.8".into(),
+    ];
+    if cfg.client.udp {
+        cmd.push("--udpgw".into());
+        cmd.push(format!("127.0.0.1:{}", config::UDPGW));
+    }
+    if cfg.client.ipv6 {
+        cmd.push("--ipv6".into());
+    }
+    cmd.extend(["--mtu".into(), "1500".into(), "-v".into(), "warn".into()]);
+    let st2 = st.clone();
+    let helper = Proc::start(st, "tun", cmd, Arc::new(move |l: &str| {
+        helper_line(&st2, "tun", l);
+        if l.starts_with("STATE tun running") {
+            let st3 = st2.clone();
+            std::thread::spawn(move || win_net_setup(&st3));
+        } else if l == "STATE tun stopped" {
+            st2.lock().unwrap().vpn_active = false;
+        }
+    }));
+    log(st, "vpn", &format!("VPN включается, выход через {}", cfg.client.server));
+    Ok(Vpn { helper, sig: vpn_sig(cfg) })
+}
+
+#[cfg(windows)]
+fn vpn_down(st: &Shared, v: Vpn) {
+    v.helper.stop(st, "tun", "VPN выключен");
+    quiet(&["ipconfig", "/flushdns"]);
+    st.lock().unwrap().vpn_active = false;
 }
 
 fn vpn_sig(cfg: &Config) -> String {
@@ -748,7 +865,7 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
     })
 }
 
-fn handle_conn(conn: UnixStream, st: Shared, cfg: Arc<Mutex<Config>>, tx: mpsc::Sender<Msg>) {
+fn handle_conn(conn: platform::Stream, st: Shared, cfg: Arc<Mutex<Config>>, tx: mpsc::Sender<Msg>) {
     let mut r = BufReader::new(match conn.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -802,35 +919,13 @@ fn handle_conn(conn: UnixStream, st: Shared, cfg: Arc<Mutex<Config>>, tx: mpsc::
     }
 }
 
-fn listen(path: &Path) -> std::io::Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-        let _ = std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755));
-    }
-    let _ = std::fs::remove_file(path);
-    let l = UnixListener::bind(path)?;
-    // root:yggproxy 0660 when the group exists (yggproxy install creates it), else root only.
-    let grp = std::ffi::CString::new("yggproxy").unwrap();
-    let g = unsafe { libc::getgrnam(grp.as_ptr()) };
-    let mode = if g.is_null() { 0o600 } else {
-        let cp = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
-        unsafe { libc::chown(cp.as_ptr(), 0, (*g).gr_gid) };
-        0o660
-    };
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
-    Ok(l)
-}
-
-static TERM: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_term(_: libc::c_int) {
-    TERM.store(true, Ordering::Relaxed);
-}
-
 pub fn main() -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
-        return Err("служба должна работать от root (sudo yggproxy daemon или systemctl start yggproxy)".into());
+    if !platform::is_admin() {
+        return Err(if cfg!(windows) {
+            "служба должна работать от администратора (yggproxy install ставит её службой Windows)".into()
+        } else {
+            "служба должна работать от root (sudo yggproxy daemon или systemctl start yggproxy)".into()
+        });
     }
     let dir = config::state_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -839,15 +934,13 @@ pub fn main() -> Result<(), String> {
     let cfg = Arc::new(Mutex::new(Config::load()));
     log(&st, "service", &format!("yggproxy {} запущен, настройки {}", env!("CARGO_PKG_VERSION"), config::config_path().display()));
 
-    unsafe {
-        libc::signal(libc::SIGTERM, on_term as *const () as usize);
-        libc::signal(libc::SIGINT, on_term as *const () as usize);
-    }
+    platform::on_stop_signal();
     // Leftovers of a crash: stale rules would black-hole traffic.
+    #[cfg(unix)]
     routes(&st, false, true);
 
     let (tx, rx) = mpsc::channel::<Msg>();
-    let listener = listen(&config::socket_path()).map_err(|e| format!("{}: {e}", config::socket_path().display()))?;
+    let listener = platform::listen().map_err(|e| format!("{}: {e}", platform::ctl_name()))?;
     {
         let (st, cfg, tx) = (st.clone(), cfg.clone(), tx.clone());
         std::thread::spawn(move || {
@@ -866,7 +959,7 @@ pub fn main() -> Result<(), String> {
     let mut last_tracker_peers: Option<Instant> = None;
     let mut last_trackers: Option<Instant> = None;
     let trackers_busy = Arc::new(AtomicBool::new(false));
-    while !TERM.load(Ordering::Relaxed) {
+    while !platform::stopping() {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Msg::Reconcile) => {
                 let c = cfg.lock().unwrap().clone();
@@ -918,6 +1011,6 @@ pub fn main() -> Result<(), String> {
     }
     log(&st, "service", "получен сигнал остановки");
     d.stop_all();
-    let _ = std::fs::remove_file(config::socket_path());
+    platform::unlisten();
     Ok(())
 }
