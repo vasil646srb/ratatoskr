@@ -28,20 +28,22 @@ pub fn command(prog: impl AsRef<std::ffi::OsStr>) -> Command {
     c
 }
 
-/// Download `url` to `path`: curl, then wget, then (Windows) PowerShell.
-pub fn download(url: &str, path: &std::path::Path) -> bool {
-    let ok = |c: &mut Command| c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
-    if ok(command("curl").args(["-fsSL", "--max-time", "30", "-o"]).arg(path).arg(url)) {
-        return true;
-    }
-    if cfg!(unix) {
-        return ok(command("wget").args(["-q", "-T", "30", "-O"]).arg(path).arg(url));
-    }
-    let script = format!(
-        "$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -UseBasicParsing -TimeoutSec 30 -Uri '{url}' -OutFile '{}'",
-        path.display()
-    );
-    ok(command("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]))
+/// Download a text file over HTTP(S) in-process (rustls with the Mozilla root certificates, no
+/// curl/wget/PowerShell and no system TLS library). At most 32 MB, 30 s per stage.
+pub fn download_text(url: &str) -> Result<String, String> {
+    use std::io::Read;
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(30))
+        .user_agent(concat!("yggproxy/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let resp = agent.get(url).call().map_err(|e| match e {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        ureq::Error::Transport(t) => t.to_string(),
+    })?;
+    let mut body = Vec::new();
+    resp.into_reader().take(32 << 20).read_to_end(&mut body).map_err(|e| e.to_string())?;
+    String::from_utf8(body).map_err(|_| "ответ не текст (UTF-8)".into())
 }
 
 // ------------------------------------------------------------------------------------------

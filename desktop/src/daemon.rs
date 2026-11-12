@@ -245,14 +245,15 @@ fn refresh_public(st: &Shared, dir: &Path, force: bool) {
         return;
     }
     let tmp = dir.join("public-peers.json.tmp");
-    let ok = platform::download(PUBLIC_PEERS_URL, &tmp);
-    let valid = ok && std::fs::read_to_string(&tmp).map(|t| t.trim_start().starts_with('{') && (t.contains("tls://") || t.contains("tcp://"))).unwrap_or(false);
-    if valid {
-        let _ = std::fs::rename(&tmp, &p);
-        log(st, "peers", "публичный список загружен");
-    } else {
-        let _ = std::fs::remove_file(&tmp);
-        error(st, "peers", &format!("не удалось скачать публичный список{}", if p.exists() { " — используется сохранённый" } else { "" }));
+    let got = platform::download_text(PUBLIC_PEERS_URL).and_then(|t| {
+        if t.trim_start().starts_with('{') && (t.contains("tls://") || t.contains("tcp://")) { Ok(t) } else { Err("это не список пиров".into()) }
+    });
+    match got.and_then(|t| std::fs::write(&tmp, t).and_then(|_| std::fs::rename(&tmp, &p)).map_err(|e| e.to_string())) {
+        Ok(()) => log(st, "peers", "публичный список загружен"),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            error(st, "peers", &format!("не удалось скачать публичный список ({e}){}", if p.exists() { " — используется сохранённый" } else { "" }));
+        }
     }
 }
 

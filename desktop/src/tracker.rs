@@ -439,11 +439,17 @@ fn parse_public_list(text: &str) -> Vec<(String, String, String)> {
 }
 
 fn download(url: &str) -> Option<String> {
-    let tmp = config::state_dir().join("download.tmp");
-    let ok = crate::platform::download(url, &tmp);
-    let text = std::fs::read_to_string(&tmp).ok();
-    let _ = std::fs::remove_file(&tmp);
-    text.filter(|t| ok && t.trim_start().starts_with('{'))
+    match crate::platform::download_text(url) {
+        Ok(t) if t.trim_start().starts_with('{') => Some(t),
+        Ok(_) => {
+            log(&format!("{url}: ответ не JSON"));
+            None
+        }
+        Err(e) => {
+            log(&format!("{url}: {e}"));
+            None
+        }
+    }
 }
 
 /// TCP connect time from here (ms), as a liveness check of a peer URI.
