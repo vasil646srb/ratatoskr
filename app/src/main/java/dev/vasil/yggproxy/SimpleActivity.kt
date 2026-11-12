@@ -47,11 +47,21 @@ class SimpleActivity : Activity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#F4F6F4"))
-            setPadding(dp(20), dp(28), dp(20), dp(12))
+            setPadding(dp(20), dp(12), dp(20), dp(12))
         }
-        root.addView(TextView(this).apply {
+        // Top bar: the name and the way into the full app.
+        val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        top.addView(TextView(this).apply {
             text = "Ratatoskr"; textSize = 26f; setTypeface(typeface, Typeface.BOLD); setTextColor(ACCENT)
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        top.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
+            text = "Эксперт ›"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
+            setOnClickListener {
+                prefs.advancedMode = true
+                openAdvanced()
+            }
         })
+        root.addView(top)
         root.addView(TextView(this).apply {
             text = "Интернет через Yggdrasil"; textSize = 14f; setTextColor(Color.DKGRAY); setPadding(0, 0, 0, dp(16))
         })
@@ -66,13 +76,6 @@ class SimpleActivity : Activity() {
         stepsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(16), 0, dp(16)) }
         scroll = ScrollView(this).apply { addView(stepsBox) }
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
-        root.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = "Расширенный режим"; isAllCaps = false; textSize = 14f; setTextColor(ACCENT)
-            setOnClickListener {
-                prefs.advancedMode = true
-                openAdvanced()
-            }
-        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { gravity = Gravity.CENTER_HORIZONTAL })
         setContentView(root)
         if (Build.VERSION.SDK_INT >= 21) window.statusBarColor = ACCENT
         render()

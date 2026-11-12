@@ -118,6 +118,14 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        // Simple mode unless the full app was chosen: the launcher icon (and old home-screen
+        // shortcuts) open this activity, so it hands over to the one-button screen here.
+        // yggproxy:// links stay in the full app.
+        if (!prefs.advancedMode && intent?.action != Intent.ACTION_VIEW) {
+            startActivity(Intent(this, SimpleActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NO_ANIMATION))
+            finish()
+            return
+        }
 
         // Content between the system bars; the bars themselves sit on the accent colour.
         // Tabs at the bottom, hidden while the keyboard is open.

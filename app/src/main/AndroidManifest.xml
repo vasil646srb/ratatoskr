@@ -25,23 +25,17 @@
         android:theme="@android:style/Theme.Material.Light.NoActionBar"
         android:supportsRtl="false">
 
-        <!-- Simple mode (one button) is the start screen; it opens MainActivity in advanced mode. -->
-        <activity
-            android:name=".SimpleActivity"
-            android:exported="true"
-            android:launchMode="singleTask"
-            android:screenOrientation="portrait">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
-
+        <!-- The launcher entry stays MainActivity (home-screen shortcuts keep working); it opens
+             the simple one-button screen unless the full app ("Эксперт") was chosen. -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
             android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
             <!-- Quick connect link from the server's QR code: yggproxy://c?a=ADDR&p=PORT -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -50,6 +44,12 @@
                 <data android:scheme="yggproxy" android:host="c" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".SimpleActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait" />
 
         <activity
             android:name=".ScanActivity"
