@@ -249,6 +249,11 @@ fn write_peer_file(dir: &Path, cfg: &Config) {
             out.push_str(&p);
         }
     }
+    // Peers checked by the trackers (works where the public list's site is blocked).
+    if let Ok(p) = std::fs::read_to_string(dir.join("tracker-peers.json")) {
+        out.push_str(",\"tracker\":");
+        out.push_str(&p);
+    }
     out.push('}');
     let _ = std::fs::write(dir.join("peers.json"), out);
 }
@@ -769,6 +774,7 @@ pub fn main() -> Result<(), String> {
     d.reconcile(&snapshot);
     let mut last_poll = Instant::now();
     let mut last_peer_check = Instant::now();
+    let mut last_tracker_peers: Option<Instant> = None;
     while !TERM.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Msg::Reconcile) => {
@@ -792,6 +798,25 @@ pub fn main() -> Result<(), String> {
             let mut s = st.lock().unwrap();
             s.node_stats = stats;
             s.node_peers = peers;
+        }
+        // Public peers checked by a tracker, hourly (fetched through the node's --socks).
+        if d.node.is_some() && last_tracker_peers.map_or(true, |t| t.elapsed() >= Duration::from_secs(3600))
+            && last_poll.elapsed() < Duration::from_secs(1) && st.lock().unwrap().node_stats.is_some()
+        {
+            last_tracker_peers = Some(Instant::now());
+            let (st2, dir2) = (st.clone(), dir.clone());
+            std::thread::spawn(move || {
+                for t in crate::tracker::DEFAULT_TRACKERS.iter().filter_map(|t| t.parse().ok()) {
+                    if let Ok(v) = crate::tracker::fetch(t, "/peers") {
+                        let n = v["peers"].as_array().map(|a| a.len()).unwrap_or(0);
+                        if n > 0 {
+                            let _ = std::fs::write(dir2.join("tracker-peers.json"), v.to_string());
+                            log(&st2, "peers", &format!("от трекера {t}: {n} проверенных пиров (в ход при следующем запуске узла)"));
+                            return;
+                        }
+                    }
+                }
+            });
         }
         if last_peer_check.elapsed() >= Duration::from_secs(600) && d.node.is_some() {
             last_peer_check = Instant::now();

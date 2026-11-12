@@ -98,7 +98,8 @@ measuring time are configurable.
 (`debug_remotegetpeers`) it crawls the whole network starting from its own peers and checks port
 27080 on every node (SOCKS5 plus an allowed CONNECT to the speed-test port, which is how a
 Ratatoskr exit is told apart from other proxies) and the tracker port 27081. The list is served
-over HTTP: `GET /exits`, `GET /trackers`, `GET /info`. Trackers fetch each other's lists and probe
+over HTTP: `GET /exits`, `GET /trackers`, `GET /peers` (public peers checked by the tracker, so a
+node finds peers even where the list's website is blocked), `GET /info`. Trackers fetch each other's lists and probe
 every received entry themselves. The app queries trackers through its own node
 (`tcp_node --socks`) every 2 minutes and learns about new trackers on its own.
 
@@ -110,6 +111,7 @@ Tracker schedule (configurable in `/etc/yggproxy/tracker.json`):
 | re-check of known exits | every 5 min |
 | sync with other trackers | every 5 min |
 | an exit is dropped from the list | after 24 h without an answer |
+| public peers: download the list and check every peer | hourly |
 
 ## Ports
 

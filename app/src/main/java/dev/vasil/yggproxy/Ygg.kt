@@ -302,7 +302,7 @@ object Ygg {
     private fun jsonStr(s: String) = JSONObject.quote(s)
 
     /** tcp_node --peers file: custom peers plus the cached public list (scanner ignores structure). */
-    fun writePeerFile(dst: File, custom: List<String>, publicList: File?) {
+    fun writePeerFile(dst: File, custom: List<String>, publicList: File?, trackerList: File? = null) {
         val sb = StringBuilder("{\"custom\":{")
         custom.forEachIndexed { i, u ->
             if (i > 0) sb.append(',')
@@ -311,6 +311,10 @@ object Ygg {
         sb.append('}')
         if (publicList != null && publicList.isFile && publicList.length() > 2) {
             sb.append(",\"public\":").append(publicList.readText())
+        }
+        // Peers checked by the trackers (works where the public list's site is blocked).
+        if (trackerList != null && trackerList.isFile && trackerList.length() > 2) {
+            sb.append(",\"tracker\":").append(trackerList.readText())
         }
         sb.append('}')
         dst.writeText(sb.toString())

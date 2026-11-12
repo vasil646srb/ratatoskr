@@ -7,7 +7,10 @@
 //! - probe: TCP to `[addr]:27080` through the TUN, a SOCKS5 greeting and a CONNECT to the exit's
 //!   speed-test port (only Ratatoskr exits allow that) — an exit; `[addr]:27081 /info` — a tracker;
 //! - sync: other trackers' lists are fetched and every entry is probed again before it is listed;
-//! - API (HTTP on our Yggdrasil address, port 27081): `GET /exits`, `GET /trackers`, `GET /info`.
+//! - public peers: the public peer list (plus our own working peers), checked from here, served as
+//!   `GET /peers` so clients can find peers even where the list's website is blocked;
+//! - API (HTTP on our Yggdrasil address, port 27081): `GET /exits`, `GET /trackers`, `GET /peers`,
+//!   `GET /info`.
 
 use crate::config;
 use serde::{Deserialize, Serialize};
@@ -36,6 +39,9 @@ pub struct TrackerConfig {
     pub crawl_workers: usize,
     pub probe_workers: usize,
     pub max_nodes: usize,
+    /// How often the public peer list is downloaded and checked.
+    pub peers_interval_min: u64,
+    pub public_peers_url: String,
     pub trackers: Vec<String>,
 }
 
@@ -50,6 +56,8 @@ impl Default for TrackerConfig {
             crawl_workers: 24,
             probe_workers: 64,
             max_nodes: 50_000,
+            peers_interval_min: 60,
+            public_peers_url: "https://publicpeers.neilalexander.dev/publicnodes.json".into(),
             trackers: DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect(),
         }
     }
@@ -291,6 +299,9 @@ pub struct Db {
     pub trackers: HashMap<String, Entry>,
     pub last_crawl: u64,
     pub crawl_nodes: usize,
+    /// Public peers checked from this tracker: {uri, key, region, rtt_ms, source}.
+    pub peers: Vec<Value>,
+    pub peers_updated: u64,
 }
 
 impl Db {
@@ -365,6 +376,105 @@ fn check_trackers(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, Str
 }
 
 // ------------------------------------------------------------------------------------------
+// Public peers
+
+/// `tcp://`/`tls://` peers of the public list: (uri with ?key=, key, region).
+fn parse_public_list(text: &str) -> Vec<(String, String, String)> {
+    let Ok(v) = serde_json::from_str::<Value>(text) else { return Vec::new() };
+    let mut out = Vec::new();
+    for (region, peers) in v.as_object().into_iter().flatten() {
+        for (uri, info) in peers.as_object().into_iter().flatten() {
+            if info["up"].as_bool() == Some(false) || !(uri.starts_with("tcp://") || uri.starts_with("tls://")) {
+                continue;
+            }
+            let key = info["key"].as_str().filter(|k| k.len() == 64).unwrap_or("").to_string();
+            let full = if !key.is_empty() && !uri.contains('?') { format!("{uri}?key={key}") } else { uri.clone() };
+            out.push((full, key, region.trim_end_matches(".md").to_string()));
+        }
+    }
+    out
+}
+
+fn download(url: &str) -> Option<String> {
+    let out = std::process::Command::new("curl").args(["-fsSL", "--max-time", "30", url]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned()).filter(|t| t.trim_start().starts_with('{'))
+}
+
+/// TCP connect time from here (ms), as a liveness check of a peer URI.
+fn probe_uri(uri: &str) -> Option<u64> {
+    let rest = uri.split("://").nth(1)?.split('?').next()?;
+    let t0 = Instant::now();
+    let addrs: Vec<SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(rest).ok()?.collect();
+    let a = addrs.first()?;
+    TcpStream::connect_timeout(a, Duration::from_secs(3)).ok()?;
+    Some(t0.elapsed().as_millis() as u64)
+}
+
+/// Download the public list (or take other trackers' lists), add our own working peers, check
+/// every peer from here and keep the ones that answer.
+fn refresh_peers(db: &Mutex<Db>, cfg: &TrackerConfig, others: &[Ipv6Addr]) {
+    let mut cands: Vec<(String, String, String, String)> = Vec::new(); // uri, key, region, source
+    match download(&cfg.public_peers_url) {
+        Some(t) => cands.extend(parse_public_list(&t).into_iter().map(|(u, k, r)| (u, k, r, "public".into()))),
+        None => {
+            log("публичный список пиров не скачивается — беру у других трекеров");
+            for t in others {
+                if let Some(v) = http_get(*t, TRACKER_PORT, "/peers") {
+                    for p in v["peers"].as_array().into_iter().flatten() {
+                        if let Some(u) = p["uri"].as_str() {
+                            cands.push((u.into(), p["key"].as_str().unwrap_or("").into(), p["region"].as_str().unwrap_or("").into(), format!("sync:{t}")));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Our own yggdrasil-go peers that are up work for sure.
+    if let Ok(p) = admin(&cfg.admin_socket, "getpeers", json!({})) {
+        for e in p["peers"].as_array().into_iter().flatten().filter(|e| e["up"].as_bool() == Some(true) && e["inbound"].as_bool() != Some(true)) {
+            if let (Some(u), Some(k)) = (e["remote"].as_str(), e["key"].as_str()) {
+                if u.starts_with("tcp://") || u.starts_with("tls://") {
+                    let full = if u.contains('?') { u.to_string() } else { format!("{u}?key={k}") };
+                    cands.push((full, k.into(), String::new(), "tracker".into()));
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    cands.retain(|c| seen.insert(c.0.clone()));
+    if cands.is_empty() {
+        log("пиров для проверки нет");
+        return;
+    }
+    let q = Arc::new(Mutex::new(cands));
+    let out: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let hs: Vec<_> = (0..cfg.probe_workers.max(1))
+        .map(|_| {
+            let (q, out) = (q.clone(), out.clone());
+            std::thread::spawn(move || loop {
+                let Some((uri, key, region, source)) = q.lock().unwrap().pop() else { return };
+                if let Some(rtt) = probe_uri(&uri) {
+                    out.lock().unwrap().push(json!({"uri": uri, "key": key, "region": region, "rtt_ms": rtt, "source": source}));
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        let _ = h.join();
+    }
+    let mut peers = std::mem::take(&mut *out.lock().unwrap());
+    peers.sort_by_key(|p| p["rtt_ms"].as_u64().unwrap_or(u64::MAX));
+    let n = peers.len();
+    let mut d = db.lock().unwrap();
+    if n > 0 {
+        d.peers = peers;
+        d.peers_updated = now();
+        d.save();
+    }
+    log(&format!("публичные пиры: отвечают {n}"));
+}
+
+// ------------------------------------------------------------------------------------------
 // API
 
 fn list_json(map: &HashMap<String, Entry>, cfg: &TrackerConfig, key: &str) -> Value {
@@ -400,11 +510,17 @@ fn serve(listener: TcpListener, db: Arc<Mutex<Db>>, cfg: TrackerConfig, me: Ipv6
                         }
                         ("200 OK", v)
                     }
+                    "/peers" => (
+                        "200 OK",
+                        json!({"service": "ratatoskr-tracker", "peers": d.peers, "updated": d.peers_updated,
+                               "note": "rtt_ms is the TCP connect time from this tracker"}),
+                    ),
                     "/" | "/info" => (
                         "200 OK",
                         json!({"service": "ratatoskr-tracker", "version": env!("CARGO_PKG_VERSION"), "address": me.to_string(),
                                "proxy_port": config::PORT, "exits": d.exits.values().filter(|e| listed(e, &cfg)).count(),
                                "trackers": d.trackers.values().filter(|e| listed(e, &cfg)).count(),
+                               "peers": d.peers.len(),
                                "last_crawl": d.last_crawl, "crawl_nodes": d.crawl_nodes}),
                     ),
                     _ => ("404 Not Found", json!({"error": "not found"})),
@@ -444,7 +560,17 @@ pub fn main() -> Result<(), String> {
     check_trackers(&db, &cfg, seeds, me);
 
     let (mut last_crawl, mut last_recheck, mut last_sync) = (None::<Instant>, Instant::now(), None::<Instant>);
+    let mut last_peers = None::<Instant>;
     loop {
+        // Public peers: downloaded and checked from here (from other trackers if blocked).
+        if last_peers.map_or(true, |t| t.elapsed() >= Duration::from_secs(cfg.peers_interval_min * 60)) {
+            last_peers = Some(Instant::now());
+            let others: Vec<Ipv6Addr> = {
+                let d = db.lock().unwrap();
+                d.trackers.iter().filter(|(_, e)| listed(e, &cfg)).filter_map(|(a, _)| a.parse().ok()).chain(cfg.trackers.iter().filter_map(|t| t.parse().ok())).filter(|a| *a != me).collect()
+            };
+            refresh_peers(&db, &cfg, &others);
+        }
         // Sync: other trackers' exits and trackers, verified by our own probes.
         if last_sync.map_or(true, |t| t.elapsed() >= Duration::from_secs(cfg.sync_interval_min * 60)) {
             last_sync = Some(Instant::now());

@@ -545,13 +545,27 @@ class MainActivity : Activity() {
                     for (k in 0 until a.length()) Ygg.serverFromText(a.getJSONObject(k).optString("address"))?.let { newTrackers += it }
                 }
             }
+            // Public peers checked by a tracker, hourly: the node uses them on its next start.
+            var peersNote = ""
+            if (ok.isNotEmpty() && System.currentTimeMillis() - State.trackerPeersAt > 3_600_000) {
+                for (t in ok) {
+                    val p = Ygg.fetchTracker(t, "/peers") ?: continue
+                    val n = p.optJSONArray("peers")?.length() ?: 0
+                    if (n > 0) {
+                        java.io.File(filesDir, "tracker-peers.json").writeText(p.toString())
+                        State.trackerPeersAt = System.currentTimeMillis()
+                        peersNote = ", пиров $n"
+                        break
+                    }
+                }
+            }
             val known = prefs.trackerList()
             val add = newTrackers.distinct().filter { it !in known }
             if (add.isNotEmpty()) prefs.trackers = (known + add).joinToString("\n")
             if (ok.isNotEmpty()) State.trackerExits = exits.map { it.key to it.value }.take(50)
             val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date())
             State.trackerStatus = if (ok.isEmpty()) "$time: трекеры недоступны"
-                else "$time: серверов ${exits.size} от ${ok.size} трекер(ов)" + if (add.isNotEmpty()) ", новых трекеров ${add.size}" else ""
+                else "$time: серверов ${exits.size} от ${ok.size} трекер(ов)$peersNote" + if (add.isNotEmpty()) ", новых трекеров ${add.size}" else ""
             State.log("trackers", State.trackerStatus)
             writeMonitors()
             trackerBusy = false

@@ -296,8 +296,9 @@ class YggService : VpnService() {
         }
         val custom = prefs.customPeerList()
         val pub = if (prefs.usePublicPeers) publicPeers else null
-        Ygg.writePeerFile(peerFile, custom, pub)
-        if (custom.isEmpty() && (pub == null || !pub.isFile)) State.error("peers", "нет ни одного пира: добавьте свои или включите публичный список")
+        val fromTrackers = File(filesDir, "tracker-peers.json").takeIf { prefs.useTrackers && it.isFile }
+        Ygg.writePeerFile(peerFile, custom, pub, fromTrackers)
+        if (custom.isEmpty() && (pub == null || !pub.isFile) && fromTrackers == null) State.error("peers", "нет ни одного пира: добавьте свои или включите публичный список")
     }
 
     // ---------------------------------------------------------------------------------------

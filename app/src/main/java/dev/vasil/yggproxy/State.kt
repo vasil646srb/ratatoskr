@@ -19,6 +19,8 @@ object State {
     @Volatile var trackerExits: List<Pair<String, Long>> = emptyList()
     @Volatile var trackerStatus: String = "ещё не запрашивались"
     @Volatile var trackerAt = 0L
+    /** Last time public peers were taken from a tracker (hourly). */
+    @Volatile var trackerPeersAt = 0L
     @Volatile var nodeRunning = false
     @Volatile var nodeRestarts = 0
     @Volatile var nodeStartedAt = 0L
