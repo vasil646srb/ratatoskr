@@ -35,7 +35,12 @@ class SimpleActivity : Activity() {
     private lateinit var scroll: ScrollView
 
     @Volatile private var flow: Thread? = null
-    @Volatile private var cancelled = false
+    /** Number of the current connection attempt; a cancelled attempt's thread sees a newer one. */
+    @Volatile private var gen = 0
+    /** The attempt this thread works for (set when the thread starts). */
+    private val myGen = ThreadLocal<Int>()
+    /** False on a cancelled attempt's thread: it must not touch the screen or the settings. */
+    private fun alive() = myGen.get() == null || myGen.get() == gen
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -129,11 +134,7 @@ class SimpleActivity : Activity() {
 
     private fun onButton() {
         when {
-            flow != null -> {
-                cancelled = true
-                flow?.interrupt()
-                say("Отменено", Mark.FAIL)
-            }
+            flow != null -> cancelFlow()
             prefs.vpnEnabled -> {
                 prefs.vpnEnabled = false
                 YggService.send(this, YggService.ACTION_RECONCILE)
@@ -170,8 +171,30 @@ class SimpleActivity : Activity() {
     private var current: TextView? = null
     private var currentText = ""
 
+    /**
+     * Cancel: back to the start at once — VPN off (the attempt may have turned it on to test
+     * servers), steps cleared, «Подключиться». The old thread may still sit in a network call;
+     * it is detached and changes nothing any more.
+     */
+    private fun cancelFlow() {
+        val t = flow
+        gen++
+        flow = null
+        t?.interrupt()
+        prefs.vpnEnabled = false
+        YggService.send(this, YggService.ACTION_RECONCILE)
+        stepsBox.removeAllViews()
+        current = null
+        State.log("simple", "подключение отменено")
+        render()
+    }
+
     /** A new step (shown as in progress) or a plain line. Safe from any thread. */
-    private fun say(text: String, mark: Mark = Mark.WORK) = ui.post {
+    private fun say(text: String, mark: Mark = Mark.WORK) {
+        if (alive()) sayNow(text, mark)
+    }
+
+    private fun sayNow(text: String, mark: Mark) = ui.post {
         State.log("simple", text)
         val tv = TextView(this).apply {
             textSize = if (mark == Mark.INFO) 13.5f else 15.5f
@@ -185,7 +208,11 @@ class SimpleActivity : Activity() {
     }
 
     /** Close the current step: ✓ (or ✗) with a short result. */
-    private fun finish(result: String, ok: Boolean = true) = ui.post {
+    private fun finish(result: String, ok: Boolean = true) {
+        if (alive()) finishNow(result, ok)
+    }
+
+    private fun finishNow(result: String, ok: Boolean) = ui.post {
         val tv = current ?: return@post
         val m = if (ok) Mark.DONE else Mark.FAIL
         tv.text = "${m.sign} $currentText" + (if (result.isNotEmpty()) " — $result" else "")
@@ -194,7 +221,9 @@ class SimpleActivity : Activity() {
         current = null
     }
 
-    private fun headline(t: String) = ui.post { tvState.text = t }
+    private fun headline(t: String) {
+        if (alive()) ui.post { tvState.text = t }
+    }
 
     // ------------------------------------------------------------------------------- the connection
 
@@ -202,9 +231,11 @@ class SimpleActivity : Activity() {
 
     private fun startFlow() {
         if (flow != null) return
-        cancelled = false
         stepsBox.removeAllViews()
+        current = null
+        val g = ++gen
         val t = Thread {
+            myGen.set(g)
             try {
                 connectFlow()
             } catch (e: Stop) {
@@ -212,13 +243,15 @@ class SimpleActivity : Activity() {
                 say(e.message ?: "не удалось", Mark.FAIL)
                 headline("Не подключено")
             } catch (e: InterruptedException) {
-                headline("Отменено")
+                // cancelled: cancelFlow has already reset the screen
             } catch (e: Exception) {
                 finish("ошибка: ${e.message}", ok = false)
                 headline("Не подключено")
             } finally {
-                flow = null
-                ui.post { render() }
+                if (alive()) {
+                    flow = null
+                    ui.post { render() }
+                }
             }
         }
         flow = t
@@ -228,9 +261,9 @@ class SimpleActivity : Activity() {
     }
 
     private fun pause(ms: Long) {
-        if (cancelled) throw InterruptedException()
+        if (!alive()) throw InterruptedException()
         Thread.sleep(ms)
-        if (cancelled) throw InterruptedException()
+        if (!alive()) throw InterruptedException()
     }
 
     /** Wait up to [secs] for [f] to give a non-null value, polling every second. */
@@ -279,7 +312,7 @@ class SimpleActivity : Activity() {
         val exits = LinkedHashMap<String, Long>()
         var answered: String? = null
         for (t in prefs.trackerList()) {
-            if (cancelled) throw InterruptedException()
+            if (!alive()) throw InterruptedException()
             say("спрашиваю трекер $t", Mark.INFO)
             val v = Ygg.fetchTracker(t, "/exits") ?: Ygg.fetchTracker(t, "/exits") ?: continue
             answered = answered ?: t
@@ -376,10 +409,17 @@ class SimpleActivity : Activity() {
      * connections through the previous server, so nothing measured afterwards belongs to it.
      */
     private fun useServer(server: String): Boolean {
+        if (!alive()) throw InterruptedException()
         prefs.addServer(server)
         prefs.server = server
         prefs.vpnEnabled = true
         YggService.send(this, YggService.ACTION_RECONCILE)
+        if (!alive()) {
+            // Cancelled right while switching: leave the VPN off as the cancel did.
+            prefs.vpnEnabled = false
+            YggService.send(this, YggService.ACTION_RECONCILE)
+            throw InterruptedException()
+        }
         val ok = waitFor(60) {
             val target = State.vpnTarget?.let { Ygg.serverFromText(it) }
             if (target == server && State.vpnActive) true else null
