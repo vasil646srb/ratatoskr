@@ -658,6 +658,61 @@ fn node_line(st: &Shared, l: &str) {
 }
 
 // ------------------------------------------------------------------------------------------
+// Peer journal
+
+fn peer_journal(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>) {
+    use crate::peerstats::{prefer_list, Journal};
+    let path = dir.join("peer-journal.json");
+    let mut j = Journal::load(&path);
+    let mut ticks = 0u64;
+    let mut last_prefer = String::new();
+    while !platform::stopping() {
+        std::thread::sleep(Duration::from_secs(10));
+        let (peers, rtt, running) = {
+            let s = st.lock().unwrap();
+            (s.node_peers.clone(), s.node_rtt.clone(), s.node_running)
+        };
+        let Some(peers) = peers.filter(|_| running) else { continue };
+        // Ping to the server we are connected to (the target the node pings for the VPN).
+        let server = rtt.as_ref().and_then(|r| {
+            r["servers"].as_array()?.iter().find(|e| e["connected"].as_bool() == Some(true))?["avg_ms"].as_f64()
+        });
+        j.tick(&peers, server);
+        ticks += 1;
+        if ticks % 6 == 0 {
+            j.save(&path);
+            let tracker_peers: Option<Value> = std::fs::read_to_string(dir.join("tracker-peers.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
+            let list = prefer_list(&j, tracker_peers.as_ref(), 12).join("\n");
+            if list != last_prefer {
+                let _ = std::fs::write(dir.join("prefer.txt"), &list);
+                let n = list.lines().count();
+                if last_prefer.is_empty() || ticks % 360 == 0 {
+                    log(&st, "peers", &format!("приоритет пиров обновлён: {n} (свои лучшие и рейтинг трекеров)"));
+                }
+                last_prefer = list;
+            }
+        }
+        // Anonymous summary to one tracker every 30 min.
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+        if t.saturating_sub(j.last_report) >= 1800 {
+            let rep = j.report();
+            let n = rep["peers"].as_array().map(|a| a.len()).unwrap_or(0);
+            if n > 0 && cfg.lock().unwrap().network.use_trackers {
+                j.last_report = t;
+                let trackers = crate::tracker::with_defaults(&cfg.lock().unwrap().network.trackers);
+                for tr in trackers.iter().filter_map(|t| config::parse_server(t)) {
+                    if crate::tracker::post(tr, "/report", &rep).is_ok() {
+                        log(&st, "peers", &format!("статистика {n} пиров отправлена трекеру {tr}"));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    j.save(&path);
+}
+
+// ------------------------------------------------------------------------------------------
 // Reconcile
 
 struct Daemon {
@@ -709,6 +764,9 @@ impl Daemon {
         a.extend([
             "--connect-file".into(),
             format!("{}:{}", config::CLIENT_SOCKS, d.join("connect.txt").display()),
+            // Peers ranked by how well they carried our traffic (and by the trackers' reports).
+            "--prefer-file".into(),
+            d.join("prefer.txt").display().to_string(),
             "--rtt-limit".into(),
             n.rtt_limit.clamp(10, 5000).to_string(),
             "--fwmark".into(),
@@ -981,6 +1039,13 @@ pub fn main() -> Result<(), String> {
                 std::thread::sleep(Duration::from_millis(1000).saturating_sub(t0.elapsed()));
             }
         });
+    }
+
+    // Peer journal: every 10 s what each peer did; every minute the node's priority list; every
+    // 30 min an anonymous summary to a tracker (no client address, no exit server).
+    {
+        let (st, dir, cfg) = (st.clone(), dir.clone(), cfg.clone());
+        std::thread::spawn(move || peer_journal(st, dir, cfg));
     }
 
     let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, exit: None, vpn: None };

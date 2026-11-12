@@ -109,6 +109,15 @@ threshold (100 ms by default) it replaces the slowest peer, measures the new one
 if the swap did not help, waits twice as long before the next one. Threshold, pause and
 measuring time are configurable.
 
+**Peer statistics.** Every 10 s a client (the app and the PC service) records how each peer
+carried its traffic: ping to the peer, ping to the exit server while that peer carried the
+traffic, speed from real traffic, drops. That gives a ranking; the node dials the best peers
+first (`tcp_node --prefer-file`) and every 2 minutes replaces its worst peer with a better free
+one. Every 30 minutes the client sends a tracker an anonymous per-peer summary (no client
+address, no exit server, `POST /report`); trackers merge the reports, share them
+(`GET /peerstats`) and serve `/peers` sorted by the combined score. A client's priority list is
+its own best peers, then the trackers' ranking.
+
 **Trackers.** A tracker runs its own Yggdrasil node — [yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng)
 as a library, with a TCP stack of its own: no yggdrasil-go, TUN or root. With the remote getPeers
 request it crawls the whole network starting from its own peers and checks port

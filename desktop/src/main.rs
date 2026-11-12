@@ -13,6 +13,7 @@ mod install;
 #[path = "install_win.rs"]
 mod install;
 mod platform;
+mod peerstats;
 mod tracker;
 mod ygg_net;
 

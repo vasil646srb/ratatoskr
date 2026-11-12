@@ -80,7 +80,52 @@ class YggService : VpnService() {
         prefs = Prefs(this)
         State.serviceRunning = true
         instance = this
+        journalTimer.scheduleWithFixedDelay({ journalTick() }, 10, 10, java.util.concurrent.TimeUnit.SECONDS)
     }
+
+    // ------------------------------------------------------------------ peer journal
+
+    private val journalTimer = Executors.newSingleThreadScheduledExecutor()
+    private val journal by lazy { PeerJournal(File(filesDir, "peer-journal.json")) }
+    private val preferFile get() = File(filesDir, "prefer.txt")
+    private var journalTicks = 0L
+
+    /**
+     * Every 10 s: what each peer did (see PeerJournal). Every minute: the node's priority list
+     * (our own best peers, then the trackers' ranking). Every 30 min: an anonymous summary to a
+     * tracker (no address, no exit server).
+     */
+    private fun journalTick() { try {
+        if (State.nodeRunning) Ygg.fetchPeers()?.let { peers ->
+            val server = Ygg.fetchRtt()?.optJSONArray("servers")?.let { a ->
+                (0 until a.length()).map { a.getJSONObject(it) }.firstOrNull { it.optBoolean("connected") && !it.isNull("avg_ms") }?.optDouble("avg_ms")
+            }
+            synchronized(journal) {
+                journal.tick(peers, server)
+                journalTicks++
+                if (journalTicks % 6 == 0L) {
+                    journal.save()
+                    val tp = try { org.json.JSONObject(File(filesDir, "tracker-peers.json").readText()) } catch (_: Exception) { null }
+                    val list = journal.preferList(if (prefs.useTrackers) tp else null).joinToString("\n")
+                    if (!preferFile.exists() || preferFile.readText() != list) {
+                        preferFile.writeText(list)
+                        if (journalTicks == 6L) State.log("peers", "приоритет пиров: ${list.lines().count { it.isNotBlank() }} (свои лучшие и рейтинг трекеров)")
+                    }
+                }
+                val now = System.currentTimeMillis() / 1000
+                if (prefs.useTrackers && now - journal.lastReport >= 1800) {
+                    val rep = journal.report()
+                    val n = rep.optJSONArray("peers")?.length() ?: 0
+                    if (n > 0) {
+                        journal.lastReport = now
+                        for (t in prefs.trackerList()) {
+                            if (Ygg.postTracker(t, "/report", rep) != null) { State.log("peers", "статистика $n пиров отправлена трекеру $t"); break }
+                        }
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) { State.log("peers", "журнал пиров: ${e.message}") } }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         foreground("Запуск…")
@@ -118,6 +163,8 @@ class YggService : VpnService() {
         State.log("service", "onDestroy: сервис уничтожен системой или остановлен")
         stopAll("сервис завершён (onDestroy)")
         exec.shutdownNow()
+        journalTimer.shutdownNow()
+        try { synchronized(journal) { journal.save() } } catch (_: Exception) {}
         State.serviceRunning = false
         instance = null
         super.onDestroy()
@@ -246,6 +293,8 @@ class YggService : VpnService() {
         }
         // Client SOCKS -> the server in connect.txt (empty: no VPN, connections refused).
         add("--connect-file"); add("${Ygg.CLIENT_SOCKS}:${connectFile.path}")
+        // Peers ranked by how well they carried our traffic and by the trackers (re-read live).
+        add("--prefer-file"); add(preferFile.path)
         // Peer search keeps replacing peers while the ping to the server is above this.
         add("--rtt-limit"); add(prefs.rttLimit.toString())
         if (exit) {

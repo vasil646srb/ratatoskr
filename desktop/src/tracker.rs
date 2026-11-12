@@ -309,6 +309,10 @@ pub struct Db {
     /// Public peers checked from this tracker: {uri, key, region, rtt_ms, source}.
     pub peers: Vec<Value>,
     pub peers_updated: u64,
+    /// Clients' anonymous peer summaries sent to this tracker (`POST /report`), decayed.
+    pub peer_reports: HashMap<String, crate::peerstats::Agg>,
+    /// Other trackers' own aggregates (`GET /peerstats`), by tracker address.
+    pub remote_stats: HashMap<String, Vec<crate::peerstats::Agg>>,
 }
 
 impl Db {
@@ -510,17 +514,52 @@ fn serve(listener: crate::ygg_net::NetListener, db: Arc<Mutex<Db>>, cfg: Tracker
         std::thread::spawn(move || {
             let mut c = conn;
             c.set_read_timeout(Some(Duration::from_secs(10)));
+            let remote = c.remote;
+            // Request line, headers and (POST) the body.
             let mut line = String::new();
+            let mut body_in = Vec::new();
             {
                 let mut r = BufReader::new(&mut c);
                 if (&mut r).take(4096).read_line(&mut line).is_err() {
                     return;
                 }
+                let mut len = 0usize;
+                let mut seen = 0usize;
+                loop {
+                    let mut h = String::new();
+                    match (&mut r).take(4096).read_line(&mut h) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => seen += n,
+                    }
+                    if h.trim().is_empty() || seen > 16 * 1024 {
+                        break;
+                    }
+                    if let Some((k, v)) = h.split_once(':') {
+                        if k.trim().eq_ignore_ascii_case("content-length") {
+                            len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if len > 0 && len <= 256 * 1024 {
+                    body_in.resize(len, 0);
+                    if r.read_exact(&mut body_in).is_err() {
+                        body_in.clear();
+                    }
+                }
             }
+            let method = line.split_whitespace().next().unwrap_or("GET").to_string();
             let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
+            if method == "POST" && path == "/report" {
+                let (status, body) = take_report(&db, remote, &body_in);
+                let body = body.to_string();
+                let _ = write!(c, "HTTP/1.0 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                return;
+            }
             let (status, body) = {
                 let d = db.lock().unwrap();
                 match path.as_str() {
+                    // Our own aggregates only: what other trackers merge (each report counted once).
+                    "/peerstats" => ("200 OK", json!({"service": "ratatoskr-tracker", "stats": d.peer_reports.values().collect::<Vec<_>>(), "updated": now()})),
                     "/exits" => ("200 OK", list_json(&d.exits, &cfg, "exits")),
                     "/trackers" => {
                         let mut v = list_json(&d.trackers, &cfg, "trackers");
@@ -530,11 +569,16 @@ fn serve(listener: crate::ygg_net::NetListener, db: Arc<Mutex<Db>>, cfg: Tracker
                         }
                         ("200 OK", v)
                     }
-                    "/peers" => (
-                        "200 OK",
-                        json!({"service": "ratatoskr-tracker", "peers": d.peers, "updated": d.peers_updated,
-                               "note": "rtt_ms is the TCP connect time from this tracker"}),
-                    ),
+                    "/peers" => {
+                        // Checked peers, best first by what clients report (merged across trackers).
+                        let stats = crate::peerstats::merged(&d.peer_reports, &d.remote_stats);
+                        let ranked = crate::peerstats::rank_checked_peers(&d.peers, &stats);
+                        (
+                            "200 OK",
+                            json!({"service": "ratatoskr-tracker", "peers": ranked, "updated": d.peers_updated,
+                                   "note": "rtt_ms: TCP connect time from this tracker; client_ping_ms/speed_kbps/fail_rate: clients' reports; sorted by score"}),
+                        )
+                    }
                     "/" | "/info" => (
                         "200 OK",
                         json!({"service": "ratatoskr-tracker", "version": env!("CARGO_PKG_VERSION"), "address": me.to_string(),
@@ -550,6 +594,33 @@ fn serve(listener: crate::ygg_net::NetListener, db: Arc<Mutex<Db>>, cfg: Tracker
             let _ = write!(c, "HTTP/1.0 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
         });
     }
+}
+
+/// `POST /report`: a client's anonymous peer summary. At most one per client address every
+/// 10 minutes; the address itself is not stored.
+fn take_report(db: &Mutex<Db>, remote: Option<Ipv6Addr>, body: &[u8]) -> (&'static str, Value) {
+    static LAST: OnceLock<Mutex<HashMap<Ipv6Addr, Instant>>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(a) = remote {
+        let mut l = last.lock().unwrap();
+        l.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+        if l.contains_key(&a) {
+            return ("429 Too Many Requests", json!({"error": "one report per 10 minutes"}));
+        }
+        l.insert(a, Instant::now());
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(body) else { return ("400 Bad Request", json!({"error": "JSON expected"})) };
+    let mut d = db.lock().unwrap();
+    let n = crate::peerstats::ingest(&mut d.peer_reports, &v);
+    // Bounded: the 5000 most reported peers.
+    if d.peer_reports.len() > 5000 {
+        let mut v: Vec<(String, f64)> = d.peer_reports.iter().map(|(k, a)| (k.clone(), a.reports)).collect();
+        v.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let keep: HashSet<String> = v.into_iter().take(5000).map(|x| x.0).collect();
+        d.peer_reports.retain(|k, _| keep.contains(k));
+    }
+    d.save();
+    ("200 OK", json!({"ok": true, "peers": n}))
 }
 
 // ------------------------------------------------------------------------------------------
@@ -629,6 +700,11 @@ pub fn main() -> Result<(), String> {
                 if let Some(v) = http_get(t, TRACKER_PORT, "/trackers") {
                     tr.extend(v["trackers"].as_array().into_iter().flatten().filter_map(|e| e["address"].as_str()?.parse().ok()).map(|a| (a, src.clone())));
                 }
+                // Their own peer statistics (they count each client report once, so do we).
+                if let Some(v) = http_get(t, TRACKER_PORT, "/peerstats") {
+                    let stats: Vec<crate::peerstats::Agg> = v["stats"].as_array().into_iter().flatten().take(5000).filter_map(|a| serde_json::from_value(a.clone()).ok()).collect();
+                    db.lock().unwrap().remote_stats.insert(t.to_string(), stats);
+                }
             }
             if !ex.is_empty() || !tr.is_empty() {
                 let n = check_exits(&db, &cfg, ex);
@@ -702,9 +778,13 @@ fn parse_http(body: &[u8], tracker: Ipv6Addr) -> Result<Value, String> {
 
 /// Directly through a yggdrasil-go TUN.
 fn fetch_direct(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
+    request_direct(tracker, &format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n"))
+}
+
+fn request_direct(tracker: Ipv6Addr, req: &str) -> Result<Value, String> {
     let mut s = TcpStream::connect_timeout(&SocketAddr::from((tracker, TRACKER_PORT)), Duration::from_secs(20)).map_err(|e| io_text(&e, tracker, 20))?;
     s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n").as_bytes()).map_err(|e| io_text(&e, tracker, 30))?;
+    s.write_all(req.as_bytes()).map_err(|e| io_text(&e, tracker, 30))?;
     let mut body = Vec::new();
     s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| io_text(&e, tracker, 30))?;
     parse_http(&body, tracker)
@@ -712,21 +792,25 @@ fn fetch_direct(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
 
 /// Through tcp_node --socks (the yggproxy service).
 fn fetch_socks(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
+    request_socks(tracker, &format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n"))
+}
+
+fn request_socks(tracker: Ipv6Addr, req: &str) -> Result<Value, String> {
     let mut s = TcpStream::connect(("127.0.0.1", config::NODE_SOCKS))
         .map_err(|_| "трекер недоступен: нет yggdrasil-go и не запущена служба yggproxy (sudo yggproxy install)".to_string())?;
     s.set_read_timeout(Some(Duration::from_secs(40))).ok();
     let mut b = [0u8; 22];
     s.write_all(&[5, 1, 0]).map_err(|e| e.to_string())?;
     s.read_exact(&mut b[..2]).map_err(|e| e.to_string())?;
-    let mut req = vec![5, 1, 0, 4];
-    req.extend_from_slice(&tracker.octets());
-    req.extend_from_slice(&TRACKER_PORT.to_be_bytes());
-    s.write_all(&req).map_err(|e| e.to_string())?;
+    let mut sreq = vec![5, 1, 0, 4];
+    sreq.extend_from_slice(&tracker.octets());
+    sreq.extend_from_slice(&TRACKER_PORT.to_be_bytes());
+    s.write_all(&sreq).map_err(|e| e.to_string())?;
     s.read_exact(&mut b).map_err(|e| e.to_string())?;
     if b[1] != 0 {
         return Err(format!("SOCKS узла: отказ {}", b[1]));
     }
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n").as_bytes()).map_err(|e| io_text(&e, tracker, 40))?;
+    s.write_all(req.as_bytes()).map_err(|e| io_text(&e, tracker, 40))?;
     let mut body = Vec::new();
     s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| io_text(&e, tracker, 40))?;
     parse_http(&body, tracker)
@@ -746,6 +830,13 @@ pub fn fetch(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
         }
     }
     Err(last)
+}
+
+/// `POST path` with a JSON body to a tracker (same transport as [`fetch`]).
+pub fn post(tracker: Ipv6Addr, path: &str, body: &Value) -> Result<Value, String> {
+    let b = body.to_string();
+    let req = format!("POST {path} HTTP/1.0\r\nHost: [{tracker}]\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len());
+    if have_ygg_route() { request_direct(tracker, &req).or_else(|_| request_socks(tracker, &req)) } else { request_socks(tracker, &req) }
 }
 
 /// The first of `trackers` that answers, with its address.

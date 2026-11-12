@@ -57,6 +57,8 @@ enum Chunk {
 
 /// A TCP connection over Yggdrasil. Blocking, like `std::net::TcpStream`.
 pub struct NetStream {
+    /// The other side's address (accepted connections).
+    pub remote: Option<Ipv6Addr>,
     id: u64,
     ev: mpsc::Sender<Ev>,
     rx: mpsc::Receiver<Chunk>,
@@ -402,7 +404,7 @@ fn stack(me: Ipv6Addr, ev: mpsc::Receiver<Ev>, stream_tx: mpsc::Sender<Ev>, out:
                             let (to_user, from_stack) = mpsc::channel();
                             let id = next_id;
                             next_id += 1;
-                            let stream = NetStream { id, ev: stream_tx.clone(), rx: from_stack, pending: Vec::new(), eof: false, read_timeout: None };
+                            let stream = NetStream { remote: Some(addr), id, ev: stream_tx.clone(), rx: from_stack, pending: Vec::new(), eof: false, read_timeout: None };
                             // The stream is handed over once connected (kept in PENDING meanwhile).
                             conns.insert(id, Conn {
                                 handle,
@@ -454,13 +456,18 @@ fn stack(me: Ipv6Addr, ev: mpsc::Receiver<Ev>, stream_tx: mpsc::Sender<Ev>, out:
                     continue;
                 }
                 let accepted = *h;
+                let remote = s.remote_endpoint().and_then(|e| match e.addr {
+                    IpAddress::Ipv6(a) => Some(Ipv6Addr::from(a)),
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                });
                 let mut fresh = new_socket();
                 let _ = fresh.listen(l.port);
                 *h = sockets.add(fresh);
                 let (to_user, from_stack) = mpsc::channel();
                 let id = next_id;
                 next_id += 1;
-                let stream = NetStream { id, ev: stream_tx.clone(), rx: from_stack, pending: Vec::new(), eof: false, read_timeout: None };
+                let stream = NetStream { remote, id, ev: stream_tx.clone(), rx: from_stack, pending: Vec::new(), eof: false, read_timeout: None };
                 conns.insert(id, Conn { handle: accepted, to_user, out: VecDeque::new(), phase: Phase::Open, user_closed: false, ended: false });
                 let _ = l.accept.send(stream);
             }

@@ -126,6 +126,24 @@ object Ygg {
         }
     } catch (e: Exception) { null }
 
+    /** POST [tracker]:27081/PATH with a JSON body, through tcp_node --socks. Reply or null. */
+    fun postTracker(tracker: String, path: String, body: JSONObject): JSONObject? = try {
+        val a = (InetAddress.getByName(tracker) as Inet6Address).address
+        val b = body.toString().toByteArray()
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
+            s.soTimeout = 40000
+            val o = s.getOutputStream()
+            val i = s.getInputStream()
+            o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
+            o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((TRACKER_PORT shr 8).toByte(), (TRACKER_PORT and 0xff).toByte()))
+            if (readN(i, 22)[1].toInt() != 0) return null
+            o.write("POST $path HTTP/1.0\r\nHost: [$tracker]\r\nContent-Type: application/json\r\nContent-Length: ${b.size}\r\n\r\n".toByteArray() + b)
+            val text = i.readBytes().toString(Charsets.UTF_8)
+            if (!text.startsWith("HTTP/1.0 200")) null else JSONObject(text.substringAfter("\r\n\r\n", "{}"))
+        }
+    } catch (e: Exception) { null }
+
     /** GET /api/rtt: ping to the saved servers (monitor list) and to the root. */
     fun fetchRtt(): JSONObject? = fetchJson("/api/rtt")
 
