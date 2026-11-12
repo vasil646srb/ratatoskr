@@ -78,6 +78,7 @@ class SimpleActivity : Activity() {
             setOnClickListener { onButton() }
         }
         root.addView(btn, LinearLayout.LayoutParams(MATCH_PARENT, dp(64)))
+        root.addView(buildDash())
         stepsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(16), 0, dp(16)) }
         scroll = ScrollView(this).apply { addView(stepsBox) }
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -99,6 +100,11 @@ class SimpleActivity : Activity() {
         ui.post(tick)
     }
 
+    override fun onDestroy() {
+        dashExec.shutdownNow()
+        super.onDestroy()
+    }
+
     override fun onStop() {
         super.onStop()
         ui.removeCallbacks(tick)
@@ -113,6 +119,150 @@ class SimpleActivity : Activity() {
         }
     }
 
+    // ------------------------------------------------------------------------------- connected panel
+
+    private lateinit var dash: LinearLayout
+    private lateinit var tvNet: TextView
+    private lateinit var tvExit: TextView
+    private lateinit var tvPing: TextView
+    private lateinit var tvNow: TextView
+    private lateinit var tvAvg: TextView
+    private lateinit var tvTotal: TextView
+
+    /** Fresh node data for the panel, polled off the UI thread once a second. */
+    @Volatile private var dPeers = -1
+    @Volatile private var dRootOk = false
+    @Volatile private var dRtt: Long? = null
+    @Volatile private var dAvg: Long? = null
+    @Volatile private var dExitMs: Long? = null
+    @Volatile private var dExitAt = 0L
+    @Volatile private var dRttList: org.json.JSONArray? = null
+    private val dashExec = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private val dashBusy = java.util.concurrent.atomic.AtomicBoolean(false)
+    /** Tunnel byte counters, one sample a second: (time ms, rx, tx). */
+    private val samples = ArrayDeque<LongArray>()
+
+    private fun buildDash(): LinearLayout {
+        fun line(size: Float, bold: Boolean = false) = TextView(this).apply {
+            textSize = size; setTextColor(Color.BLACK); setPadding(0, dp(5), 0, dp(1))
+            if (bold) setTypeface(typeface, Typeface.BOLD)
+        }
+        dash = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(18), 0, 0); visibility = android.view.View.GONE }
+        tvNet = line(15f).also { dash.addView(it) }
+        tvExit = line(15f).also { dash.addView(it) }
+        tvPing = line(22f, true).also { dash.addView(it) }
+        tvNow = line(17f).also { dash.addView(it) }
+        tvAvg = line(15f).also { dash.addView(it) }
+        tvTotal = line(13.5f).also { it.setTextColor(Color.DKGRAY); dash.addView(it) }
+        dash.addView(Button(this).apply {
+            text = "Сменить сервер"; isAllCaps = false; textSize = 16f
+            setOnClickListener { chooseServer() }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(18) })
+        return dash
+    }
+
+    private fun pollDash() {
+        if (!dashBusy.compareAndSet(false, true)) return
+        dashExec.execute {
+            try {
+                val st = Ygg.fetchStats()?.optJSONObject("node")
+                dRootOk = st != null && st.optString("root") != st.optString("public_key")
+                dPeers = Ygg.fetchPeers()?.optJSONArray("peers")?.length() ?: if (st == null) -1 else 0
+                val list = Ygg.fetchRtt()?.optJSONArray("servers")
+                dRttList = list
+                val cur = list?.let { a -> (0 until a.length()).map { a.getJSONObject(it) }.firstOrNull { it.optBoolean("connected") } }
+                dRtt = cur?.takeIf { !it.isNull("rtt_ms") }?.optLong("rtt_ms")
+                dAvg = cur?.takeIf { !it.isNull("avg_ms") }?.optLong("avg_ms")
+                // The exit itself answers through the tunnel: checked every 10 s.
+                if (System.currentTimeMillis() - dExitAt > 10_000) {
+                    dExitMs = Ygg.probeExit()
+                    dExitAt = System.currentTimeMillis()
+                }
+            } finally { dashBusy.set(false) }
+        }
+    }
+
+    private fun mbit(bytesPerSec: Double) = when {
+        bytesPerSec * 8 >= 1_000_000 -> "%.1f Мбит/с".format(bytesPerSec * 8 / 1_000_000)
+        else -> "%.0f кбит/с".format(bytesPerSec * 8 / 1000)
+    }
+
+    /** The panel shown while connected (instead of the steps). */
+    private fun renderDash() {
+        pollDash()
+        val now = System.currentTimeMillis()
+        samples.addLast(longArrayOf(now, State.tunRx, State.tunTx))
+        while (samples.size > 61) samples.removeFirst()
+        fun rate(back: Int): Pair<Double, Double>? {
+            if (samples.size < 2) return null
+            val a = samples[maxOf(0, samples.size - 1 - back)]
+            val b = samples.last()
+            val dt = (b[0] - a[0]) / 1000.0
+            if (dt <= 0) return null
+            return maxOf(0.0, (b[1] - a[1]) / dt) to maxOf(0.0, (b[2] - a[2]) / dt)
+        }
+        val peers = dPeers
+        tvNet.text = "Сеть Yggdrasil: " + when {
+            peers < 0 -> "узел не отвечает ✖"
+            peers == 0 -> "нет пиров ✖"
+            !dRootOk -> "пиров $peers, ищу сеть…"
+            else -> "подключено ✔ · пиров $peers"
+        }
+        tvExit.text = "Сервер выхода: ${prefs.server}\n" + when {
+            dExitAt == 0L -> "проверяю…"
+            dExitMs != null -> "на связи ✔ (ответ ${dExitMs} мс)"
+            else -> "не отвечает ✖"
+        }
+        tvPing.text = "Пинг: " + (dRtt?.let { "$it мс" } ?: "—") + (dAvg?.let { "  (средний $it мс)" } ?: "")
+        val n = rate(1)
+        tvNow.text = "Сейчас: " + (n?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
+        val m = rate(60)
+        tvAvg.text = "В среднем за минуту: " + (m?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
+        tvTotal.text = "Передано: ↓ ${Ygg.human(State.tunRx)}   ↑ ${Ygg.human(State.tunTx)}"
+    }
+
+    /** «Сменить сервер»: automatic (best ping) or one from the list, with the node's ping. */
+    private fun chooseServer() {
+        val cur = Ygg.serverFromText(prefs.server)
+        val ping = HashMap<String, Long>()
+        dRttList?.let { a -> for (k in 0 until a.length()) a.getJSONObject(k).let { o ->
+            Ygg.serverFromText(o.optString("address"))?.let { addr -> if (!o.isNull("avg_ms")) ping[addr] = o.optLong("avg_ms") }
+        } }
+        val all = (State.trackerExits.map { it.first } + prefs.serverList()).mapNotNull { Ygg.serverFromText(it) }.distinct()
+        val others = all.filter { it != cur }.sortedBy { ping[it] ?: Long.MAX_VALUE }
+        if (others.isEmpty()) { toast("Других серверов пока нет"); return }
+        val labels = listOf("Автоматически: лучший по пингу") + others.map { s -> s + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Сменить сервер")
+            .setItems(labels.toTypedArray()) { _, i ->
+                val target = if (i == 0) others.firstOrNull { ping.containsKey(it) } ?: others.first() else others[i - 1]
+                startFlow { switchFlow(target) }
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    /** Switch the exit without touching the node (it keeps its peers and paths). */
+    private fun switchFlow(server: String) {
+        headline("Переключаю сервер…")
+        say("Переключаю на $server")
+        if (!useServer(server)) throw Stop("VPN к серверу $server не поднялся")
+        waitFor(45) { Ygg.probeExit() } ?: throw Stop("сервер $server не отвечает через туннель")
+        finish("на связи")
+        say("Проверяю выход в интернет")
+        val net = Ygg.checkInternet()
+        if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
+        finish("работает")
+        connectedNow()
+    }
+
+    /** Connected: the steps go, the panel takes their place. */
+    private fun connectedNow() {
+        dExitAt = 0L
+        samples.clear()
+        ui.post { stepsBox.removeAllViews(); current = null }
+    }
+
     /** Button and headline when no connection is being set up. */
     private fun render() {
         if (!::btn.isInitialized) return
@@ -122,10 +272,13 @@ class SimpleActivity : Activity() {
             prefs.vpnEnabled -> "Отключиться"
             else -> "Подключиться"
         }
+        val connected = !busy && prefs.vpnEnabled && State.vpnActive
+        dash.visibility = if (connected) android.view.View.VISIBLE else android.view.View.GONE
+        scroll.visibility = if (connected && stepsBox.childCount == 0) android.view.View.GONE else android.view.View.VISIBLE
         if (busy) return
+        if (connected) renderDash()
         tvState.text = when {
-            prefs.vpnEnabled && State.vpnActive -> "Подключено: ${prefs.server}\n" +
-                (State.serverRtt?.let { "пинг до сервера $it · " } ?: "") + "↓ ${Ygg.human(State.tunRx)}  ↑ ${Ygg.human(State.tunTx)}"
+            prefs.vpnEnabled && State.vpnActive -> "Подключено ✔"
             prefs.vpnEnabled -> "VPN включается…"
             !State.nodeRunning -> "Не подключено"
             else -> "Не подключено · узел Yggdrasil работает"
@@ -229,7 +382,7 @@ class SimpleActivity : Activity() {
 
     private class Stop(msg: String) : Exception(msg)
 
-    private fun startFlow() {
+    private fun startFlow(body: () -> Unit = { connectFlow() }) {
         if (flow != null) return
         stepsBox.removeAllViews()
         current = null
@@ -237,7 +390,7 @@ class SimpleActivity : Activity() {
         val t = Thread {
             myGen.set(g)
             try {
-                connectFlow()
+                body()
             } catch (e: Stop) {
                 finish(e.message ?: "", ok = false)
                 say(e.message ?: "не удалось", Mark.FAIL)
@@ -399,8 +552,7 @@ class SimpleActivity : Activity() {
         val net = Ygg.checkInternet()
         if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
         finish("работает")
-        say("Подключено. Можно пользоваться интернетом.", Mark.DONE)
-        headline("Подключено: $best\nпинг ${State.serverRtt ?: "${ping[best]} мс"}" + (speed[best]?.let { " · %.1f Мбит/с".format(it) } ?: ""))
+        connectedNow()
     }
 
     /**
