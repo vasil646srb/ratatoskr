@@ -275,7 +275,7 @@ fn write_monitors(st: &Shared, dir: &Path, cfg: &Config) {
 
 /// Ask the trackers for exits and more trackers (and, hourly, checked public peers).
 fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peers: bool) {
-    let trackers: Vec<std::net::Ipv6Addr> = cfg.lock().unwrap().network.trackers.iter().filter_map(|t| config::parse_server(t)).collect();
+    let trackers: Vec<std::net::Ipv6Addr> = crate::tracker::with_defaults(&cfg.lock().unwrap().network.trackers).iter().filter_map(|t| config::parse_server(t)).collect();
     let mut exits: Vec<(String, Option<u64>)> = Vec::new();
     let mut found: Vec<String> = Vec::new();
     let mut ok = 0;

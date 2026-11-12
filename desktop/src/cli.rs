@@ -392,9 +392,13 @@ pub fn run(args: &[String]) -> Result<(), String> {
             _ => Err("yggproxy set КЛЮЧ ЗНАЧЕНИЕ".into()),
         },
         "exits" | "trackers" => {
-            let t = a(1).and_then(|s| config::parse_server(s)).or_else(|| crate::tracker::DEFAULT_TRACKERS[0].parse().ok()).unwrap();
             let what = if a(0).map(|s| s.as_str()) == Some("exits") { "exits" } else { "trackers" };
-            let v = crate::tracker::fetch(t, &format!("/{what}"))?;
+            // A given tracker, else the configured ones (with the built-in) until one answers.
+            let list: Vec<String> = match a(1) {
+                Some(x) => vec![config::parse_server(x).ok_or("адрес трекера: 200:…")?.to_string()],
+                None => crate::tracker::with_defaults(&api::config().map(|c| c.network.trackers).unwrap_or_default()),
+            };
+            let (t, v) = crate::tracker::fetch_any(&list, &format!("/{what}"))?;
             let list = v[what].as_array().cloned().unwrap_or_default();
             println!("трекер {t}: {} {}", list.len(), if what == "exits" { "выходных серверов" } else { "трекеров" });
             for e in list {

@@ -25,7 +25,20 @@ use std::time::{Duration, Instant, SystemTime};
 /// Overlay port of the tracker API.
 pub const TRACKER_PORT: u16 = 27081;
 /// Built-in tracker(s): the project's own server; others are found and synced.
-pub const DEFAULT_TRACKERS: &[&str] = &["200:fbf3:4681:219d:8a88:4f:9770:ece5"];
+pub const DEFAULT_TRACKERS: &[&str] = &["200:fbf3:4681:219d:8a88:4f:9770:ece5", "227:30c5:d080:c75f:9588:130b:f3f1:1fa8"];
+
+/// `list` with the built-in trackers added (they are always asked, also on old configs).
+pub fn with_defaults(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for t in DEFAULT_TRACKERS.iter().map(|s| s.to_string()).chain(list.iter().cloned()) {
+        if let Some(a) = config::parse_server(&t).map(|a| a.to_string()) {
+            if !out.contains(&a) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -556,7 +569,7 @@ pub fn main() -> Result<(), String> {
     }
 
     // Seed trackers from the config (the default one first).
-    let seeds: Vec<(Ipv6Addr, String)> = cfg.trackers.iter().filter_map(|t| t.parse().ok()).map(|a| (a, "default".to_string())).collect();
+    let seeds: Vec<(Ipv6Addr, String)> = with_defaults(&cfg.trackers).iter().filter_map(|t| t.parse().ok()).map(|a| (a, "default".to_string())).collect();
     check_trackers(&db, &cfg, seeds, me);
 
     let (mut last_crawl, mut last_recheck, mut last_sync) = (None::<Instant>, Instant::now(), None::<Instant>);
@@ -625,15 +638,44 @@ pub fn main() -> Result<(), String> {
     }
 }
 
-/// `yggproxy exits [TRACKER]`: the list from a tracker (directly through a yggdrasil-go TUN, or
-/// through the yggproxy service's tcp_node SOCKS).
-pub fn fetch(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
-    if let Some(v) = http_get(tracker, TRACKER_PORT, path) {
-        return Ok(v);
+/// This host has a Yggdrasil address (a yggdrasil-go TUN): the kernel can reach 200::/7 itself.
+fn have_ygg_route() -> bool {
+    std::fs::read_to_string("/proc/net/if_inet6").map(|t| t.lines().any(|l| l.starts_with("02") || l.starts_with("03"))).unwrap_or(false)
+}
+
+fn io_text(e: &std::io::Error, tracker: Ipv6Addr, secs: u64) -> String {
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!(
+            "трекер {tracker} не ответил за {secs} с (первое соединение через Yggdrasil, пока ищется путь, бывает долгим — повторите)"
+        ),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof => {
+            format!("трекер {tracker} недоступен (на нём не запущен трекер или закрыт порт {TRACKER_PORT})")
+        }
+        _ => format!("трекер {tracker}: {e}"),
     }
-    // Through tcp_node --socks (the yggproxy service).
-    let mut s = TcpStream::connect(("127.0.0.1", config::NODE_SOCKS)).map_err(|_| "трекер недоступен: нет yggdrasil-go и не запущена служба yggproxy".to_string())?;
-    s.set_read_timeout(Some(Duration::from_secs(20))).ok();
+}
+
+fn parse_http(body: &[u8], tracker: Ipv6Addr) -> Result<Value, String> {
+    let text = String::from_utf8_lossy(body);
+    let (_, b) = text.split_once("\r\n\r\n").ok_or_else(|| format!("трекер {tracker} закрыл соединение без ответа (недоступен или закрыт порт {TRACKER_PORT})"))?;
+    serde_json::from_str(b).map_err(|e| format!("трекер {tracker}: неверный ответ ({e})"))
+}
+
+/// Directly through a yggdrasil-go TUN.
+fn fetch_direct(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
+    let mut s = TcpStream::connect_timeout(&SocketAddr::from((tracker, TRACKER_PORT)), Duration::from_secs(20)).map_err(|e| io_text(&e, tracker, 20))?;
+    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n").as_bytes()).map_err(|e| io_text(&e, tracker, 30))?;
+    let mut body = Vec::new();
+    s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| io_text(&e, tracker, 30))?;
+    parse_http(&body, tracker)
+}
+
+/// Through tcp_node --socks (the yggproxy service).
+fn fetch_socks(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
+    let mut s = TcpStream::connect(("127.0.0.1", config::NODE_SOCKS))
+        .map_err(|_| "трекер недоступен: нет yggdrasil-go и не запущена служба yggproxy (sudo yggproxy install)".to_string())?;
+    s.set_read_timeout(Some(Duration::from_secs(40))).ok();
     let mut b = [0u8; 22];
     s.write_all(&[5, 1, 0]).map_err(|e| e.to_string())?;
     s.read_exact(&mut b[..2]).map_err(|e| e.to_string())?;
@@ -643,18 +685,52 @@ pub fn fetch(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
     s.write_all(&req).map_err(|e| e.to_string())?;
     s.read_exact(&mut b).map_err(|e| e.to_string())?;
     if b[1] != 0 {
-        return Err(format!("SOCKS: отказ {}", b[1]));
+        return Err(format!("SOCKS узла: отказ {}", b[1]));
     }
-    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n").as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n").as_bytes()).map_err(|e| io_text(&e, tracker, 40))?;
     let mut body = Vec::new();
-    s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&body);
-    serde_json::from_str(text.split_once("\r\n\r\n").ok_or("пустой ответ трекера")?.1).map_err(|e| e.to_string())
+    s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| io_text(&e, tracker, 40))?;
+    parse_http(&body, tracker)
+}
+
+/// `GET path` from a tracker: directly through a yggdrasil-go TUN when this host has one, else
+/// through the yggproxy service's tcp_node SOCKS. Two tries: the first connection to a new
+/// address can take a while (path discovery).
+pub fn fetch(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
+    let direct = have_ygg_route();
+    let mut last = String::new();
+    for _ in 0..2 {
+        let r = if direct { fetch_direct(tracker, path).or_else(|e| fetch_socks(tracker, path).map_err(|_| e)) } else { fetch_socks(tracker, path) };
+        match r {
+            Ok(v) => return Ok(v),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// The first of `trackers` that answers, with its address.
+pub fn fetch_any(trackers: &[String], path: &str) -> Result<(Ipv6Addr, Value), String> {
+    let mut errs = Vec::new();
+    for t in trackers.iter().filter_map(|t| config::parse_server(t)) {
+        match fetch(t, path) {
+            Ok(v) => return Ok((t, v)),
+            Err(e) => errs.push(e),
+        }
+    }
+    Err(if errs.is_empty() { "нет трекеров".into() } else { errs.join("\n") })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_are_always_in_the_list() {
+        let l = with_defaults(&["200:1::1".into(), DEFAULT_TRACKERS[0].into()]);
+        assert_eq!(l.len(), DEFAULT_TRACKERS.len() + 1);
+        assert_eq!(l[0], DEFAULT_TRACKERS[0]);
+    }
 
     #[test]
     fn address_of_key_matches_yggdrasil_go() {

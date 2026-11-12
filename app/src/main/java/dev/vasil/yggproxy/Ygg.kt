@@ -19,7 +19,7 @@ object Ygg {
     const val NODE_SOCKS = 10810       // tcp_node --socks: SOCKS5 into Yggdrasil (tracker requests)
     const val TRACKER_PORT = 27081     // tracker API on the overlay
     /** Built-in tracker (the project's server); more are learned from its /trackers. */
-    val DEFAULT_TRACKERS = listOf("200:fbf3:4681:219d:8a88:4f:9770:ece5")
+    val DEFAULT_TRACKERS = listOf("200:fbf3:4681:219d:8a88:4f:9770:ece5", "227:30c5:d080:c75f:9588:130b:f3f1:1fa8")
     const val API = 19080              // tcp_node --api
     const val HTML_PORT = 1081         // tcp_node overlay status page (kept off the proxy port)
 
@@ -113,7 +113,8 @@ object Ygg {
         val a = (InetAddress.getByName(tracker) as Inet6Address).address
         Socket().use { s ->
             s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
-            s.soTimeout = 20000
+            // The first connection to a new address waits for path discovery: allow 40 s.
+            s.soTimeout = 40000
             val o = s.getOutputStream()
             val i = s.getInputStream()
             o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
