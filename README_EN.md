@@ -76,7 +76,8 @@ chmod +x yggproxy
 sudo ./yggproxy install             # systemd service, yggproxy group for control without sudo
 yggproxy server on                  # share the internet connection
 yggproxy qr                         # address and QR code for clients
-yggproxy connect 200:…              # or connect to a server as a client
+yggproxy servers                    # servers from trackers, with ping
+yggproxy connect                    # connect to the server with the lowest ping
 yggproxy gui                        # window
 ```
 
@@ -112,7 +113,8 @@ Tracker schedule (configurable in `/etc/yggproxy/tracker.json`):
 
 | What | How often |
 |---|---|
-| full network crawl and port scan of every node | every 30 min (crawl ~8 min, scan ~12 min for ~8,500 nodes) |
+| finding other trackers: asking known ones for `/trackers` | every 5 min |
+| finding other trackers and exits: crawl of the whole network (ports 27080 and 27081) | every 30 min (crawl ~8 min, scan ~12 min for ~8,500 nodes) |
 | re-check of known exits | every 5 min |
 | sync with other trackers | every 5 min |
 | an exit is dropped from the list | after 24 h without an answer |

@@ -68,13 +68,15 @@ pub struct Client {
     pub enabled: bool,
     /// Yggdrasil address of the exit (the port is always [PORT]).
     pub server: String,
+    /// Saved exits (addresses), pinged for the server list.
+    pub servers: Vec<String>,
     pub udp: bool,
     pub ipv6: bool,
 }
 
 impl Default for Client {
     fn default() -> Self {
-        Self { enabled: false, server: String::new(), udp: true, ipv6: true }
+        Self { enabled: false, server: String::new(), servers: Vec::new(), udp: true, ipv6: true }
     }
 }
 
@@ -91,6 +93,11 @@ pub struct Network {
     pub swap_interval: u32,
     pub swap_settle: u32,
     pub extra_args: String,
+    /// Run the node without client or server too (server list pings, trackers).
+    pub keep_node: bool,
+    /// Ask these trackers for exit servers, more trackers and checked public peers.
+    pub use_trackers: bool,
+    pub trackers: Vec<String>,
 }
 
 impl Default for Network {
@@ -105,6 +112,9 @@ impl Default for Network {
             swap_interval: 30,
             swap_settle: 60,
             extra_args: String::new(),
+            keep_node: true,
+            use_trackers: true,
+            trackers: crate::tracker::DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect(),
         }
     }
 }

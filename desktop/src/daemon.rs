@@ -43,6 +43,11 @@ pub struct St {
     last_error: Option<String>,
     node_stats: Option<Value>,
     node_peers: Option<Value>,
+    /// tcp_node /api/rtt: ping to saved and tracker servers, and to the root.
+    node_rtt: Option<Value>,
+    /// Exits from the trackers: (address, rtt the tracker measured).
+    tracker_exits: Vec<(String, Option<u64>)>,
+    tracker_status: Option<String>,
 }
 
 type Shared = Arc<Mutex<St>>;
@@ -256,6 +261,73 @@ fn write_peer_file(dir: &Path, cfg: &Config) {
     }
     out.push('}');
     let _ = std::fs::write(dir.join("peers.json"), out);
+}
+
+/// Ping list of the node (re-read live): saved servers and the trackers' exits.
+fn write_monitors(st: &Shared, dir: &Path, cfg: &Config) {
+    let mut all: Vec<String> = cfg.client.servers.clone();
+    all.extend(cfg.client.server.split_whitespace().map(String::from).filter(|s| !s.is_empty()));
+    all.extend(st.lock().unwrap().tracker_exits.iter().map(|e| e.0.clone()));
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|a| seen.insert(a.clone()));
+    let _ = std::fs::write(dir.join("monitors.txt"), all.join("\n"));
+}
+
+/// Ask the trackers for exits and more trackers (and, hourly, checked public peers).
+fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peers: bool) {
+    let trackers: Vec<std::net::Ipv6Addr> = cfg.lock().unwrap().network.trackers.iter().filter_map(|t| config::parse_server(t)).collect();
+    let mut exits: Vec<(String, Option<u64>)> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    let mut ok = 0;
+    let mut peers_note = String::new();
+    for t in &trackers {
+        let Ok(v) = crate::tracker::fetch(*t, "/exits") else { continue };
+        ok += 1;
+        for e in v["exits"].as_array().into_iter().flatten() {
+            if let Some(a) = e["address"].as_str().and_then(config::parse_server).map(|a| a.to_string()) {
+                if !exits.iter().any(|x| x.0 == a) {
+                    exits.push((a, e["rtt_ms"].as_u64()));
+                }
+            }
+        }
+        if let Ok(v) = crate::tracker::fetch(*t, "/trackers") {
+            found.extend(v["trackers"].as_array().into_iter().flatten().filter_map(|e| e["address"].as_str().and_then(config::parse_server)).map(|a| a.to_string()));
+        }
+        if with_peers && peers_note.is_empty() {
+            if let Ok(v) = crate::tracker::fetch(*t, "/peers") {
+                let n = v["peers"].as_array().map(|a| a.len()).unwrap_or(0);
+                if n > 0 {
+                    let _ = std::fs::write(dir.join("tracker-peers.json"), v.to_string());
+                    peers_note = format!(", пиров {n}");
+                }
+            }
+        }
+    }
+    // New trackers join the list.
+    let added = {
+        let mut c = cfg.lock().unwrap();
+        let new: Vec<String> = found.into_iter().filter(|a| !c.network.trackers.iter().any(|t| config::parse_server(t).map(|x| x.to_string()) == Some(a.clone()))).collect::<std::collections::HashSet<_>>().into_iter().collect();
+        if !new.is_empty() {
+            c.network.trackers.extend(new.iter().cloned());
+            let _ = c.save();
+        }
+        new.len()
+    };
+    let msg = if ok == 0 {
+        format!("{}: трекеры недоступны", now_hms())
+    } else {
+        format!("{}: серверов {} от {ok} трекер(ов){peers_note}{}", now_hms(), exits.len(), if added > 0 { format!(", новых трекеров {added}") } else { String::new() })
+    };
+    {
+        let mut s = st.lock().unwrap();
+        if ok > 0 {
+            s.tracker_exits = exits;
+        }
+        s.tracker_status = Some(msg.clone());
+    }
+    log(&st, "trackers", &msg);
+    let c = cfg.lock().unwrap().clone();
+    write_monitors(&st, &dir, &c);
 }
 
 // ------------------------------------------------------------------------------------------
@@ -498,6 +570,8 @@ impl Daemon {
             config::HTML_PORT.to_string(),
             "--socks".into(),
             format!("127.0.0.1:{}", config::NODE_SOCKS),
+            "--monitor-file".into(),
+            d.join("monitors.txt").display().to_string(),
         ];
         if n.lan_discovery {
             a.push("--lan-upstream".into());
@@ -535,7 +609,9 @@ impl Daemon {
         if cfg.client.enabled && !client {
             error(&self.st, "vpn", "не задан адрес сервера выхода");
         }
-        let any = client || cfg.server.enabled;
+        let any = client || cfg.server.enabled || cfg.network.keep_node;
+
+        write_monitors(&self.st, &self.dir, cfg);
 
         // 1. Node.
         if any {
@@ -551,7 +627,7 @@ impl Daemon {
                 self.node = Some(Proc::start(&self.st, "node", cmd, Arc::new(move |l: &str| node_line(&st, l))));
             }
         } else if let Some(p) = self.node.take() {
-            p.stop(&self.st, "node", "клиент и сервер выключены");
+            p.stop(&self.st, "node", "клиент и сервер выключены, узел в фоне отключён");
             let mut s = self.st.lock().unwrap();
             s.node_running = false;
             s.node_stats = None;
@@ -638,6 +714,7 @@ impl Daemon {
 enum Msg {
     Reconcile,
     RefreshPeers,
+    RefreshTrackers,
 }
 
 fn status_json(st: &Shared, cfg: &Config) -> Value {
@@ -658,7 +735,11 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
                    "active_conns": s.srv[0], "total": s.srv[1], "denied": s.srv[2], "tx": s.srv[3], "rx": s.srv[4],
                    "clients": clients, "limits": cfg.server.limits},
         "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "active": s.vpn_active,
-                   "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap},
+                   "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
+                   "servers": cfg.client.servers},
+        "rtt": s.node_rtt,
+        "trackers": {"enabled": cfg.network.use_trackers, "list": cfg.network.trackers, "status": s.tracker_status,
+                     "exits": s.tracker_exits.iter().map(|(a, r)| json!({"address": a, "tracker_rtt_ms": r})).collect::<Vec<_>>()},
         "last_error": s.last_error,
     })
 }
@@ -699,6 +780,10 @@ fn handle_conn(conn: UnixStream, st: Shared, cfg: Arc<Mutex<Config>>, tx: mpsc::
             }
             "clear_logs" => {
                 st.lock().unwrap().logs.clear();
+                json!({"ok": true})
+            }
+            "refresh_trackers" => {
+                let _ = tx.send(Msg::RefreshTrackers);
                 json!({"ok": true})
             }
             "refresh_peers" => {
@@ -775,6 +860,8 @@ pub fn main() -> Result<(), String> {
     let mut last_poll = Instant::now();
     let mut last_peer_check = Instant::now();
     let mut last_tracker_peers: Option<Instant> = None;
+    let mut last_trackers: Option<Instant> = None;
+    let trackers_busy = Arc::new(AtomicBool::new(false));
     while !TERM.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Msg::Reconcile) => {
@@ -790,32 +877,34 @@ pub fn main() -> Result<(), String> {
                 }
                 d.reconcile(&c);
             }
+            Ok(Msg::RefreshTrackers) => last_trackers = None,
             Err(_) => {}
         }
         if last_poll.elapsed() >= Duration::from_secs(2) && d.node.is_some() {
             last_poll = Instant::now();
-            let (stats, peers) = (http_json("/api/stats"), http_json("/api/peers"));
+            let (stats, peers, rtt) = (http_json("/api/stats"), http_json("/api/peers"), http_json("/api/rtt"));
             let mut s = st.lock().unwrap();
             s.node_stats = stats;
             s.node_peers = peers;
+            s.node_rtt = rtt;
         }
-        // Public peers checked by a tracker, hourly (fetched through the node's --socks).
-        if d.node.is_some() && last_tracker_peers.map_or(true, |t| t.elapsed() >= Duration::from_secs(3600))
-            && last_poll.elapsed() < Duration::from_secs(1) && st.lock().unwrap().node_stats.is_some()
+        // Trackers: exits and more trackers every 2 min, checked public peers hourly (fetched
+        // directly through a yggdrasil-go TUN or through the node's --socks).
+        let use_trackers = cfg.lock().unwrap().network.use_trackers;
+        if use_trackers && d.node.is_some() && st.lock().unwrap().node_stats.is_some()
+            && last_trackers.map_or(true, |t| t.elapsed() >= Duration::from_secs(120))
+            && !trackers_busy.load(Ordering::Relaxed)
         {
-            last_tracker_peers = Some(Instant::now());
-            let (st2, dir2) = (st.clone(), dir.clone());
+            last_trackers = Some(Instant::now());
+            let with_peers = last_tracker_peers.map_or(true, |t| t.elapsed() >= Duration::from_secs(3600));
+            if with_peers {
+                last_tracker_peers = Some(Instant::now());
+            }
+            trackers_busy.store(true, Ordering::Relaxed);
+            let (st2, dir2, cfg2, busy) = (st.clone(), dir.clone(), cfg.clone(), trackers_busy.clone());
             std::thread::spawn(move || {
-                for t in crate::tracker::DEFAULT_TRACKERS.iter().filter_map(|t| t.parse().ok()) {
-                    if let Ok(v) = crate::tracker::fetch(t, "/peers") {
-                        let n = v["peers"].as_array().map(|a| a.len()).unwrap_or(0);
-                        if n > 0 {
-                            let _ = std::fs::write(dir2.join("tracker-peers.json"), v.to_string());
-                            log(&st2, "peers", &format!("от трекера {t}: {n} проверенных пиров (в ход при следующем запуске узла)"));
-                            return;
-                        }
-                    }
-                }
+                refresh_trackers(st2, dir2, cfg2, with_peers);
+                busy.store(false, Ordering::Relaxed);
             });
         }
         if last_peer_check.elapsed() >= Duration::from_secs(600) && d.node.is_some() {

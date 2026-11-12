@@ -36,6 +36,11 @@ struct App {
     lim: [String; 4],
     qr: Option<(String, egui::TextureHandle)>,
     peer_detail: Option<Value>,
+    /// Client tab: address being typed.
+    add_text: String,
+    /// Network tab: tracker list being edited, and the list it was loaded from.
+    trackers_text: String,
+    trackers_loaded: Vec<String>,
     /// YGGPROXY_SHOT=DIR (development aid): screenshot every tab into DIR/*.ppm, then quit.
     shot: Option<(String, usize, Instant)>,
 }
@@ -86,7 +91,7 @@ impl App {
         let data = Arc::new(Mutex::new(Data::default()));
         let (d, ctx) = (data.clone(), cc.egui_ctx.clone());
         std::thread::spawn(move || poller(d, ctx));
-        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None,
+        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None, add_text: String::new(), trackers_text: String::new(), trackers_loaded: Vec::new(),
             shot: std::env::var("YGGPROXY_SHOT").ok().map(|d| (d, 0, Instant::now())) };
         app.reload_config();
         app
@@ -95,6 +100,8 @@ impl App {
     fn reload_config(&mut self) {
         if let Ok(c) = api::config() {
             self.peers_text = c.network.peers.join("\n");
+            self.trackers_text = c.network.trackers.join("\n");
+            self.trackers_loaded = c.network.trackers.clone();
             let l = c.server.limits;
             self.lim = [l.total_down, l.total_up, l.client_down, l.client_up].map(mbit_field);
             if c.server.enabled || c.client.enabled {
@@ -124,26 +131,126 @@ impl App {
     fn client_tab(&mut self, ui: &mut egui::Ui, st: Option<&Value>) {
         ui.heading("Клиент: интернет через Yggdrasil");
         ui.label("Весь трафик компьютера идёт через туннель и Yggdrasil на сервер выхода.");
-        let Some(c) = self.cfg.as_mut() else { return };
+        if self.cfg.is_none() {
+            return;
+        }
         ui.add_space(6.0);
-        ui.label("Адрес сервера выхода (200:… или ссылка yggproxy://c?a=…):");
-        ui.add(egui::TextEdit::singleline(&mut c.client.server).desired_width(f32::INFINITY).hint_text("200:…"));
-        ui.checkbox(&mut c.client.udp, "UDP через udpgw (QUIC, игры, звонки)");
-        ui.checkbox(&mut c.client.ipv6, "IPv6-сайты через сервер");
+        ui.horizontal(|ui| {
+            ui.add(egui::TextEdit::singleline(&mut self.add_text).desired_width(330.0).hint_text("адрес сервера 200:… или ссылка yggproxy://c?a=…"));
+            if ui.button("Добавить").clicked() {
+                match config::parse_server(&self.add_text) {
+                    Some(a) => {
+                        let c = self.cfg.as_mut().unwrap();
+                        if !c.client.servers.contains(&a.to_string()) {
+                            c.client.servers.push(a.to_string());
+                        }
+                        if config::parse_server(&c.client.server).is_none() {
+                            c.client.server = a.to_string();
+                        }
+                        self.add_text.clear();
+                        self.apply("Сервер добавлен");
+                    }
+                    None => self.toast("Адрес сервера: IPv6 из 200::/7, например 200:…"),
+                }
+            }
+        });
+
+        // Saved servers and the trackers' exits, with the node's ping.
+        ui.add_space(4.0);
+        ui.label("Серверы (нажмите — подключиться). Пинг меряет узел Yggdrasil каждые 10 с.");
+        let mut ping = std::collections::HashMap::new();
+        if let Some(s) = st {
+            for e in s["rtt"]["servers"].as_array().into_iter().flatten() {
+                if let (Some(a), Some(r)) = (e["address"].as_str(), e["rtt_ms"].as_u64()) {
+                    ping.insert(a.to_string(), r);
+                }
+            }
+        }
+        let saved = self.cfg.as_ref().unwrap().client.servers.clone();
+        let tracker: Vec<String> = st
+            .map(|s| s["trackers"]["exits"].as_array().into_iter().flatten().filter_map(|e| e["address"].as_str().map(String::from)).filter(|a| !saved.contains(a)).collect())
+            .unwrap_or_default();
+        let (cur, on, active) = {
+            let c = self.cfg.as_ref().unwrap();
+            (c.client.server.clone(), c.client.enabled, st.map(|s| s["client"]["active"].as_bool() == Some(true)).unwrap_or(false))
+        };
+        let mut connect: Option<String> = None;
+        let mut forget: Option<String> = None;
+        let mut row = |ui: &mut egui::Ui, a: &String, is_saved: bool| {
+            let p = ping.get(a).map(|r| format!("{r} мс")).unwrap_or("нет ответа".into());
+            let mark = if *a == cur && on && active { "● " } else if *a == cur && on { "◐ " } else if *a == cur { "○ " } else { "  " };
+            ui.horizontal(|ui| {
+                let txt = egui::RichText::new(format!("{mark}{a}   {p}")).monospace();
+                if ui.add(egui::Button::new(if *a == cur { txt.strong() } else { txt }).frame(false)).clicked() {
+                    connect = Some(a.clone());
+                }
+                if is_saved && ui.small_button("убрать").clicked() {
+                    forget = Some(a.clone());
+                }
+            });
+        };
+        if saved.is_empty() && tracker.is_empty() {
+            ui.label("Список пуст: добавьте адрес или дождитесь списка от трекеров.");
+        }
+        for a in &saved {
+            row(ui, a, true);
+        }
+        if !tracker.is_empty() {
+            ui.label(egui::RichText::new("От трекеров").strong());
+            for a in &tracker {
+                row(ui, a, false);
+            }
+        }
+        if let Some(s) = st {
+            let root = &s["rtt"]["root"];
+            ui.monospace(format!("Корень сети: {}", root["rtt_ms"].as_u64().map(|r| format!("{r} мс")).unwrap_or("нет ответа".into())));
+            if let Some(t) = s["trackers"]["status"].as_str() {
+                ui.label(format!("Трекеры: {t}"));
+            }
+        }
+        if let Some(a) = forget {
+            let c = self.cfg.as_mut().unwrap();
+            c.client.servers.retain(|x| *x != a);
+            self.apply("Убран из списка");
+        }
+        if let Some(a) = connect {
+            let c = self.cfg.as_mut().unwrap();
+            if !c.client.servers.contains(&a) {
+                c.client.servers.push(a.clone());
+            }
+            c.client.server = a;
+            c.client.enabled = true;
+            self.apply("Подключаюсь…");
+        }
+
         ui.add_space(6.0);
+        let c = self.cfg.as_mut().unwrap();
         let on = c.client.enabled;
         if ui.add_sized([220.0, 32.0], egui::Button::new(if on { "Отключить VPN" } else { "Подключить VPN" })).clicked() {
             if on {
                 c.client.enabled = false;
                 self.apply("VPN выключен");
-            } else if let Some(a) = config::parse_server(&c.client.server) {
-                c.client.server = a.to_string();
-                c.client.enabled = true;
-                self.apply("Подключаюсь…");
             } else {
-                self.toast("Адрес сервера: IPv6 из 200::/7, например 200:…");
+                // The selected server, else the best by ping, else the first in the list.
+                let pick = config::parse_server(&c.client.server).map(|a| a.to_string())
+                    .or_else(|| saved.iter().chain(tracker.iter()).filter(|a| ping.contains_key(*a)).min_by_key(|a| ping[*a]).cloned())
+                    .or_else(|| saved.first().or(tracker.first()).cloned());
+                match pick {
+                    Some(a) => {
+                        if !c.client.servers.contains(&a) {
+                            c.client.servers.push(a.clone());
+                        }
+                        c.client.server = a;
+                        c.client.enabled = true;
+                        self.apply("Подключаюсь…");
+                    }
+                    None => self.toast("Добавьте сервер или дождитесь списка от трекеров"),
+                }
             }
         }
+        let c = self.cfg.as_mut().unwrap();
+        ui.checkbox(&mut c.client.udp, "UDP через udpgw (QUIC, игры, звонки)");
+        ui.checkbox(&mut c.client.ipv6, "IPv6-сайты через сервер");
         if let Some(s) = st {
             let cl = &s["client"];
             ui.add_space(6.0);
@@ -293,7 +400,25 @@ impl App {
         }
     }
 
-    fn network_tab(&mut self, ui: &mut egui::Ui) {
+    fn network_tab(&mut self, ui: &mut egui::Ui, st: Option<&Value>) {
+        ui.heading("Трекеры");
+        ui.label("Трекеры обходят сеть Yggdrasil и собирают работающие серверы выхода; служба спрашивает их каждые 2 мин, новые трекеры добавляются сами.");
+        if let Some(c) = self.cfg.as_mut() {
+            ui.checkbox(&mut c.network.use_trackers, "Получать серверы и пиры от трекеров");
+        }
+        ui.label("Трекеры, по одному в строке:");
+        ui.add(egui::TextEdit::multiline(&mut self.trackers_text).desired_rows(3).desired_width(f32::INFINITY).code_editor());
+        if let Some(t) = st.and_then(|s| s["trackers"]["status"].as_str()) {
+            ui.label(format!("Последний опрос: {t}"));
+        }
+        if ui.button("Спросить трекеры сейчас").clicked() {
+            let data = self.data.clone();
+            std::thread::spawn(move || {
+                let t = api::request(json!({"cmd": "refresh_trackers"})).map(|_| "Спрашиваю трекеры…".to_string()).unwrap_or_else(|e| e);
+                data.lock().unwrap().toast = Some((t, Instant::now()));
+            });
+        }
+        ui.separator();
         ui.heading("Сеть Yggdrasil");
         let Some(c) = self.cfg.as_mut() else { return };
         let n = &mut c.network;
@@ -325,6 +450,8 @@ impl App {
             if ui.button("Сохранить и применить").clicked() {
                 if let Some(c) = self.cfg.as_mut() {
                     c.network.peers = self.peers_text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+                    c.network.trackers = self.trackers_text.lines().map(|l| l.trim().to_string()).filter(|l| config::parse_server(l).is_some()).collect();
+                    self.trackers_loaded = c.network.trackers.clone();
                 }
                 self.apply("Сохранено");
             }
@@ -474,6 +601,16 @@ impl eframe::App for App {
         if self.cfg.is_none() && status.is_some() {
             self.reload_config();
         }
+        if let Some(list) = status.as_ref().and_then(|s| s["trackers"]["list"].as_array()) {
+            let list: Vec<String> = list.iter().filter_map(|v| v.as_str().map(String::from)).collect();
+            if list != self.trackers_loaded && self.trackers_text == self.trackers_loaded.join("\n") {
+                if let Some(c) = self.cfg.as_mut() {
+                    c.network.trackers = list.clone();
+                }
+                self.trackers_text = list.join("\n");
+                self.trackers_loaded = list;
+            }
+        }
         egui::TopBottomPanel::bottom("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 for (t, name) in [(Tab::Client, "Клиент"), (Tab::Server, "Сервер"), (Tab::Network, "Сеть"), (Tab::Status, "Статус"), (Tab::Logs, "Логи")] {
@@ -500,7 +637,7 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.tab {
                 Tab::Client => self.client_tab(ui, status.as_ref()),
                 Tab::Server => self.server_tab(ui, status.as_ref()),
-                Tab::Network => self.network_tab(ui),
+                Tab::Network => self.network_tab(ui, status.as_ref()),
                 Tab::Status => self.status_tab(ui, status.as_ref()),
                 Tab::Logs => {}
             });

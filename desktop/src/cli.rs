@@ -22,12 +22,16 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy lan on|off          пускать клиентов в локальную сеть сервера
 
 Клиент (VPN):
-  yggproxy connect АДРЕС       подключиться к серверу (200:…, или ссылка yggproxy://c?a=…)
+  yggproxy servers             серверы выхода: сохранённые и от трекеров, с пингом
+  yggproxy connect [АДРЕС]     подключиться к серверу (200:… или yggproxy://c?a=…);
+                               без адреса — к серверу с наименьшим пингом
+  yggproxy forget АДРЕС        убрать сервер из сохранённых
   yggproxy disconnect          отключиться
   yggproxy speedtest           тест скорости до сервера (10 с приём, 10 с отдача)
 
 Трекеры (поиск выходных серверов в сети Yggdrasil):
-  yggproxy exits [ТРЕКЕР]      список выходных серверов от трекера
+  yggproxy exits [ТРЕКЕР]      список выходных серверов от трекера (напрямую)
+  yggproxy refresh-trackers    спросить трекеры сейчас (служба делает это каждые 2 мин)
   yggproxy trackers [ТРЕКЕР]   известные трекеры
   sudo yggproxy install-tracker  запустить трекер на этой машине (нужен yggdrasil-go)
 
@@ -36,7 +40,9 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy peers               пиры Yggdrasil и трафик через них
   yggproxy logs [-f]           журнал (с -f — следить)
   yggproxy set КЛЮЧ ЗНАЧЕНИЕ   настройка сети: rtt_limit, swap_interval, swap_settle, target,
-                               lan_discovery, public_peers, peers (через запятую), udp, ipv6
+                               lan_discovery, public_peers, peers (через запятую), udp, ipv6,
+                               trackers (через запятую), use_trackers, keep_node (узел без
+                               клиента и сервера: пинги серверов и трекеры)
   yggproxy refresh-peers       скачать публичный список пиров заново
   yggproxy gui                 окно (если собрано с GUI)";
 
@@ -155,6 +161,46 @@ fn peers() -> Result<(), String> {
     Ok(())
 }
 
+/// Saved servers and the trackers' exits with the node's ping: (address, saved, ping ms).
+fn server_rows(s: &Value) -> Vec<(String, bool, Option<u64>)> {
+    let mut ping = std::collections::HashMap::new();
+    for e in s["rtt"]["servers"].as_array().into_iter().flatten() {
+        if let (Some(a), Some(r)) = (e["address"].as_str(), e["rtt_ms"].as_u64()) {
+            ping.insert(a.to_string(), r);
+        }
+    }
+    let mut rows: Vec<(String, bool, Option<u64>)> = Vec::new();
+    for a in s["client"]["servers"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+        rows.push((a.to_string(), true, ping.get(a).copied()));
+    }
+    for e in s["trackers"]["exits"].as_array().into_iter().flatten() {
+        if let Some(a) = e["address"].as_str() {
+            if !rows.iter().any(|r| r.0 == a) {
+                rows.push((a.to_string(), false, ping.get(a).copied()));
+            }
+        }
+    }
+    rows
+}
+
+fn servers() -> Result<(), String> {
+    let s = api::status()?;
+    let cur = s["client"]["server"].as_str().unwrap_or("");
+    let rows = server_rows(&s);
+    if rows.is_empty() {
+        println!("серверов нет: yggproxy connect АДРЕС, или дождитесь списка от трекеров");
+    }
+    for (a, saved, ping) in &rows {
+        let mark = if a == cur && s["client"]["enabled"].as_bool() == Some(true) { "●" } else if a == cur { "○" } else { " " };
+        println!("{mark} {a}  {}  {}", ping.map(|p| format!("{p} мс")).unwrap_or("нет ответа".into()), if *saved { "сохранён" } else { "от трекера" });
+    }
+    if let Some(r) = s["rtt"]["root"]["rtt_ms"].as_u64() {
+        println!("корень сети: {r} мс");
+    }
+    println!("трекеры: {}", s["trackers"]["status"].as_str().unwrap_or(if s["trackers"]["enabled"].as_bool() == Some(true) { "ещё не опрашивались" } else { "выключены" }));
+    Ok(())
+}
+
 fn clients() -> Result<(), String> {
     let s = api::status()?;
     let list = s["server"]["clients"].as_array().cloned().unwrap_or_default();
@@ -220,6 +266,9 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             "lan_target" => net.lan_target = n.clone().unwrap_or(net.lan_target),
             "lan_discovery" => net.lan_discovery = b.clone().unwrap_or(net.lan_discovery),
             "public_peers" => net.public_peers = b.clone().unwrap_or(net.public_peers),
+            "trackers" => net.trackers = val.split(',').map(|s| s.trim().to_string()).filter(|s| config::parse_server(s).is_some()).collect(),
+            "use_trackers" => net.use_trackers = b.clone().unwrap_or(net.use_trackers),
+            "keep_node" => net.keep_node = b.clone().unwrap_or(net.keep_node),
             "peers" => net.peers = val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             "extra_args" => net.extra_args = val.to_string(),
             "udp" => c.client.udp = b.clone().unwrap_or(c.client.udp),
@@ -227,7 +276,7 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             _ => {}
         }
     })?;
-    let known = ["rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6"];
+    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6"];
     if !known.contains(&key) {
         return Err(format!("неизвестная настройка {key}"));
     }
@@ -291,13 +340,32 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             _ => Err("yggproxy limit total|client DOWN UP (Мбит/с, 0 — без ограничения)".into()),
         },
+        "servers" => servers(),
+        "forget" => {
+            let Some(addr) = a(1).and_then(|s| config::parse_server(s)) else { return Err("yggproxy forget АДРЕС".into()) };
+            api::update(|c| c.client.servers.retain(|x| config::parse_server(x) != Some(addr)))?;
+            println!("{addr} убран из сохранённых");
+            Ok(())
+        }
         "connect" => {
-            let Some(addr) = a(1).and_then(|s| config::parse_server(s)) else {
-                return Err("нужен адрес сервера 200:… или ссылка yggproxy://c?a=…".into());
+            let addr = match a(1) {
+                Some(s) => config::parse_server(s).ok_or("нужен адрес сервера 200:… или ссылка yggproxy://c?a=…")?,
+                None => {
+                    // The lowest ping among saved and tracker servers; else the tracker's first.
+                    let s = api::status()?;
+                    let rows = server_rows(&s);
+                    let best = rows.iter().filter(|r| r.2.is_some()).min_by_key(|r| r.2).or(rows.first())
+                        .ok_or("серверов пока нет: укажите адрес или дождитесь списка от трекеров (yggproxy servers)")?;
+                    println!("лучший сервер: {}{}", best.0, best.2.map(|p| format!(" ({p} мс)")).unwrap_or_default());
+                    best.0.parse().map_err(|_| "неверный адрес".to_string())?
+                }
             };
             api::update(|c| {
                 c.client.enabled = true;
                 c.client.server = addr.to_string();
+                if !c.client.servers.iter().any(|x| config::parse_server(x) == Some(addr)) {
+                    c.client.servers.push(addr.to_string());
+                }
             })?;
             println!("подключаюсь к {addr} (порт {}) — состояние: yggproxy status", config::PORT);
             Ok(())
@@ -336,6 +404,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        "refresh-trackers" => api::request(json!({"cmd": "refresh_trackers"})).map(|_: Value| println!("спрашиваю трекеры — список: yggproxy servers")),
         "refresh-peers" => api::request(json!({"cmd": "refresh_peers"})).map(|_: Value| println!("список пиров обновляется, узел перезапустится")),
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
