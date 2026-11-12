@@ -223,7 +223,7 @@ class YggService : VpnService() {
         add("--api"); add("127.0.0.1:${Ygg.API}")
         add("--html-port"); add(Ygg.HTML_PORT.toString())
         // Ping list for the server list's ping column (re-read live, no restart on changes).
-        monitorsFile.writeText((prefs.serverList() + State.trackerExits.map { it.first }).distinct().joinToString("\n"))
+        monitorsFile.writeText(prefs.monitorList().joinToString("\n"))
         add("--monitor-file"); add(monitorsFile.path)
         add("--socks"); add("127.0.0.1:${Ygg.NODE_SOCKS}")
         if (prefs.lanDiscovery) {

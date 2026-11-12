@@ -31,6 +31,10 @@ class Prefs(ctx: Context) {
     fun trackerList(): List<String> =
         (Ygg.DEFAULT_TRACKERS + trackers.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }).distinct()
 
+    /** The node's ping list: servers, the trackers' exits and the trackers (pings keep their routes warm). */
+    fun monitorList(): List<String> =
+        (serverList() + State.trackerExits.map { it.first } + (if (useTrackers) trackerList() else emptyList())).distinct()
+
     fun serverList(): List<String> = servers.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     fun addServer(addr: String) { if (addr !in serverList()) servers = (serverList() + addr).joinToString("\n") }
     fun removeServer(addr: String) { servers = serverList().filter { it != addr }.joinToString("\n") }

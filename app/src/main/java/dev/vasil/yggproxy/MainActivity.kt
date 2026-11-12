@@ -502,8 +502,7 @@ class MainActivity : Activity() {
 
     /** The node re-reads this ping list on its own (no restart, the VPN stays up). */
     private fun writeMonitors() {
-        val all = (prefs.serverList() + State.trackerExits.map { it.first }).distinct()
-        try { java.io.File(filesDir, "monitors.txt").writeText(all.joinToString("\n")) } catch (_: Exception) {}
+        try { java.io.File(filesDir, "monitors.txt").writeText(prefs.monitorList().joinToString("\n")) } catch (_: Exception) {}
     }
 
     private fun addServerFromInput() {

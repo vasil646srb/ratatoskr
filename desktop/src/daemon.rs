@@ -263,11 +263,15 @@ fn write_peer_file(dir: &Path, cfg: &Config) {
     let _ = std::fs::write(dir.join("peers.json"), out);
 }
 
-/// Ping list of the node (re-read live): saved servers and the trackers' exits.
+/// Ping list of the node (re-read live): saved servers, the trackers' exits and the trackers.
 fn write_monitors(st: &Shared, dir: &Path, cfg: &Config) {
     let mut all: Vec<String> = cfg.client.servers.clone();
     all.extend(cfg.client.server.split_whitespace().map(String::from).filter(|s| !s.is_empty()));
     all.extend(st.lock().unwrap().tracker_exits.iter().map(|e| e.0.clone()));
+    // Trackers too: regular pings keep the route to them warm, so the list is fetched fast.
+    if cfg.network.use_trackers {
+        all.extend(crate::tracker::with_defaults(&cfg.network.trackers));
+    }
     let mut seen = std::collections::HashSet::new();
     all.retain(|a| seen.insert(a.clone()));
     let _ = std::fs::write(dir.join("monitors.txt"), all.join("\n"));
