@@ -48,7 +48,7 @@ Ratatoskr превращает любой телефон или компьюте
 
 | Часть | Где | Что делает |
 |---|---|---|
-| Android-приложение **YggProxy** | `app/` | клиент, сервер, статус, настройки (Kotlin, без сторонних UI-библиотек) |
+| Android-приложение **Ratatoskr** | `app/` | клиент, сервер, статус, настройки (Kotlin, без сторонних UI-библиотек) |
 | `ygghelper` | `ygghelper/` | сервер выхода (SOCKS5, udpgw, лимиты, тест скорости) и сторона tun2proxy для клиента (Rust) |
 | `yggproxy` для Linux и Windows | `desktop/` | служба (systemd / служба Windows), консольные команды, окно (egui), трекер — один файл ([подробнее](desktop/README.md)) |
 | `tcp_node` | [yggdrasil-lite, ветка `ratatoskr`](https://github.com/vasil646srb/yggdrasil-lite/tree/ratatoskr) | узел Yggdrasil в пространстве пользователя |

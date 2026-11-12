@@ -545,7 +545,7 @@ class YggService : VpnService() {
         else PendingIntent.getService(this, 1, stopIntent, PendingIntent.FLAG_IMMUTABLE)
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
         return b.setSmallIcon(R.drawable.ic_notif)
-            .setContentTitle("YggProxy")
+            .setContentTitle("Ratatoskr")
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)

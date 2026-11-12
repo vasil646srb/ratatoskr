@@ -8,7 +8,7 @@ const UNIT: &str = "/etc/systemd/system/yggproxy.service";
 const DESKTOP: &str = "/usr/share/applications/yggproxy.desktop";
 
 const UNIT_TEXT: &str = "[Unit]
-Description=YggProxy: internet through Yggdrasil (exit server and VPN client)
+Description=Ratatoskr: internet through Yggdrasil (exit server and VPN client)
 After=network-online.target
 Wants=network-online.target
 
@@ -26,7 +26,7 @@ WantedBy=multi-user.target
 
 const DESKTOP_TEXT: &str = "[Desktop Entry]
 Type=Application
-Name=YggProxy
+Name=Ratatoskr
 Comment=Интернет через Yggdrasil
 Exec=/usr/local/bin/yggproxy gui
 Icon=network-vpn

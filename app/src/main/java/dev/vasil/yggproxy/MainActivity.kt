@@ -451,7 +451,7 @@ class MainActivity : Activity() {
         if (requestCode == REQ_SCAN && resultCode == RESULT_OK) {
             val text = data?.getStringExtra(ScanActivity.EXTRA_TEXT) ?: return
             val server = Ygg.serverFromText(text)
-            if (server == null) toast("Это не адрес сервера YggProxy") else connectTo(server)
+            if (server == null) toast("Это не адрес сервера Ratatoskr") else connectTo(server)
         }
         if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
@@ -508,7 +508,7 @@ class MainActivity : Activity() {
         if (i.action != Intent.ACTION_VIEW || data.scheme != "yggproxy") return
         i.data = null // handle once (not again on recreate)
         val server = Ygg.serverFromText(data.toString())
-        if (server == null) { toast("Неверная ссылка YggProxy"); return }
+        if (server == null) { toast("Неверная ссылка Ratatoskr"); return }
         select(0)
         AlertDialog.Builder(this)
             .setTitle("Подключиться к серверу?")
@@ -708,7 +708,7 @@ class MainActivity : Activity() {
 
     private fun shareAddress() {
         val addr = State.address ?: run { toast("Пока нет данных"); return }
-        val text = "Сервер YggProxy: $addr\n${Ygg.connectLink(addr)}"
+        val text = "Сервер Ratatoskr: $addr\n${Ygg.connectLink(addr)}"
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Адрес сервера"))
     }
 

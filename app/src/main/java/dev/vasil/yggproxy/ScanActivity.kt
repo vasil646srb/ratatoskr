@@ -57,7 +57,7 @@ class ScanActivity : Activity() {
         frame.addView(texture, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         root.addView(frame, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(TextView(this).apply {
-            text = "Наведите камеру на QR-код сервера YggProxy"
+            text = "Наведите камеру на QR-код сервера Ratatoskr"
             setTextColor(Color.WHITE); textSize = 15f; gravity = Gravity.CENTER
             setPadding((16 * d).toInt(), (12 * d).toInt(), (16 * d).toInt(), 0)
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))

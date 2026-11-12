@@ -130,7 +130,7 @@ pub fn install() -> Result<(), String> {
         let m = manager()?;
         stop_service(&m, SERVICE);
         let exe = copy_self()?;
-        create_or_update(&m, SERVICE, "Ratatoskr (YggProxy)", "Интернет через Yggdrasil: VPN-клиент и сервер выхода", "service", &exe)?;
+        create_or_update(&m, SERVICE, "Ratatoskr", "Интернет через Yggdrasil: VPN-клиент и сервер выхода", "service", &exe)?;
         let dir = install_dir();
         let lnk = shortcut_path();
         let _ = ps(&format!(

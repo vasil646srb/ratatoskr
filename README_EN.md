@@ -48,7 +48,7 @@ apps → VPN (TUN) → tun2proxy ─SOCKS5→ tcp_node ══ Yggdrasil ══ t
 
 | Part | Where | What it does |
 |---|---|---|
-| **YggProxy** Android app | `app/` | client, server, status, settings (Kotlin, no third-party UI libraries) |
+| **Ratatoskr** Android app | `app/` | client, server, status, settings (Kotlin, no third-party UI libraries) |
 | `ygghelper` | `ygghelper/` | exit server (SOCKS5, udpgw, limits, speed test) and the client's tun2proxy side (Rust) |
 | `yggproxy` for Linux and Windows | `desktop/` | service (systemd / Windows service), console commands, a window (egui), the tracker — one file ([details](desktop/README.md)) |
 | `tcp_node` | [yggdrasil-lite, branch `ratatoskr`](https://github.com/vasil646srb/yggdrasil-lite/tree/ratatoskr) | userspace Yggdrasil node |

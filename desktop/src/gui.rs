@@ -694,8 +694,8 @@ impl eframe::App for App {
 
 pub fn run() -> Result<(), String> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("YggProxy").with_inner_size([560.0, 760.0]),
+        viewport: egui::ViewportBuilder::default().with_title("Ratatoskr").with_inner_size([560.0, 760.0]),
         ..Default::default()
     };
-    eframe::run_native("YggProxy", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| format!("окно: {e}"))
+    eframe::run_native("Ratatoskr", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| format!("окно: {e}"))
 }
