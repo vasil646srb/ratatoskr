@@ -49,6 +49,8 @@ pub struct TrackerConfig {
     pub sync_interval_min: u64,
     /// Exits not confirmed for this long are dropped from the list.
     pub expire_hours: u64,
+    /// Hide an entry after this many failed checks in a row (0 = only `expire_hours`).
+    pub hide_after_fails: u32,
     pub crawl_workers: usize,
     pub probe_workers: usize,
     pub max_nodes: usize,
@@ -66,6 +68,7 @@ impl Default for TrackerConfig {
             recheck_interval_min: 5,
             sync_interval_min: 5,
             expire_hours: 24,
+            hide_after_fails: 2,
             crawl_workers: 24,
             probe_workers: 64,
             max_nodes: 50_000,
@@ -346,7 +349,9 @@ impl Db {
 }
 
 fn listed(e: &Entry, cfg: &TrackerConfig) -> bool {
-    e.last_ok > 0 && now().saturating_sub(e.last_ok) < cfg.expire_hours * 3600
+    e.last_ok > 0
+        && now().saturating_sub(e.last_ok) < cfg.expire_hours * 3600
+        && (cfg.hide_after_fails == 0 || e.fails < cfg.hide_after_fails)
 }
 
 /// Probe these exit candidates and record the results.
@@ -627,12 +632,15 @@ pub fn main() -> Result<(), String> {
                 Err(e) => log(&format!("обход не удался: {e}")),
             }
         }
-        // Recheck known exits so the list stays fresh between crawls.
+        // Recheck known exits and trackers so the list stays fresh between crawls.
         if last_recheck.elapsed() >= Duration::from_secs(cfg.recheck_interval_min * 60) {
             last_recheck = Instant::now();
             let known: Vec<(Ipv6Addr, String)> = db.lock().unwrap().exits.keys().filter_map(|a| a.parse().ok()).map(|a| (a, "recheck".to_string())).collect();
             let n = check_exits(&db, &cfg, known);
-            log(&format!("перепроверка: живых выходов {n}"));
+            let known_tr: Vec<(Ipv6Addr, String)> = db.lock().unwrap().trackers.keys().filter_map(|a| a.parse().ok()).map(|a| (a, "recheck".to_string())).collect();
+            check_trackers(&db, &cfg, known_tr, me);
+            let tr = db.lock().unwrap().trackers.values().filter(|e| listed(e, &cfg)).count();
+            log(&format!("перепроверка: живых выходов {n}, трекеров {tr}"));
         }
         std::thread::sleep(Duration::from_secs(10));
     }
@@ -730,6 +738,20 @@ mod tests {
         let l = with_defaults(&["200:1::1".into(), DEFAULT_TRACKERS[0].into()]);
         assert_eq!(l.len(), DEFAULT_TRACKERS.len() + 1);
         assert_eq!(l[0], DEFAULT_TRACKERS[0]);
+    }
+
+    #[test]
+    fn hidden_after_failed_checks_and_back_on_success() {
+        let cfg = TrackerConfig::default();
+        let mut m = HashMap::new();
+        Db::mark(&mut m, "200::1", Some(10), "t");
+        assert!(listed(&m["200::1"], &cfg));
+        Db::mark(&mut m, "200::1", None, "");
+        assert!(listed(&m["200::1"], &cfg), "one miss is tolerated");
+        Db::mark(&mut m, "200::1", None, "");
+        assert!(!listed(&m["200::1"], &cfg));
+        Db::mark(&mut m, "200::1", Some(12), "");
+        assert!(listed(&m["200::1"], &cfg));
     }
 
     #[test]

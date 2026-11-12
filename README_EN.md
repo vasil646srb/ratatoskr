@@ -115,9 +115,9 @@ Tracker schedule (configurable in `/etc/yggproxy/tracker.json`):
 |---|---|
 | finding other trackers: asking known ones for `/trackers` | every 5 min |
 | finding other trackers and exits: crawl of the whole network (ports 27080 and 27081) | every 30 min (crawl ~8 min, scan ~12 min for ~8,500 nodes) |
-| re-check of known exits | every 5 min |
+| re-check of known exits and trackers | every 5 min |
 | sync with other trackers | every 5 min |
-| an exit is dropped from the list | after 24 h without an answer |
+| an exit or tracker is hidden from the list | after 2 failed checks in a row (~10 min) or 24 h without an answer; it comes back as soon as it answers |
 | public peers: download the list and check every peer | hourly |
 
 ## Ports
