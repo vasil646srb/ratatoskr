@@ -102,6 +102,30 @@ yggproxy trackers [ТРЕКЕР]                           # известные 
 [публичного списка](https://publicpeers.neilalexander.dev/)). Отладка сети узла:
 `YGGPROXY_NET_DEBUG=1 yggproxy tracker`.
 
+## Трекер на телефоне (Termux)
+
+Трекеру не нужны root, TUN и yggdrasil-go, поэтому он работает и в [Termux](https://termux.dev)
+на Android (ARM64). Настройки, ключ и база — в `~/.yggproxy`.
+
+```sh
+pkg install wget
+wget -O $PREFIX/bin/yggproxy https://github.com/vasil646srb/ratatoskr/releases/latest/download/yggproxy-android-arm64
+chmod +x $PREFIX/bin/yggproxy
+termux-wake-lock                                  # не засыпать с выключенным экраном
+nohup yggproxy tracker >> ~/tracker.log 2>&1 &    # запуск в фоне
+grep 'трекер' ~/tracker.log                       # адрес трекера: «трекер … на [адрес]:27081»
+```
+
+Автозапуск после перезагрузки — приложение Termux:Boot и файл `~/.termux/boot/tracker`:
+
+```sh
+#!/data/data/com.termux/files/usr/bin/sh
+termux-wake-lock
+yggproxy tracker >> ~/tracker.log 2>&1
+```
+
+Для Termux отключите оптимизацию батареи в настройках Android, иначе система остановит трекер.
+
 ## Windows
 
 То же, что на Linux: служба, консольные команды, окно, трекер.

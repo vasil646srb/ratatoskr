@@ -23,6 +23,12 @@ pub const TUN_NAME: &str = "yggproxy0";
 #[allow(dead_code)]
 pub const CTL_PORT: u16 = 27079;
 
+/// Android (Termux, the tracker): everything in ~/.yggproxy — /etc and /var are not writable.
+#[cfg(target_os = "android")]
+fn termux_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/data/data/com.termux/files/home".into())).join(".yggproxy")
+}
+
 /// Windows: everything lives in %ProgramData%\Ratatoskr.
 #[cfg(windows)]
 fn win_dir() -> PathBuf {
@@ -32,14 +38,18 @@ fn win_dir() -> PathBuf {
 pub fn config_path() -> PathBuf {
     #[cfg(windows)]
     let def = win_dir().join("config.json");
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
+    let def = termux_dir().join("config.json");
+    #[cfg(all(unix, not(target_os = "android")))]
     let def = PathBuf::from("/etc/yggproxy/config.json");
     std::env::var("YGGPROXY_CONFIG").map(PathBuf::from).unwrap_or(def)
 }
 pub fn state_dir() -> PathBuf {
     #[cfg(windows)]
     let def = win_dir().join("state");
-    #[cfg(unix)]
+    #[cfg(target_os = "android")]
+    let def = termux_dir().join("state");
+    #[cfg(all(unix, not(target_os = "android")))]
     let def = PathBuf::from("/var/lib/yggproxy");
     std::env::var("YGGPROXY_STATE").map(PathBuf::from).unwrap_or(def)
 }
