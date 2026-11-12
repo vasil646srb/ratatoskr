@@ -76,7 +76,7 @@ fn status() -> Result<(), String> {
         let node = &st["node"];
         println!(
             "  пиров {} · сессий {} · аптайм {}",
-            node["peers_up"],
+            api::peer_count(&s),
             node["sessions"],
             dur(st.get("uptime_s").and_then(|v| v.as_u64()).unwrap_or(0))
         );

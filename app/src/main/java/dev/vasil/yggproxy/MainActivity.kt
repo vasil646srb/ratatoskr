@@ -43,6 +43,10 @@ class MainActivity : Activity() {
     private lateinit var prefs: Prefs
     private val ui = Handler(Looper.getMainLooper())
     private val bg = Executors.newSingleThreadExecutor()
+    /** Node statistics only: never queued behind tracker requests (up to 40 s) or exit checks. */
+    private val statsBg = Executors.newSingleThreadExecutor()
+    /** One statistics poll at a time: a slow one is skipped over, not stacked up. */
+    private val statsBusy = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private lateinit var content: FrameLayout
     private val tabButtons = mutableListOf<Button>()
@@ -737,7 +741,7 @@ class MainActivity : Activity() {
     private val tick = object : Runnable {
         override fun run() {
             refreshNow()
-            ui.postDelayed(this, 2000)
+            ui.postDelayed(this, 1000)
         }
     }
 
@@ -748,15 +752,24 @@ class MainActivity : Activity() {
         renderButtons()
         refreshTrackers()
         if (current <= 2) {
-            val doProbe = current == 2 && prefs.vpnEnabled && (probeCounter++ % 3 == 0)
-            bg.execute {
-                lastRtt = Ygg.fetchRtt()
-                if (current != 0) {
-                    lastStats = Ygg.fetchStats()
-                    lastPeers = Ygg.fetchPeers()
+            // Exit probe every ~6 s on its own thread: it may wait on the network.
+            if (current == 2 && prefs.vpnEnabled && (probeCounter++ % 6 == 0)) {
+                bg.execute { lastProbe = Ygg.probeExit(); probeDone = true }
+            }
+            if (statsBusy.compareAndSet(false, true)) {
+                val withNode = current != 0
+                statsBg.execute {
+                    try {
+                        lastRtt = Ygg.fetchRtt()
+                        if (withNode) {
+                            lastStats = Ygg.fetchStats()
+                            lastPeers = Ygg.fetchPeers()
+                        }
+                    } finally {
+                        statsBusy.set(false)
+                    }
+                    ui.post { renderServers(); renderStatus() }
                 }
-                if (doProbe) { lastProbe = Ygg.probeExit(); probeDone = true }
-                ui.post { renderServers(); renderStatus() }
             }
         }
         if (current == 3 && settingsSub == 1) {
@@ -820,7 +833,8 @@ class MainActivity : Activity() {
             val root = n.optString("root")
             val coords = n.optJSONArray("coords")
             val c = (0 until (coords?.length() ?: 0)).joinToString(" ") { coords!!.get(it).toString() }
-            val peersUp = n.optInt("peers_up")
+            // /api/stats "peers_up" has only 3 slots (the ESP32 format): count the /api/peers list.
+            val peersUp = lastPeers?.optJSONArray("peers")?.length() ?: n.optInt("peers_up")
             sb.append("Сеть: ").append(
                 when {
                     peersUp == 0 -> "нет пиров ✖"
@@ -885,30 +899,41 @@ class MainActivity : Activity() {
     }
 
     /** Connected peers with live traffic; the one carrying most of it now is starred. */
+    /** Peer rows are updated in place (no re-creation every second: no flicker, scroll stays). */
     private fun renderPeers() {
-        peersBox.removeAllViews()
         val arr = lastPeers?.optJSONArray("peers")
+        val rows = ArrayList<Pair<String, JSONObject?>>()
         if (arr == null || arr.length() == 0) {
-            peersBox.addView(mono("нет данных"))
-            return
+            rows.add("нет данных" to null)
+        } else {
+            val list = (0 until arr.length()).map { arr.getJSONObject(it) }
+            val busiest = list.maxByOrNull { it.optLong("rx_bps") + it.optLong("tx_bps") }
+                ?.takeIf { it.optLong("rx_bps") + it.optLong("tx_bps") > 500 }
+            lastPeers?.let { t -> rows.add("Всего сейчас: ↓ ${Ygg.mbit(t.optLong("rx_bps"))}  ↑ ${Ygg.mbit(t.optLong("tx_bps"))}" to null) }
+            for (p in list) {
+                val host = p.optString("uri").substringAfter("://").substringBefore('?').ifEmpty { "входящий " + p.optString("address") }
+                val rtt = if (p.isNull("rtt_ms")) "" else "  ${p.optLong("rtt_ms")} мс"
+                val star = if (p === busiest) "★ " else "  "
+                rows.add("$star${host}$rtt\n    ↓ ${Ygg.mbit(p.optLong("rx_bps"))}  ↑ ${Ygg.mbit(p.optLong("tx_bps"))}  · ${p.optInt("share")} %" to p)
+            }
         }
-        val list = (0 until arr.length()).map { arr.getJSONObject(it) }
-        val busiest = list.maxByOrNull { it.optLong("rx_bps") + it.optLong("tx_bps") }
-            ?.takeIf { it.optLong("rx_bps") + it.optLong("tx_bps") > 500 }
-        lastPeers?.let { t ->
-            peersBox.addView(mono("Всего сейчас: ↓ ${Ygg.mbit(t.optLong("rx_bps"))}  ↑ ${Ygg.mbit(t.optLong("tx_bps"))}"))
-        }
-        for (p in list) {
-            val host = p.optString("uri").substringAfter("://").substringBefore('?').ifEmpty { "входящий " + p.optString("address") }
-            val rtt = if (p.isNull("rtt_ms")) "" else "  ${p.optLong("rtt_ms")} мс"
-            val star = if (p === busiest) "★ " else "  "
-            val line = "$star${host}$rtt\n    ↓ ${Ygg.mbit(p.optLong("rx_bps"))}  ↑ ${Ygg.mbit(p.optLong("tx_bps"))}  · ${p.optInt("share")} %"
-            peersBox.addView(mono(line).apply {
-                setTextIsSelectable(false)
-                setBackgroundResource(android.R.drawable.list_selector_background)
-                setPadding(dp(4), dp(8), dp(4), dp(8))
-                setOnClickListener { showPeer(p) }
-            })
+        while (peersBox.childCount > rows.size) peersBox.removeViewAt(peersBox.childCount - 1)
+        while (peersBox.childCount < rows.size) peersBox.addView(mono("").apply {
+            setTextIsSelectable(false)
+            setPadding(dp(4), dp(8), dp(4), dp(8))
+        })
+        for ((i, row) in rows.withIndex()) {
+            val tv = peersBox.getChildAt(i) as TextView
+            if (tv.text.toString() != row.first) tv.text = row.first
+            val p = row.second
+            if (p != null) {
+                tv.setBackgroundResource(android.R.drawable.list_selector_background)
+                tv.setOnClickListener { showPeer(p) }
+            } else {
+                tv.background = null
+                tv.setOnClickListener(null)
+                tv.isClickable = false
+            }
         }
     }
 

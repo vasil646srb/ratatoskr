@@ -47,6 +47,7 @@ struct App {
 
 fn poller(data: Arc<Mutex<Data>>, ctx: egui::Context) {
     loop {
+        let t0 = std::time::Instant::now();
         let st = api::status();
         let since = data.lock().unwrap().log_seq;
         let logs = api::request(json!({"cmd": "logs", "since": since}));
@@ -74,7 +75,7 @@ fn poller(data: Arc<Mutex<Data>>, ctx: egui::Context) {
             }
         }
         ctx.request_repaint();
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(1000).saturating_sub(t0.elapsed()));
     }
 }
 
@@ -473,7 +474,7 @@ impl App {
         if let Some(stats) = n["stats"].as_object() {
             let nn = &stats["node"];
             let (key, root) = (nn["public_key"].as_str().unwrap_or(""), nn["root"].as_str().unwrap_or(""));
-            let up = nn["peers_up"].as_u64().unwrap_or(0);
+            let up = crate::api::peer_count(s);
             t += &format!(
                 "Сеть: {}\nАдрес:  {}\nКлюч:   {}\nКорень: {}…\nАптайм: {}\nПиров: {} · сессий {} · путей {}\n",
                 if up == 0 { "нет пиров ✖" } else if root == key { "только свой корень ⚠" } else { "подключено ✔" },

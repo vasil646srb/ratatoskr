@@ -952,10 +952,28 @@ pub fn main() -> Result<(), String> {
         });
     }
 
+    // Node statistics every second on their own thread: the main loop may wait on a download
+    // or a restart, and the window/console must not freeze with it.
+    {
+        let st = st.clone();
+        std::thread::spawn(move || {
+            while !platform::stopping() {
+                let t0 = Instant::now();
+                if st.lock().unwrap().node_running {
+                    let (stats, peers, rtt) = (http_json("/api/stats"), http_json("/api/peers"), http_json("/api/rtt"));
+                    let mut s = st.lock().unwrap();
+                    s.node_stats = stats;
+                    s.node_peers = peers;
+                    s.node_rtt = rtt;
+                }
+                std::thread::sleep(Duration::from_millis(1000).saturating_sub(t0.elapsed()));
+            }
+        });
+    }
+
     let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, exit: None, vpn: None };
     let snapshot = cfg.lock().unwrap().clone();
     d.reconcile(&snapshot);
-    let mut last_poll = Instant::now();
     let mut last_peer_check = Instant::now();
     let mut last_tracker_peers: Option<Instant> = None;
     let mut last_trackers: Option<Instant> = None;
@@ -977,14 +995,6 @@ pub fn main() -> Result<(), String> {
             }
             Ok(Msg::RefreshTrackers) => last_trackers = None,
             Err(_) => {}
-        }
-        if last_poll.elapsed() >= Duration::from_secs(2) && d.node.is_some() {
-            last_poll = Instant::now();
-            let (stats, peers, rtt) = (http_json("/api/stats"), http_json("/api/peers"), http_json("/api/rtt"));
-            let mut s = st.lock().unwrap();
-            s.node_stats = stats;
-            s.node_peers = peers;
-            s.node_rtt = rtt;
         }
         // Trackers: exits and more trackers every 2 min, checked public peers hourly (fetched
         // directly through a yggdrasil-go TUN or through the node's --socks).

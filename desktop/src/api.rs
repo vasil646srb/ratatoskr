@@ -66,6 +66,12 @@ pub fn tracker_pings(s: &Value) -> Vec<(String, Option<u64>, Option<u64>)> {
     out
 }
 
+/// Connected peers of the node. /api/stats "peers_up" has only 3 slots (the ESP32 format), so
+/// the /api/peers list is counted instead.
+pub fn peer_count(s: &Value) -> u64 {
+    s["node"]["peers"]["peers"].as_array().map(|a| a.len() as u64).or_else(|| s["node"]["stats"]["node"]["peers_up"].as_u64()).unwrap_or(0)
+}
+
 /// "N мс (сред. M мс)" or "нет ответа".
 pub fn ping_text(last: Option<u64>, avg: Option<u64>) -> String {
     match (last, avg) {
