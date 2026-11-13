@@ -108,8 +108,11 @@ object Ygg {
     /** GET /api/stats from tcp_node (raw HTTP: no cleartext policy involved). */
     fun fetchStats(): JSONObject? = fetchJson("/api/stats")
 
-    /** GET [tracker]:27081/PATH through tcp_node --socks (the app itself is outside the VPN). */
-    fun fetchTracker(tracker: String, path: String): JSONObject? = try {
+    /**
+     * One HTTP request to [tracker]:27081 through tcp_node --socks (the app itself is outside the
+     * VPN). Returns the whole response text, or null when the tracker cannot be reached.
+     */
+    private fun trackerRequest(tracker: String, request: ByteArray): String? = try {
         val a = (InetAddress.getByName(tracker) as Inet6Address).address
         Socket().use { s ->
             s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
@@ -120,29 +123,51 @@ object Ygg {
             o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
             o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((TRACKER_PORT shr 8).toByte(), (TRACKER_PORT and 0xff).toByte()))
             if (readN(i, 22)[1].toInt() != 0) return null
-            o.write("GET $path HTTP/1.0\r\nHost: [$tracker]\r\n\r\n".toByteArray())
-            val body = i.readBytes().toString(Charsets.UTF_8).substringAfter("\r\n\r\n", "")
-            if (body.isEmpty()) null else JSONObject(body)
+            o.write(request)
+            i.readBytes().toString(Charsets.UTF_8)
         }
     } catch (e: Exception) { null }
 
-    /** POST [tracker]:27081/PATH with a JSON body, through tcp_node --socks. Reply or null. */
-    fun postTracker(tracker: String, path: String, body: JSONObject): JSONObject? = try {
-        val a = (InetAddress.getByName(tracker) as Inet6Address).address
-        val b = body.toString().toByteArray()
-        Socket().use { s ->
-            s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
-            s.soTimeout = 40000
-            val o = s.getOutputStream()
-            val i = s.getInputStream()
-            o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
-            o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((TRACKER_PORT shr 8).toByte(), (TRACKER_PORT and 0xff).toByte()))
-            if (readN(i, 22)[1].toInt() != 0) return null
-            o.write("POST $path HTTP/1.0\r\nHost: [$tracker]\r\nContent-Type: application/json\r\nContent-Length: ${b.size}\r\n\r\n".toByteArray() + b)
-            val text = i.readBytes().toString(Charsets.UTF_8)
-            if (!text.startsWith("HTTP/1.0 200")) null else JSONObject(text.substringAfter("\r\n\r\n", "{}"))
-        }
+    private fun jsonBody(response: String?): JSONObject? = try {
+        response?.substringAfter("\r\n\r\n", "")?.takeIf { it.isNotEmpty() }?.let { JSONObject(it) }
     } catch (e: Exception) { null }
+
+    /** GET [tracker]:27081/PATH. */
+    fun fetchTracker(tracker: String, path: String): JSONObject? =
+        jsonBody(trackerRequest(tracker, "GET $path HTTP/1.0\r\nHost: [$tracker]\r\n\r\n".toByteArray()))
+
+    /** POST [tracker]:27081/PATH with a JSON body. The reply, or null unless the tracker said 200. */
+    fun postTracker(tracker: String, path: String, body: JSONObject): JSONObject? {
+        val b = body.toString().toByteArray()
+        val head = "POST $path HTTP/1.0\r\nHost: [$tracker]\r\nContent-Type: application/json\r\nContent-Length: ${b.size}\r\n\r\n"
+        val text = trackerRequest(tracker, head.toByteArray() + b) ?: return null
+        return if (text.startsWith("HTTP/1.0 200")) jsonBody(text) ?: JSONObject() else null
+    }
+
+    /** A tracker's `/exits` reply into [into]: address -> ping the tracker measured (-1 unknown). */
+    fun parseExits(reply: JSONObject, into: MutableMap<String, Long>) {
+        val a = reply.optJSONArray("exits") ?: return
+        for (k in 0 until a.length()) {
+            val o = a.getJSONObject(k)
+            serverFromText(o.optString("address"))?.let { into.putIfAbsent(it, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms")) }
+        }
+    }
+
+    /** `/api/rtt` of the node: its ping entry for every monitored address (servers, trackers). */
+    fun rttByAddr(rtt: JSONObject?): Map<String, JSONObject> {
+        val a = rtt?.optJSONArray("servers") ?: return emptyMap()
+        val out = HashMap<String, JSONObject>()
+        for (k in 0 until a.length()) a.getJSONObject(k).let { o -> serverFromText(o.optString("address"))?.let { out[it] = o } }
+        return out
+    }
+
+    /** The node's ping list (re-read live): written only when it changed. */
+    fun writeMonitors(dir: File, prefs: Prefs) = writeIfChanged(File(dir, "monitors.txt"), prefs.monitorList().joinToString("\n"))
+
+    /** Files the node re-reads are compared by content: no write when nothing changed. */
+    fun writeIfChanged(f: File, text: String): Boolean = try {
+        if (f.exists() && f.readText() == text) false else { f.writeText(text); true }
+    } catch (e: Exception) { false }
 
     /** GET /api/rtt: ping to the saved servers (monitor list) and to the root. */
     fun fetchRtt(): JSONObject? = fetchJson("/api/rtt")

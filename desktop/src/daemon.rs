@@ -263,19 +263,18 @@ fn write_peer_file(dir: &Path, cfg: &Config) {
         custom.insert(u.to_string(), json!({"up": true}));
     }
     let mut out = format!("{{\"custom\":{}", Value::Object(custom));
-    if cfg.network.public_peers {
-        if let Ok(p) = std::fs::read_to_string(dir.join("public-peers.json")) {
+    if cfg.network.public_peers
+        && let Ok(p) = std::fs::read_to_string(dir.join("public-peers.json")) {
             out.push_str(",\"public\":");
             out.push_str(&p);
         }
-    }
     // Peers checked by the trackers (works where the public list's site is blocked).
     if let Ok(p) = std::fs::read_to_string(dir.join("tracker-peers.json")) {
         out.push_str(",\"tracker\":");
         out.push_str(&p);
     }
     out.push('}');
-    let _ = std::fs::write(dir.join("peers.json"), out);
+    platform::write_if_changed(&dir.join("peers.json"), &out);
 }
 
 /// Ping list of the node (re-read live): saved servers, the trackers' exits and the trackers.
@@ -285,47 +284,43 @@ fn write_monitors(st: &Shared, dir: &Path, cfg: &Config) {
     all.extend(st.lock().unwrap().tracker_exits.iter().map(|e| e.0.clone()));
     // Trackers too: regular pings keep the route to them warm, so the list is fetched fast.
     if cfg.network.use_trackers {
-        all.extend(crate::tracker::with_defaults(&cfg.network.trackers));
+        all.extend(crate::tracker_client::with_defaults(&cfg.network.trackers));
     }
     let mut seen = std::collections::HashSet::new();
     all.retain(|a| seen.insert(a.clone()));
-    let _ = std::fs::write(dir.join("monitors.txt"), all.join("\n"));
+    platform::write_if_changed(&dir.join("monitors.txt"), &all.join("\n"));
     // The trackers drive the peer search while no exit server is in use.
-    let search = if cfg.network.use_trackers { crate::tracker::with_defaults(&cfg.network.trackers).join("\n") } else { String::new() };
-    if std::fs::read_to_string(dir.join("search.txt")).ok().as_deref() != Some(search.as_str()) {
-        let _ = std::fs::write(dir.join("search.txt"), search);
-    }
+    let search = if cfg.network.use_trackers { crate::tracker_client::with_defaults(&cfg.network.trackers).join("\n") } else { String::new() };
+    platform::write_if_changed(&dir.join("search.txt"), &search);
 }
 
 /// Ask the trackers for exits and more trackers (and, hourly, checked public peers).
 fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peers: bool) {
-    let trackers: Vec<std::net::Ipv6Addr> = crate::tracker::with_defaults(&cfg.lock().unwrap().network.trackers).iter().filter_map(|t| config::parse_server(t)).collect();
+    let trackers: Vec<std::net::Ipv6Addr> = crate::tracker_client::with_defaults(&cfg.lock().unwrap().network.trackers).iter().filter_map(|t| config::parse_server(t)).collect();
     let mut exits: Vec<(String, Option<u64>)> = Vec::new();
     let mut found: Vec<String> = Vec::new();
     let mut ok = 0;
     let mut peers_note = String::new();
     for t in &trackers {
-        let Ok(v) = crate::tracker::fetch(*t, "/exits") else { continue };
+        let Ok(v) = crate::tracker_client::fetch(*t, "/exits") else { continue };
         ok += 1;
         for e in v["exits"].as_array().into_iter().flatten() {
-            if let Some(a) = e["address"].as_str().and_then(config::parse_server).map(|a| a.to_string()) {
-                if !exits.iter().any(|x| x.0 == a) {
+            if let Some(a) = e["address"].as_str().and_then(config::parse_server).map(|a| a.to_string())
+                && !exits.iter().any(|x| x.0 == a) {
                     exits.push((a, e["rtt_ms"].as_u64()));
                 }
-            }
         }
-        if let Ok(v) = crate::tracker::fetch(*t, "/trackers") {
+        if let Ok(v) = crate::tracker_client::fetch(*t, "/trackers") {
             found.extend(v["trackers"].as_array().into_iter().flatten().filter_map(|e| e["address"].as_str().and_then(config::parse_server)).map(|a| a.to_string()));
         }
-        if with_peers && peers_note.is_empty() {
-            if let Ok(v) = crate::tracker::fetch(*t, "/peers") {
+        if with_peers && peers_note.is_empty()
+            && let Ok(v) = crate::tracker_client::fetch(*t, "/peers") {
                 let n = v["peers"].as_array().map(|a| a.len()).unwrap_or(0);
                 if n > 0 {
                     let _ = std::fs::write(dir.join("tracker-peers.json"), v.to_string());
                     peers_note = format!(", пиров {n}");
                 }
             }
-        }
     }
     // New trackers join the list.
     let added = {
@@ -624,11 +619,10 @@ fn helper_line(st: &Shared, tag: &str, l: &str) {
             s.tun_rx = kv.get("rx").copied().unwrap_or(s.tun_rx);
         } else if rest.starts_with("server") {
             s.srv = ["active", "total", "denied", "tx", "rx"].map(|k| kv.get(k).copied().unwrap_or(0));
-        } else if let Some(c) = rest.strip_prefix("client ") {
-            if let Some(addr) = c.split(' ').next() {
+        } else if let Some(c) = rest.strip_prefix("client ")
+            && let Some(addr) = c.split(' ').next() {
                 s.clients.insert(addr.to_string(), (kv["active"], kv["tx"], kv["rx"], Instant::now()));
             }
-        }
     } else if let Some(e) = l.strip_prefix("ERROR ") {
         error(st, tag, e);
     } else if l.starts_with("ygghelper: ") {
@@ -650,11 +644,10 @@ fn node_line(st: &Shared, l: &str) {
             s.server_rtt = val().map(|v| v.split_once("] ").map(|x| x.1.to_string()).unwrap_or(v));
         } else if l.contains("заменён пир") || l.starts_with("замена ") {
             s.last_swap = Some(format!("{} {l}", now_hms()));
-        } else if l.starts_with("lan upstream:") {
-            if let Some(v) = val().filter(|v| v.starts_with("joined") || v.starts_with("disabled")) {
+        } else if l.starts_with("lan upstream:")
+            && let Some(v) = val().filter(|v| v.starts_with("joined") || v.starts_with("disabled")) {
                 s.lan_status = Some(v);
             }
-        }
     }
     // The node prints its peer table every 10 s: keep those out of the log.
     if !(l.starts_with("peers:") || l.starts_with("  out ") || l.starts_with("  in ") || l.starts_with("  cand")) {
@@ -684,14 +677,17 @@ fn peer_journal(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>) {
         });
         j.tick(&peers, server);
         ticks += 1;
-        if ticks % 6 == 0 {
+        // The journal goes to disk every 5 min (and on shutdown): less wear on flash storage.
+        if ticks.is_multiple_of(30) {
             j.save(&path);
+        }
+        if ticks.is_multiple_of(6) {
             let tracker_peers: Option<Value> = std::fs::read_to_string(dir.join("tracker-peers.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
             let list = prefer_list(&j, tracker_peers.as_ref(), 12).join("\n");
             if list != last_prefer {
                 let _ = std::fs::write(dir.join("prefer.txt"), &list);
                 let n = list.lines().count();
-                if last_prefer.is_empty() || ticks % 360 == 0 {
+                if last_prefer.is_empty() || ticks.is_multiple_of(360) {
                     log(&st, "peers", &format!("приоритет пиров обновлён: {n} (свои лучшие и рейтинг трекеров)"));
                 }
                 last_prefer = list;
@@ -704,9 +700,9 @@ fn peer_journal(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>) {
             let n = rep["peers"].as_array().map(|a| a.len()).unwrap_or(0);
             if n > 0 && cfg.lock().unwrap().network.use_trackers {
                 j.last_report = t;
-                let trackers = crate::tracker::with_defaults(&cfg.lock().unwrap().network.trackers);
+                let trackers = crate::tracker_client::with_defaults(&cfg.lock().unwrap().network.trackers);
                 for tr in trackers.iter().filter_map(|t| config::parse_server(t)) {
-                    if crate::tracker::post(tr, "/report", &rep).is_ok() {
+                    if crate::tracker_client::post(tr, "/report", &rep).is_ok() {
                         log(&st, "peers", &format!("статистика {n} пиров отправлена трекеру {tr}"));
                         break;
                     }
@@ -804,14 +800,11 @@ impl Daemon {
 
         write_monitors(&self.st, &self.dir, cfg);
         let line = if client { format!("[{}]:{}", cfg.client.server.trim(), config::PORT) } else { String::new() };
-        let p = self.dir.join("connect.txt");
-        if std::fs::read_to_string(&p).ok().as_deref() != Some(line.as_str()) {
-            let _ = std::fs::write(&p, &line);
-            if client {
+        if platform::write_if_changed(&self.dir.join("connect.txt"), &line)
+            && client {
                 log(&self.st, "vpn", &format!("сервер выхода: {} (узел не перезапускается)", cfg.client.server));
                 self.st.lock().unwrap().server_rtt = None;
             }
-        }
 
         // 1. Node.
         if any {
@@ -837,7 +830,7 @@ impl Daemon {
         // 2. Exit.
         if cfg.server.enabled {
             let limits = self.dir.join("limits.txt");
-            let _ = std::fs::write(&limits, cfg.server.limits.file_text()); // re-read live by the exit
+            platform::write_if_changed(&limits, &cfg.server.limits.file_text()); // re-read live by the exit
             let mut cmd = vec![
                 self.helper_bin.display().to_string(),
                 "server".into(),
@@ -1085,11 +1078,11 @@ pub fn main() -> Result<(), String> {
         // directly through a yggdrasil-go TUN or through the node's --socks).
         let use_trackers = cfg.lock().unwrap().network.use_trackers;
         if use_trackers && d.node.is_some() && st.lock().unwrap().node_stats.is_some()
-            && last_trackers.map_or(true, |t| t.elapsed() >= Duration::from_secs(120))
+            && last_trackers.is_none_or(|t| t.elapsed() >= Duration::from_secs(120))
             && !trackers_busy.load(Ordering::Relaxed)
         {
             last_trackers = Some(Instant::now());
-            let with_peers = last_tracker_peers.map_or(true, |t| t.elapsed() >= Duration::from_secs(3600));
+            let with_peers = last_tracker_peers.is_none_or(|t| t.elapsed() >= Duration::from_secs(3600));
             if with_peers {
                 last_tracker_peers = Some(Instant::now());
             }

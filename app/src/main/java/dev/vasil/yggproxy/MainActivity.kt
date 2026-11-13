@@ -520,7 +520,7 @@ class MainActivity : Activity() {
 
     /** The node re-reads this ping list on its own (no restart, the VPN stays up). */
     private fun writeMonitors() {
-        try { java.io.File(filesDir, "monitors.txt").writeText(prefs.monitorList().joinToString("\n")) } catch (_: Exception) {}
+        Ygg.writeMonitors(filesDir, prefs)
     }
 
     private fun addServerFromInput() {
@@ -553,11 +553,7 @@ class MainActivity : Activity() {
             for (t in prefs.trackerList()) {
                 val e = Ygg.fetchTracker(t, "/exits") ?: continue
                 ok += t
-                e.optJSONArray("exits")?.let { a ->
-                    for (k in 0 until a.length()) a.getJSONObject(k).let { o ->
-                        Ygg.serverFromText(o.optString("address"))?.let { addr -> exits.putIfAbsent(addr, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms")) }
-                    }
-                }
+                Ygg.parseExits(e, exits)
                 Ygg.fetchTracker(t, "/trackers")?.optJSONArray("trackers")?.let { a ->
                     for (k in 0 until a.length()) Ygg.serverFromText(a.getJSONObject(k).optString("address"))?.let { newTrackers += it }
                 }
@@ -613,8 +609,7 @@ class MainActivity : Activity() {
     /** Server list with ping (from tcp_node /api/rtt); the selected one is marked. */
     private fun renderServers() {
         val rtt = lastRtt
-        val byAddr = HashMap<String, JSONObject>()
-        rtt?.optJSONArray("servers")?.let { a -> for (k in 0 until a.length()) a.getJSONObject(k).let { byAddr[it.optString("address")] = it } }
+        val byAddr = Ygg.rttByAddr(rtt)
         val list = prefs.serverList()
         val fromTrackers = State.trackerExits.filter { it.first !in list }
         val sig = list.joinToString() + "|" + fromTrackers.joinToString { it.first } + "|" + prefs.server + "|" + prefs.vpnEnabled + State.vpnActive + "|" +
@@ -872,10 +867,7 @@ class MainActivity : Activity() {
             sb.append("Пиров: ").append(peersUp).append(" · сессий ").append(n.optInt("sessions")).append(" · путей ").append(n.optInt("paths")).append('\n')
             if (prefs.useTrackers) {
                 // The node pings every tracker every 10 s (that also keeps the route warm).
-                val byAddr = HashMap<String, JSONObject>()
-                lastRtt?.optJSONArray("servers")?.let { a ->
-                    for (k in 0 until a.length()) a.getJSONObject(k).let { o -> Ygg.serverFromText(o.optString("address"))?.let { byAddr[it] = o } }
-                }
+                val byAddr = Ygg.rttByAddr(lastRtt)
                 sb.append("\nТрекеры (пинг узла):\n")
                 for (t in prefs.trackerList().mapNotNull { Ygg.serverFromText(it) }.distinct()) {
                     val o = byAddr[t]

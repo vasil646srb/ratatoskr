@@ -136,7 +136,7 @@ class SimpleActivity : Activity() {
     @Volatile private var dAvg: Long? = null
     @Volatile private var dExitMs: Long? = null
     @Volatile private var dExitAt = 0L
-    @Volatile private var dRttList: org.json.JSONArray? = null
+    @Volatile private var dRttMap: Map<String, org.json.JSONObject> = emptyMap()
     private val dashExec = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val dashBusy = java.util.concurrent.atomic.AtomicBoolean(false)
     /** Tunnel byte counters, one sample a second: (time ms, rx, tx). */
@@ -168,9 +168,9 @@ class SimpleActivity : Activity() {
                 val st = Ygg.fetchStats()?.optJSONObject("node")
                 dRootOk = st != null && st.optString("root") != st.optString("public_key")
                 dPeers = Ygg.fetchPeers()?.optJSONArray("peers")?.length() ?: if (st == null) -1 else 0
-                val list = Ygg.fetchRtt()?.optJSONArray("servers")
-                dRttList = list
-                val cur = list?.let { a -> (0 until a.length()).map { a.getJSONObject(it) }.firstOrNull { it.optBoolean("connected") } }
+                val byAddr = Ygg.rttByAddr(Ygg.fetchRtt())
+                dRttMap = byAddr
+                val cur = byAddr.values.firstOrNull { it.optBoolean("connected") }
                 dRtt = cur?.takeIf { !it.isNull("rtt_ms") }?.optLong("rtt_ms")
                 dAvg = cur?.takeIf { !it.isNull("avg_ms") }?.optLong("avg_ms")
                 // The exit itself answers through the tunnel: checked every 10 s.
@@ -225,9 +225,7 @@ class SimpleActivity : Activity() {
     private fun chooseServer() {
         val cur = Ygg.serverFromText(prefs.server)
         val ping = HashMap<String, Long>()
-        dRttList?.let { a -> for (k in 0 until a.length()) a.getJSONObject(k).let { o ->
-            Ygg.serverFromText(o.optString("address"))?.let { addr -> if (!o.isNull("avg_ms")) ping[addr] = o.optLong("avg_ms") }
-        } }
+        for ((addr, o) in dRttMap) if (!o.isNull("avg_ms")) ping[addr] = o.optLong("avg_ms")
         val all = (State.trackerExits.map { it.first } + prefs.serverList()).mapNotNull { Ygg.serverFromText(it) }.distinct()
         val others = all.filter { it != cur }.sortedBy { ping[it] ?: Long.MAX_VALUE }
         if (others.isEmpty()) { toast("Других серверов пока нет"); return }
@@ -469,11 +467,7 @@ class SimpleActivity : Activity() {
             say("спрашиваю трекер $t", Mark.INFO)
             val v = Ygg.fetchTracker(t, "/exits") ?: Ygg.fetchTracker(t, "/exits") ?: continue
             answered = answered ?: t
-            val a = v.optJSONArray("exits") ?: continue
-            for (k in 0 until a.length()) {
-                val o = a.getJSONObject(k)
-                Ygg.serverFromText(o.optString("address"))?.let { exits.putIfAbsent(it, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms")) }
-            }
+            Ygg.parseExits(v, exits)
             if (exits.isNotEmpty()) break
         }
         if (answered == null) finish("трекеры не ответили", ok = false) else finish("ответил $answered")
@@ -488,16 +482,12 @@ class SimpleActivity : Activity() {
 
         // 5. Ping to every server (the node pings everything in its monitor list).
         say("Измеряю пинг до серверов")
-        try { File(filesDir, "monitors.txt").writeText(prefs.monitorList().joinToString("\n")) } catch (_: Exception) {}
+        Ygg.writeMonitors(filesDir, prefs)
         val ping = HashMap<String, Long>()
         val deadline = System.currentTimeMillis() + 25_000
         while (System.currentTimeMillis() < deadline) {
-            Ygg.fetchRtt()?.optJSONArray("servers")?.let { a ->
-                for (k in 0 until a.length()) {
-                    val o = a.getJSONObject(k)
-                    val addr = Ygg.serverFromText(o.optString("address")) ?: continue
-                    if (addr in exits && !o.isNull("rtt_ms")) ping[addr] = o.optLong("avg_ms").takeIf { it > 0 } ?: o.optLong("rtt_ms")
-                }
+            for ((addr, o) in Ygg.rttByAddr(Ygg.fetchRtt())) {
+                if (addr in exits && !o.isNull("rtt_ms")) ping[addr] = o.optLong("avg_ms").takeIf { it > 0 } ?: o.optLong("rtt_ms")
             }
             if (ping.size == exits.size) break
             pause(2000)

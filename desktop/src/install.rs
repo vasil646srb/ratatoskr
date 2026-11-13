@@ -59,14 +59,20 @@ fn invoking_user() -> Option<String> {
     Some(unsafe { std::ffi::CStr::from_ptr((*pw).pw_name) }.to_string_lossy().into_owned())
 }
 
-pub fn install() -> Result<(), String> {
-    need_root()?;
+/// Put this binary at [`BIN`] (through a temporary file: the running one may be in use).
+fn copy_self() -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     if me != std::path::Path::new(BIN) {
         let tmp = format!("{BIN}.new");
         std::fs::copy(&me, &tmp).map_err(|e| format!("{tmp}: {e}"))?;
         std::fs::rename(&tmp, BIN).map_err(|e| format!("{BIN}: {e}"))?;
     }
+    Ok(())
+}
+
+pub fn install() -> Result<(), String> {
+    need_root()?;
+    copy_self()?;
     std::fs::write(UNIT, UNIT_TEXT).map_err(|e| format!("{UNIT}: {e}"))?;
     if std::path::Path::new("/usr/share/applications").is_dir() {
         let _ = std::fs::write(DESKTOP, DESKTOP_TEXT);
@@ -105,12 +111,7 @@ WantedBy=multi-user.target
 /// `sudo yggproxy install-tracker`: the tracker service (it runs its own Yggdrasil node).
 pub fn install_tracker() -> Result<(), String> {
     need_root()?;
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    if me != std::path::Path::new(BIN) {
-        let tmp = format!("{BIN}.new");
-        std::fs::copy(&me, &tmp).map_err(|e| format!("{tmp}: {e}"))?;
-        std::fs::rename(&tmp, BIN).map_err(|e| format!("{BIN}: {e}"))?;
-    }
+    copy_self()?;
     std::fs::write(TRACKER_UNIT, TRACKER_UNIT_TEXT).map_err(|e| format!("{TRACKER_UNIT}: {e}"))?;
     sh(&["systemctl", "daemon-reload"])?;
     sh(&["systemctl", "enable", "yggproxy-tracker"])?;

@@ -141,13 +141,11 @@ impl Journal {
         }
         // Sessions that ended since the last tick.
         for (id, r) in self.peers.iter_mut() {
-            if !seen.contains(id) {
-                if let Some(s) = r.session_start.take() {
-                    if t.saturating_sub(s) < 120 {
+            if !seen.contains(id)
+                && let Some(s) = r.session_start.take()
+                    && t.saturating_sub(s) < 120 {
                         r.drops += 1;
                     }
-                }
-            }
         }
         // Forget peers not seen for 30 days.
         self.peers.retain(|_, r| t.saturating_sub(r.last_seen) < 30 * 86400);

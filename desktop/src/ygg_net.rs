@@ -457,7 +457,7 @@ fn stack(me: Ipv6Addr, ev: mpsc::Receiver<Ev>, stream_tx: mpsc::Sender<Ev>, out:
                 }
                 let accepted = *h;
                 let remote = s.remote_endpoint().and_then(|e| match e.addr {
-                    IpAddress::Ipv6(a) => Some(Ipv6Addr::from(a)),
+                    IpAddress::Ipv6(a) => Some(a),
                     #[allow(unreachable_patterns)]
                     _ => None,
                 });
@@ -479,13 +479,11 @@ fn stack(me: Ipv6Addr, ev: mpsc::Receiver<Ev>, stream_tx: mpsc::Sender<Ev>, out:
             let s = sockets.get_mut::<tcp::Socket>(c.handle);
             if let Phase::Connecting { deadline, .. } = &c.phase {
                 if s.state() == tcp::State::Established {
-                    if let Phase::Connecting { reply, .. } = std::mem::replace(&mut c.phase, Phase::Open) {
-                        if let Some(stream) = PENDING.with(|p| p.borrow_mut().remove(id)) {
-                            if reply.send(Ok(stream)).is_err() {
+                    if let Phase::Connecting { reply, .. } = std::mem::replace(&mut c.phase, Phase::Open)
+                        && let Some(stream) = PENDING.with(|p| p.borrow_mut().remove(id))
+                            && reply.send(Ok(stream)).is_err() {
                                 c.user_closed = true;
                             }
-                        }
-                    }
                 } else if s.state() == tcp::State::Closed || Instant::now() > *deadline {
                     let refused = s.state() == tcp::State::Closed;
                     s.abort();
@@ -507,13 +505,12 @@ fn stack(me: Ipv6Addr, ev: mpsc::Receiver<Ev>, stream_tx: mpsc::Sender<Ev>, out:
             }
             // Incoming data.
             while s.can_recv() {
-                let mut buf = vec![0u8; 16384];
-                match s.recv_slice(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        buf.truncate(n);
-                        let _ = c.to_user.send(Chunk::Data(buf));
+                // Straight from the socket's buffer: one allocation of exactly the data's size.
+                match s.recv(|data| (data.len(), data.to_vec())) {
+                    Ok(data) if !data.is_empty() => {
+                        let _ = c.to_user.send(Chunk::Data(data));
                     }
+                    _ => break,
                 }
             }
             if !c.ended && !s.may_recv() && !matches!(s.state(), tcp::State::Listen | tcp::State::SynReceived) {

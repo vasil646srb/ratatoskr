@@ -170,22 +170,16 @@ fn peers() -> Result<(), String> {
 
 /// Saved servers and the trackers' exits with the node's ping: (address, saved, ping ms).
 fn server_rows(s: &Value) -> Vec<(String, bool, Option<u64>)> {
-    let mut ping = std::collections::HashMap::new();
-    for e in s["rtt"]["servers"].as_array().into_iter().flatten() {
-        if let (Some(a), Some(r)) = (e["address"].as_str(), e["rtt_ms"].as_u64()) {
-            ping.insert(a.to_string(), r);
-        }
-    }
+    let ping = api::ping_map(s);
     let mut rows: Vec<(String, bool, Option<u64>)> = Vec::new();
     for a in s["client"]["servers"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
         rows.push((a.to_string(), true, ping.get(a).copied()));
     }
     for e in s["trackers"]["exits"].as_array().into_iter().flatten() {
-        if let Some(a) = e["address"].as_str() {
-            if !rows.iter().any(|r| r.0 == a) {
+        if let Some(a) = e["address"].as_str()
+            && !rows.iter().any(|r| r.0 == a) {
                 rows.push((a.to_string(), false, ping.get(a).copied()));
             }
-        }
     }
     rows
 }
@@ -403,9 +397,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             // A given tracker, else the configured ones (with the built-in) until one answers.
             let list: Vec<String> = match a(1) {
                 Some(x) => vec![config::parse_server(x).ok_or("адрес трекера: 200:…")?.to_string()],
-                None => crate::tracker::with_defaults(&api::config().map(|c| c.network.trackers).unwrap_or_default()),
+                None => crate::tracker_client::with_defaults(&api::config().map(|c| c.network.trackers).unwrap_or_default()),
             };
-            let (t, v) = crate::tracker::fetch_any(&list, &format!("/{what}"))?;
+            let (t, v) = crate::tracker_client::fetch_any(&list, &format!("/{what}"))?;
             let list = v[what].as_array().cloned().unwrap_or_default();
             println!("трекер {t}: {} {}", list.len(), if what == "exits" { "выходных серверов" } else { "трекеров" });
             for e in list {

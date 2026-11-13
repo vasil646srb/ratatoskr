@@ -79,17 +79,13 @@ impl Limits {
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Server {
     pub enabled: bool,
     pub allow_lan: bool,
     pub limits: Limits,
 }
 
-impl Default for Server {
-    fn default() -> Self {
-        Self { enabled: false, allow_lan: false, limits: Limits::default() }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
@@ -143,7 +139,7 @@ impl Default for Network {
             extra_args: String::new(),
             keep_node: true,
             use_trackers: true,
-            trackers: crate::tracker::DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect(),
+            trackers: crate::tracker_client::DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect(),
         }
     }
 }

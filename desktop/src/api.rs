@@ -46,6 +46,16 @@ pub fn update(f: impl FnOnce(&mut Config)) -> Result<Config, String> {
     Ok(c)
 }
 
+/// The node's last ping (ms) to every address it monitors: servers, trackers' exits, trackers.
+pub fn ping_map(s: &Value) -> std::collections::HashMap<String, u64> {
+    s["rtt"]["servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some((e["address"].as_str()?.to_string(), e["rtt_ms"].as_u64()?)))
+        .collect()
+}
+
 /// Trackers with the node's ping to them: (address, last ms, average ms). Empty when trackers
 /// are off. The node pings every tracker every 10 s, which also keeps the route to it warm.
 pub fn tracker_pings(s: &Value) -> Vec<(String, Option<u64>, Option<u64>)> {
@@ -55,7 +65,7 @@ pub fn tracker_pings(s: &Value) -> Vec<(String, Option<u64>, Option<u64>)> {
     let saved: Vec<String> = s["trackers"]["list"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect();
     let rtt = s["rtt"]["servers"].as_array().cloned().unwrap_or_default();
     let mut out: Vec<(String, Option<u64>, Option<u64>)> = Vec::new();
-    for t in crate::tracker::with_defaults(&saved) {
+    for t in crate::tracker_client::with_defaults(&saved) {
         let Some(a) = config::parse_server(&t) else { continue };
         if out.iter().any(|o| o.0 == a.to_string()) {
             continue;
@@ -114,7 +124,7 @@ pub fn dur(s: u64) -> String {
 pub fn limit_text(kbit: u64) -> String {
     if kbit == 0 {
         "нет".into()
-    } else if kbit % 1000 == 0 {
+    } else if kbit.is_multiple_of(1000) {
         format!("{} Мбит/с", kbit / 1000)
     } else {
         format!("{:.1} Мбит/с", kbit as f64 / 1000.0)

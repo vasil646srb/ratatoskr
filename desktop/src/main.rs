@@ -15,6 +15,7 @@ mod install;
 mod platform;
 mod peerstats;
 mod tracker;
+mod tracker_client;
 mod ygg_net;
 
 fn main() {

@@ -18,28 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
+use crate::tracker_client::{with_defaults, DEFAULT_TRACKERS, TRACKER_PORT};
 use crate::ygg_net::Net;
 use std::net::{Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
-
-/// Overlay port of the tracker API.
-pub const TRACKER_PORT: u16 = 27081;
-/// Built-in tracker(s): the project's own server; others are found and synced.
-pub const DEFAULT_TRACKERS: &[&str] = &["200:379c:ac8b:ad9f:2fbd:c38c:4be:51a0"];
-
-/// `list` with the built-in trackers added (they are always asked, also on old configs).
-pub fn with_defaults(list: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for t in DEFAULT_TRACKERS.iter().map(|s| s.to_string()).chain(list.iter().cloned()) {
-        if let Some(a) = config::parse_server(&t).map(|a| a.to_string()) {
-            if !out.contains(&a) {
-                out.push(a);
-            }
-        }
-    }
-    out
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -206,8 +189,8 @@ fn crawl(cfg: &TrackerConfig) -> Result<Vec<String>, String> {
                 std::thread::sleep(Duration::from_millis(200));
                 continue;
             };
-            if let Some(k) = parse_hex_key(&key) {
-                if let Ok(found) = net().remote_peers(k) {
+            if let Some(k) = parse_hex_key(&key)
+                && let Ok(found) = net().remote_peers(k) {
                     let mut s = seen.lock().unwrap();
                     let mut q = queue.lock().unwrap();
                     for k in found.iter().map(key_hex) {
@@ -216,7 +199,6 @@ fn crawl(cfg: &TrackerConfig) -> Result<Vec<String>, String> {
                         }
                     }
                 }
-            }
             *busy.lock().unwrap() -= 1;
         }));
     }
@@ -231,10 +213,16 @@ fn crawl(cfg: &TrackerConfig) -> Result<Vec<String>, String> {
 // ------------------------------------------------------------------------------------------
 // Probes (TCP over the tracker's own node)
 
+/// Connect timeout for nodes we already know (sync, recheck): the first connection waits for
+/// path discovery.
+const KNOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Connect timeout for crawl candidates: thousands of nodes, most of them without our ports.
+const CRAWL_TIMEOUT: Duration = Duration::from_secs(6);
+
 /// A Ratatoskr exit: SOCKS5 on 27080 that lets us CONNECT to its speed-test port. Connect time (ms).
-fn probe_exit(addr: Ipv6Addr) -> Option<u64> {
+fn probe_exit(addr: Ipv6Addr, timeout: Duration) -> Option<u64> {
     let t0 = Instant::now();
-    let mut s = net().connect(addr, config::PORT, Duration::from_secs(10)).ok()?;
+    let mut s = net().connect(addr, config::PORT, timeout).ok()?;
     let rtt = t0.elapsed().as_millis() as u64;
     s.set_read_timeout(Some(Duration::from_secs(10)));
     s.write_all(&[5, 1, 0]).ok()?;
@@ -250,7 +238,11 @@ fn probe_exit(addr: Ipv6Addr) -> Option<u64> {
 }
 
 fn http_get(addr: Ipv6Addr, port: u16, path: &str) -> Option<Value> {
-    let mut s = net().connect(addr, port, Duration::from_secs(10)).ok()?;
+    http_get_within(addr, port, path, KNOWN_TIMEOUT)
+}
+
+fn http_get_within(addr: Ipv6Addr, port: u16, path: &str, timeout: Duration) -> Option<Value> {
+    let mut s = net().connect(addr, port, timeout).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(15)));
     s.write_all(format!("GET {path} HTTP/1.0\r\nHost: [{addr}]\r\n\r\n").as_bytes()).ok()?;
     let mut body = Vec::new();
@@ -260,16 +252,23 @@ fn http_get(addr: Ipv6Addr, port: u16, path: &str) -> Option<Value> {
 }
 
 /// Another tracker: `/info` names the service.
-fn probe_tracker(addr: Ipv6Addr) -> bool {
-    http_get(addr, TRACKER_PORT, "/info").map(|v| v["service"].as_str() == Some("ratatoskr-tracker")).unwrap_or(false)
+fn probe_tracker(addr: Ipv6Addr, timeout: Duration) -> bool {
+    http_get_within(addr, TRACKER_PORT, "/info", timeout).map(|v| v["service"].as_str() == Some("ratatoskr-tracker")).unwrap_or(false)
 }
 
-fn parallel<T: Send + 'static>(items: Vec<Ipv6Addr>, workers: usize, f: fn(Ipv6Addr) -> Option<T>) -> Vec<(Ipv6Addr, T)> {
+/// Run `f` over `items` on up to `workers` threads; the items it returned something for.
+fn parallel<T, F>(items: Vec<Ipv6Addr>, workers: usize, f: F) -> Vec<(Ipv6Addr, T)>
+where
+    T: Send + 'static,
+    F: Fn(Ipv6Addr) -> Option<T> + Send + Sync + 'static,
+{
+    let workers = workers.max(1).min(items.len().max(1));
     let q = Arc::new(Mutex::new(items));
     let out = Arc::new(Mutex::new(Vec::new()));
-    let hs: Vec<_> = (0..workers.max(1))
+    let f = Arc::new(f);
+    let hs: Vec<_> = (0..workers)
         .map(|_| {
-            let (q, out) = (q.clone(), out.clone());
+            let (q, out, f) = (q.clone(), out.clone(), f.clone());
             std::thread::spawn(move || loop {
                 let Some(a) = q.lock().unwrap().pop() else { return };
                 if let Some(r) = f(a) {
@@ -349,17 +348,13 @@ fn listed(e: &Entry, cfg: &TrackerConfig) -> bool {
         && (cfg.hide_after_fails == 0 || e.fails < cfg.hide_after_fails)
 }
 
-/// Probe these exit candidates and record the results.
-fn check_exits(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, String)>) -> usize {
-    let source: HashMap<Ipv6Addr, String> = cands.iter().cloned().collect();
-    let addrs: Vec<Ipv6Addr> = source.keys().copied().collect();
-    let ok = parallel(addrs.clone(), cfg.probe_workers, probe_exit);
-    let okmap: HashMap<Ipv6Addr, u64> = ok.into_iter().collect();
+/// Record exit probe results: `ok` answered (with the connect time), the rest of `source` did not.
+fn record_exits(db: &Mutex<Db>, cfg: &TrackerConfig, source: &HashMap<Ipv6Addr, String>, ok: &HashMap<Ipv6Addr, u64>) -> usize {
     let mut d = db.lock().unwrap();
-    for a in &addrs {
+    for (a, src) in source {
         let s = a.to_string();
-        match okmap.get(a) {
-            Some(rtt) => Db::mark(&mut d.exits, &s, Some(*rtt), &source[a]),
+        match ok.get(a) {
+            Some(rtt) => Db::mark(&mut d.exits, &s, Some(*rtt), src),
             // A crawl candidate that never answered is not worth remembering.
             None if d.exits.contains_key(&s) => Db::mark(&mut d.exits, &s, None, ""),
             None => {}
@@ -369,23 +364,53 @@ fn check_exits(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, String
     let exp = cfg.expire_hours * 3600;
     d.exits.retain(|_, e| now().saturating_sub(e.last_ok.max(e.first_seen)) < exp * 7);
     d.save();
-    okmap.len()
+    ok.len()
 }
 
-fn check_trackers(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, String)>, me: Ipv6Addr) {
-    let source: HashMap<Ipv6Addr, String> = cands.into_iter().filter(|(a, _)| *a != me).collect();
-    let addrs: Vec<Ipv6Addr> = source.keys().copied().collect();
-    let ok: HashSet<Ipv6Addr> = parallel(addrs.clone(), cfg.probe_workers, |a| probe_tracker(a).then_some(())).into_iter().map(|x| x.0).collect();
+fn record_trackers(db: &Mutex<Db>, source: &HashMap<Ipv6Addr, String>, ok: &HashSet<Ipv6Addr>) {
     let mut d = db.lock().unwrap();
-    for a in &addrs {
+    for (a, src) in source {
         let s = a.to_string();
         if ok.contains(a) {
-            Db::mark(&mut d.trackers, &s, Some(0), &source[a]);
+            Db::mark(&mut d.trackers, &s, Some(0), src);
         } else if d.trackers.contains_key(&s) {
             Db::mark(&mut d.trackers, &s, None, "");
         }
     }
     d.save();
+}
+
+/// Probe these exit candidates and record the results.
+fn check_exits(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, String)>) -> usize {
+    let source: HashMap<Ipv6Addr, String> = cands.into_iter().collect();
+    let ok: HashMap<Ipv6Addr, u64> = parallel(source.keys().copied().collect(), cfg.probe_workers, |a| probe_exit(a, KNOWN_TIMEOUT)).into_iter().collect();
+    record_exits(db, cfg, &source, &ok)
+}
+
+fn check_trackers(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, String)>, me: Ipv6Addr) {
+    let source: HashMap<Ipv6Addr, String> = cands.into_iter().filter(|(a, _)| *a != me).collect();
+    let ok: HashSet<Ipv6Addr> =
+        parallel(source.keys().copied().collect(), cfg.probe_workers, |a| probe_tracker(a, KNOWN_TIMEOUT).then_some(())).into_iter().map(|x| x.0).collect();
+    record_trackers(db, &source, &ok);
+}
+
+/// The crawl's nodes: both ports of every node in one pass. A node's two probes run together,
+/// so the pass takes as long as the slower probe, not their sum (two passes over ~9000 nodes
+/// took longer than the crawl interval).
+fn check_crawled(db: &Mutex<Db>, cfg: &TrackerConfig, addrs: &[Ipv6Addr], me: Ipv6Addr) -> usize {
+    let source: HashMap<Ipv6Addr, String> = addrs.iter().filter(|a| **a != me).map(|a| (*a, "crawl".to_string())).collect();
+    let found = parallel(source.keys().copied().collect(), cfg.probe_workers, |a| {
+        std::thread::scope(|s| {
+            let tracker = s.spawn(move || probe_tracker(a, CRAWL_TIMEOUT));
+            let exit = probe_exit(a, CRAWL_TIMEOUT);
+            let tracker = tracker.join().unwrap_or(false);
+            (exit.is_some() || tracker).then_some((exit, tracker))
+        })
+    });
+    let exits: HashMap<Ipv6Addr, u64> = found.iter().filter_map(|(a, (e, _))| e.map(|rtt| (*a, rtt))).collect();
+    let trackers: HashSet<Ipv6Addr> = found.iter().filter(|(_, (_, t))| *t).map(|x| x.0).collect();
+    record_trackers(db, &source, &trackers);
+    record_exits(db, cfg, &source, &exits)
 }
 
 // ------------------------------------------------------------------------------------------
@@ -534,11 +559,10 @@ fn serve(listener: crate::ygg_net::NetListener, db: Arc<Mutex<Db>>, cfg: Tracker
                     if h.trim().is_empty() || seen > 16 * 1024 {
                         break;
                     }
-                    if let Some((k, v)) = h.split_once(':') {
-                        if k.trim().eq_ignore_ascii_case("content-length") {
+                    if let Some((k, v)) = h.split_once(':')
+                        && k.trim().eq_ignore_ascii_case("content-length") {
                             len = v.trim().parse().unwrap_or(0);
                         }
-                    }
                 }
                 if len > 0 && len <= 256 * 1024 {
                     body_in.resize(len, 0);
@@ -676,7 +700,7 @@ pub fn main() -> Result<(), String> {
     let mut last_peers = None::<Instant>;
     loop {
         // Public peers: downloaded and checked from here (from other trackers if blocked).
-        if last_peers.map_or(true, |t| t.elapsed() >= Duration::from_secs(cfg.peers_interval_min * 60)) {
+        if last_peers.is_none_or(|t| t.elapsed() >= Duration::from_secs(cfg.peers_interval_min * 60)) {
             last_peers = Some(Instant::now());
             let others: Vec<Ipv6Addr> = {
                 let d = db.lock().unwrap();
@@ -685,7 +709,7 @@ pub fn main() -> Result<(), String> {
             refresh_peers(&db, &cfg, &others);
         }
         // Sync: other trackers' exits and trackers, verified by our own probes.
-        if last_sync.map_or(true, |t| t.elapsed() >= Duration::from_secs(cfg.sync_interval_min * 60)) {
+        if last_sync.is_none_or(|t| t.elapsed() >= Duration::from_secs(cfg.sync_interval_min * 60)) {
             last_sync = Some(Instant::now());
             let trackers: Vec<String> = {
                 let d = db.lock().unwrap();
@@ -713,7 +737,7 @@ pub fn main() -> Result<(), String> {
             }
         }
         // Crawl: every node of the network, probed for the exit and tracker ports.
-        if last_crawl.map_or(true, |t| t.elapsed() >= Duration::from_secs(cfg.crawl_interval_min * 60)) {
+        if last_crawl.is_none_or(|t| t.elapsed() >= Duration::from_secs(cfg.crawl_interval_min * 60)) {
             last_crawl = Some(Instant::now());
             match crawl(&cfg) {
                 Ok(keys) => {
@@ -724,8 +748,7 @@ pub fn main() -> Result<(), String> {
                         d.crawl_nodes = addrs.len();
                     }
                     let t0 = Instant::now();
-                    let n = check_exits(&db, &cfg, addrs.iter().map(|a| (*a, "crawl".to_string())).collect());
-                    check_trackers(&db, &cfg, addrs.iter().map(|a| (*a, "crawl".to_string())).collect(), me);
+                    let n = check_crawled(&db, &cfg, &addrs, me);
                     log(&format!("проверено {} узлов за {} с: выходов {n}, трекеров {}", addrs.len(), t0.elapsed().as_secs(),
                         db.lock().unwrap().trackers.values().filter(|e| listed(e, &cfg)).count()));
                 }
@@ -746,121 +769,9 @@ pub fn main() -> Result<(), String> {
     }
 }
 
-/// This host has a Yggdrasil address (a yggdrasil-go TUN): the kernel can reach 200::/7 itself.
-fn have_ygg_route() -> bool {
-    #[cfg(unix)]
-    return std::fs::read_to_string("/proc/net/if_inet6").map(|t| t.lines().any(|l| l.starts_with("02") || l.starts_with("03"))).unwrap_or(false);
-    // Windows: the source address the system would pick for 200::/7 is a Yggdrasil one.
-    #[cfg(windows)]
-    {
-        let Ok(u) = std::net::UdpSocket::bind("[::]:0") else { return false };
-        u.connect("[200::1]:9").is_ok() && u.local_addr().map(|a| matches!(a.ip(), std::net::IpAddr::V6(v) if (v.octets()[0] & 0xfe) == 0x02)).unwrap_or(false)
-    }
-}
-
-fn io_text(e: &std::io::Error, tracker: Ipv6Addr, secs: u64) -> String {
-    match e.kind() {
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => format!(
-            "трекер {tracker} не ответил за {secs} с (первое соединение через Yggdrasil, пока ищется путь, бывает долгим — повторите)"
-        ),
-        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof => {
-            format!("трекер {tracker} недоступен (на нём не запущен трекер или закрыт порт {TRACKER_PORT})")
-        }
-        _ => format!("трекер {tracker}: {e}"),
-    }
-}
-
-fn parse_http(body: &[u8], tracker: Ipv6Addr) -> Result<Value, String> {
-    let text = String::from_utf8_lossy(body);
-    let (_, b) = text.split_once("\r\n\r\n").ok_or_else(|| format!("трекер {tracker} закрыл соединение без ответа (недоступен или закрыт порт {TRACKER_PORT})"))?;
-    serde_json::from_str(b).map_err(|e| format!("трекер {tracker}: неверный ответ ({e})"))
-}
-
-/// Directly through a yggdrasil-go TUN.
-fn fetch_direct(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
-    request_direct(tracker, &format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n"))
-}
-
-fn request_direct(tracker: Ipv6Addr, req: &str) -> Result<Value, String> {
-    let mut s = TcpStream::connect_timeout(&SocketAddr::from((tracker, TRACKER_PORT)), Duration::from_secs(20)).map_err(|e| io_text(&e, tracker, 20))?;
-    s.set_read_timeout(Some(Duration::from_secs(30))).ok();
-    s.write_all(req.as_bytes()).map_err(|e| io_text(&e, tracker, 30))?;
-    let mut body = Vec::new();
-    s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| io_text(&e, tracker, 30))?;
-    parse_http(&body, tracker)
-}
-
-/// Through tcp_node --socks (the yggproxy service).
-fn fetch_socks(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
-    request_socks(tracker, &format!("GET {path} HTTP/1.0\r\nHost: [{tracker}]\r\n\r\n"))
-}
-
-fn request_socks(tracker: Ipv6Addr, req: &str) -> Result<Value, String> {
-    let mut s = TcpStream::connect(("127.0.0.1", config::NODE_SOCKS))
-        .map_err(|_| "трекер недоступен: нет yggdrasil-go и не запущена служба yggproxy (sudo yggproxy install)".to_string())?;
-    s.set_read_timeout(Some(Duration::from_secs(40))).ok();
-    let mut b = [0u8; 22];
-    s.write_all(&[5, 1, 0]).map_err(|e| e.to_string())?;
-    s.read_exact(&mut b[..2]).map_err(|e| e.to_string())?;
-    let mut sreq = vec![5, 1, 0, 4];
-    sreq.extend_from_slice(&tracker.octets());
-    sreq.extend_from_slice(&TRACKER_PORT.to_be_bytes());
-    s.write_all(&sreq).map_err(|e| e.to_string())?;
-    s.read_exact(&mut b).map_err(|e| e.to_string())?;
-    if b[1] != 0 {
-        return Err(format!("SOCKS узла: отказ {}", b[1]));
-    }
-    s.write_all(req.as_bytes()).map_err(|e| io_text(&e, tracker, 40))?;
-    let mut body = Vec::new();
-    s.take(4 * 1024 * 1024).read_to_end(&mut body).map_err(|e| io_text(&e, tracker, 40))?;
-    parse_http(&body, tracker)
-}
-
-/// `GET path` from a tracker: directly through a yggdrasil-go TUN when this host has one, else
-/// through the yggproxy service's tcp_node SOCKS. Two tries: the first connection to a new
-/// address can take a while (path discovery).
-pub fn fetch(tracker: Ipv6Addr, path: &str) -> Result<Value, String> {
-    let direct = have_ygg_route();
-    let mut last = String::new();
-    for _ in 0..2 {
-        let r = if direct { fetch_direct(tracker, path).or_else(|e| fetch_socks(tracker, path).map_err(|_| e)) } else { fetch_socks(tracker, path) };
-        match r {
-            Ok(v) => return Ok(v),
-            Err(e) => last = e,
-        }
-    }
-    Err(last)
-}
-
-/// `POST path` with a JSON body to a tracker (same transport as [`fetch`]).
-pub fn post(tracker: Ipv6Addr, path: &str, body: &Value) -> Result<Value, String> {
-    let b = body.to_string();
-    let req = format!("POST {path} HTTP/1.0\r\nHost: [{tracker}]\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{b}", b.len());
-    if have_ygg_route() { request_direct(tracker, &req).or_else(|_| request_socks(tracker, &req)) } else { request_socks(tracker, &req) }
-}
-
-/// The first of `trackers` that answers, with its address.
-pub fn fetch_any(trackers: &[String], path: &str) -> Result<(Ipv6Addr, Value), String> {
-    let mut errs = Vec::new();
-    for t in trackers.iter().filter_map(|t| config::parse_server(t)) {
-        match fetch(t, path) {
-            Ok(v) => return Ok((t, v)),
-            Err(e) => errs.push(e),
-        }
-    }
-    Err(if errs.is_empty() { "нет трекеров".into() } else { errs.join("\n") })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn defaults_are_always_in_the_list() {
-        let l = with_defaults(&["200:1::1".into(), DEFAULT_TRACKERS[0].into()]);
-        assert_eq!(l.len(), DEFAULT_TRACKERS.len() + 1);
-        assert_eq!(l[0], DEFAULT_TRACKERS[0]);
-    }
 
     #[test]
     fn hidden_after_failed_checks_and_back_on_success() {

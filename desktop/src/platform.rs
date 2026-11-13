@@ -28,6 +28,15 @@ pub fn command(prog: impl AsRef<std::ffi::OsStr>) -> Command {
     c
 }
 
+/// Write `text` to `path` only when it differs: files the node re-reads live are compared by
+/// content, and unchanged ones need no write (flash storage on routers and phones).
+pub fn write_if_changed(path: &std::path::Path, text: &str) -> bool {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(text) {
+        return false;
+    }
+    std::fs::write(path, text).is_ok()
+}
+
 /// Download a text file over HTTP(S) in-process (rustls with the Mozilla root certificates, no
 /// curl/wget/PowerShell and no system TLS library). At most 32 MB, 30 s per stage.
 pub fn download_text(url: &str) -> Result<String, String> {

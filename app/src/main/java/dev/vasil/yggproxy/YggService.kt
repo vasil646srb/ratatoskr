@@ -93,8 +93,7 @@ class YggService : VpnService() {
     /** The trackers, for the node's peer search while no server is used (re-read live). */
     private fun writeSearchFile() {
         try {
-            val text = if (prefs.useTrackers) prefs.trackerList().joinToString("\n") else ""
-            if (!searchFile.exists() || searchFile.readText() != text) searchFile.writeText(text)
+            Ygg.writeIfChanged(searchFile, if (prefs.useTrackers) prefs.trackerList().joinToString("\n") else "")
         } catch (_: Exception) {}
     }
     private var journalTicks = 0L
@@ -106,19 +105,17 @@ class YggService : VpnService() {
      */
     private fun journalTick() { try {
         if (State.nodeRunning) Ygg.fetchPeers()?.let { peers ->
-            val server = Ygg.fetchRtt()?.optJSONArray("servers")?.let { a ->
-                (0 until a.length()).map { a.getJSONObject(it) }.firstOrNull { it.optBoolean("connected") && !it.isNull("avg_ms") }?.optDouble("avg_ms")
-            }
+            val server = Ygg.rttByAddr(Ygg.fetchRtt()).values.firstOrNull { it.optBoolean("connected") && !it.isNull("avg_ms") }?.optDouble("avg_ms")
             synchronized(journal) {
                 journal.tick(peers, server)
                 journalTicks++
+                // To disk every 5 min (and when the service stops): less wear on flash storage.
+                if (journalTicks % 30 == 0L) journal.save()
                 if (journalTicks % 6 == 0L) {
-                    journal.save()
                     writeSearchFile() // trackers learned meanwhile
                     val tp = try { org.json.JSONObject(File(filesDir, "tracker-peers.json").readText()) } catch (_: Exception) { null }
                     val list = journal.preferList(if (prefs.useTrackers) tp else null).joinToString("\n")
-                    if (!preferFile.exists() || preferFile.readText() != list) {
-                        preferFile.writeText(list)
+                    if (Ygg.writeIfChanged(preferFile, list)) {
                         if (journalTicks == 6L) State.log("peers", "приоритет пиров: ${list.lines().count { it.isNotBlank() }} (свои лучшие и рейтинг трекеров)")
                     }
                 }
@@ -228,7 +225,7 @@ class YggService : VpnService() {
         // off keeps the node, its peers and its paths.
         val connectLine = if (wantVpn) "[${target!!.first}]:${target.second}" else ""
         if (connectLine != lastTarget) {
-            try { connectFile.writeText(connectLine) } catch (e: Exception) { State.error("vpn", "connect.txt: ${e.message}") }
+            Ygg.writeIfChanged(connectFile, connectLine)
             if (lastTarget != null) State.serverRtt = null
             lastTarget = connectLine
             if (wantVpn) State.log("vpn", "сервер выхода: ${target!!.first} (узел не перезапускается)")
@@ -294,7 +291,7 @@ class YggService : VpnService() {
         add("--api"); add("127.0.0.1:${Ygg.API}")
         add("--html-port"); add(Ygg.HTML_PORT.toString())
         // Ping list for the server list's ping column (re-read live, no restart on changes).
-        monitorsFile.writeText(prefs.monitorList().joinToString("\n"))
+        Ygg.writeMonitors(filesDir, prefs)
         add("--monitor-file"); add(monitorsFile.path)
         add("--socks"); add("127.0.0.1:${Ygg.NODE_SOCKS}")
         if (prefs.lanDiscovery) {

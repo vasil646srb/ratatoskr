@@ -80,7 +80,7 @@ fn poller(data: Arc<Mutex<Data>>, ctx: egui::Context) {
 }
 
 fn mbit_field(kbit: u64) -> String {
-    if kbit % 1000 == 0 { (kbit / 1000).to_string() } else { format!("{:.1}", kbit as f64 / 1000.0) }
+    if kbit.is_multiple_of(1000) { (kbit / 1000).to_string() } else { format!("{:.1}", kbit as f64 / 1000.0) }
 }
 
 fn parse_mbit(s: &str) -> u64 {
@@ -159,14 +159,7 @@ impl App {
         // Saved servers and the trackers' exits, with the node's ping.
         ui.add_space(4.0);
         ui.label("Серверы (нажмите — подключиться). Пинг меряет узел Yggdrasil каждые 10 с.");
-        let mut ping = std::collections::HashMap::new();
-        if let Some(s) = st {
-            for e in s["rtt"]["servers"].as_array().into_iter().flatten() {
-                if let (Some(a), Some(r)) = (e["address"].as_str(), e["rtt_ms"].as_u64()) {
-                    ping.insert(a.to_string(), r);
-                }
-            }
-        }
+        let ping = st.map(api::ping_map).unwrap_or_default();
         let saved = self.cfg.as_ref().unwrap().client.servers.clone();
         let tracker: Vec<String> = st
             .map(|s| s["trackers"]["exits"].as_array().into_iter().flatten().filter_map(|e| e["address"].as_str().map(String::from)).filter(|a| !saved.contains(a)).collect())
@@ -308,8 +301,8 @@ impl App {
         let addr = st.and_then(|s| s["node"]["address"].as_str()).map(String::from);
         if let Some(a) = &addr {
             let link = config::connect_link(a);
-            if self.qr.as_ref().map(|q| &q.0) != Some(&link) {
-                if let Some((m, w)) = api::qr(&link) {
+            if self.qr.as_ref().map(|q| &q.0) != Some(&link)
+                && let Some((m, w)) = api::qr(&link) {
                     let q = 2;
                     let side = w + 2 * q;
                     let mut px = vec![255u8; side * side];
@@ -323,7 +316,6 @@ impl App {
                     let img = egui::ColorImage::from_gray([side, side], &px);
                     self.qr = Some((link.clone(), ui.ctx().load_texture("qr", img, egui::TextureOptions::NEAREST)));
                 }
-            }
             ui.add_space(4.0);
             ui.monospace(format!("Адрес для клиентов: {a}"));
             if let Some((_, tex)) = &self.qr {
@@ -632,11 +624,10 @@ impl eframe::App for App {
             if let Some(e) = &error {
                 ui.colored_label(egui::Color32::from_rgb(200, 60, 40), e);
                 #[cfg(unix)]
-                if ui.button("Установить и запустить службу (pkexec)").clicked() {
-                    if let Ok(me) = std::env::current_exe() {
+                if ui.button("Установить и запустить службу (pkexec)").clicked()
+                    && let Ok(me) = std::env::current_exe() {
                         let _ = std::process::Command::new("pkexec").arg(me).arg("install").spawn();
                     }
-                }
                 #[cfg(windows)]
                 if ui.button("Установить и запустить службу (нужны права администратора)").clicked() {
                     crate::install::install_elevated_detached();
@@ -681,14 +672,13 @@ impl eframe::App for App {
                 self.peer_detail = None;
             }
         }
-        if let Some((t, at)) = toast {
-            if at.elapsed() < Duration::from_secs(3) {
+        if let Some((t, at)) = toast
+            && at.elapsed() < Duration::from_secs(3) {
                 egui::Area::new(egui::Id::new("toast")).anchor(egui::Align2::CENTER_BOTTOM, [0.0, -60.0]).show(ctx, |ui| {
                     egui::Frame::popup(ui.style()).show(ui, |ui| ui.label(t));
                 });
                 ctx.request_repaint_after(Duration::from_millis(500));
             }
-        }
     }
 }
 
