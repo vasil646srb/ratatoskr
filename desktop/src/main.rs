@@ -1,6 +1,8 @@
 //! yggproxy for Linux and Windows: one binary for the service (`daemon`), the console commands
 //! and the GUI.
 
+#[path = "../../ygghelper/src/access.rs"]
+mod access;
 mod api;
 mod cli;
 mod config;
@@ -16,6 +18,7 @@ mod platform;
 mod peerstats;
 mod tracker;
 mod tracker_client;
+mod update;
 mod ygg_net;
 
 fn main() {
@@ -33,6 +36,7 @@ fn main() {
         #[cfg(windows)]
         "tracker-service" => install::run_service("tracker"),
         "gui" => gui(),
+        "update" => update::run(),
         "version" | "--version" => {
             println!("yggproxy {}", env!("CARGO_PKG_VERSION"));
             Ok(())

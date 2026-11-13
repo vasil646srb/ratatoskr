@@ -81,7 +81,34 @@ class YggService : VpnService() {
         State.serviceRunning = true
         instance = this
         journalTimer.scheduleWithFixedDelay({ journalTick() }, 10, 10, java.util.concurrent.TimeUnit.SECONDS)
+        accessTimer.scheduleWithFixedDelay({ accessTick() }, 3, 3, java.util.concurrent.TimeUnit.SECONDS)
     }
+
+    // ------------------------------------------------------------------ access to the server
+
+    private val accessTimer = Executors.newSingleThreadScheduledExecutor()
+    private var accessLast: Triple<String, String, Long>? = null
+
+    /**
+     * Client: access to the selected server — every 20 s until granted, then every 5 min. With
+     * the VPN on, a server without our key gets a request (the user chose to connect to it).
+     */
+    private fun accessTick() { try {
+        val server = Ygg.serverFromText(prefs.server)
+        if (!prefs.vpnEnabled || server == null || !State.nodeRunning) { accessLast = null; return }
+        val key = prefs.keyFor(server) ?: ""
+        val sig = "$server $key"
+        val last = accessLast
+        val now = System.currentTimeMillis()
+        if (last != null && last.first == sig && now - last.third < if (last.second == "ok") 300_000 else 20_000) return
+        val code = Ygg.probeAccess(server, key, ask = true)
+        if (last == null || last.first != sig || last.second != code) {
+            val text = Ygg.accessText(code)
+            if (code == "ok") State.log("access", "$server: $text") else State.error("access", "$server: $text")
+        }
+        State.access = server to code
+        accessLast = Triple(sig, code, now)
+    } catch (_: Exception) {} }
 
     // ------------------------------------------------------------------ peer journal
 
@@ -171,6 +198,7 @@ class YggService : VpnService() {
         stopAll("сервис завершён (onDestroy)")
         exec.shutdownNow()
         journalTimer.shutdownNow()
+        accessTimer.shutdownNow()
         try { synchronized(journal) { journal.save() } } catch (_: Exception) {}
         State.serviceRunning = false
         instance = null
@@ -250,6 +278,8 @@ class YggService : VpnService() {
                 add("--speedtest"); add("127.0.0.1:${Ygg.SPEEDTEST}")
                 add("--proxy-protocol")
                 add("--limits"); add(limitsFile.path)
+                // Closed by default: only devices with a key (or everyone, when made public).
+                add("--access"); add(File(filesDir, "access.json").path)
                 if (prefs.allowLan) add("--allow-lan")
                 add("-v"); add("warn")
             }
@@ -345,6 +375,8 @@ class YggService : VpnService() {
         when {
             l.startsWith("STAT ") -> State.parseStat(l)
             l.startsWith("ERROR ") -> State.error(tag, l.removePrefix("ERROR "))
+            l.startsWith("ACCESS bind ") -> l.split(' ').let { State.log("access", "ключ ${it.getOrNull(2)} привязан к устройству ${it.getOrNull(3)}") }
+            l.startsWith("ACCESS request ") -> State.log("access", "запрос доступа от ${l.substringAfterLast(' ')} — см. «Сервер»")
             else -> State.log(tag, l)
         }
         extra(l)

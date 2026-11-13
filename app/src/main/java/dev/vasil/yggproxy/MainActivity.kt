@@ -55,6 +55,7 @@ class MainActivity : Activity() {
 
     // Client
     private lateinit var etServer: EditText
+    private lateinit var etKey: EditText
     private lateinit var cbUdp: CheckBox
     private lateinit var cbIpv6: CheckBox
     private lateinit var btnVpn: Button
@@ -79,6 +80,16 @@ class MainActivity : Activity() {
     private lateinit var ivQr: ImageView
     private lateinit var qrBox: LinearLayout
     private var qrText: String? = null
+    // Server: access keys and requests (access.json through libygghelper.so access …).
+    private lateinit var accessBox: LinearLayout
+    private lateinit var tvAccess: TextView
+    private lateinit var etKeyName: EditText
+    private lateinit var etKeyDays: EditText
+    @Volatile private var lastAccess: JSONObject? = null
+    private var accessSig: String? = null
+    /** The key whose QR code is shown ("" = the newest unused one). */
+    private var qrKeyId: String? = null
+    private var accessCounter = 0
 
     // Network
     private lateinit var cbPublic: CheckBox
@@ -187,6 +198,7 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
+        Updates.check(this, prefs)
         // The node runs while the app is on screen (pings the servers and the root); this also
         // brings back a service that was killed or stopped by an app update.
         State.uiShown()
@@ -235,13 +247,15 @@ class MainActivity : Activity() {
         addView(h1("Клиент"))
         addView(bigButton("Сканировать QR сервера") { scanQr() })
         etServer = edit("адрес сервера 200:…", "")
+        addView(etServer)
+        etKey = edit("ключ доступа (от владельца сервера)", "")
         addView(LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-            addView(etServer, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(etKey, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
             addView(smallButton("Добавить") { addServerFromInput() })
         })
         addView(h2("Серверы"))
-        addView(note("Нажмите на сервер — подключиться к нему, долгое нажатие — меню. Пинг меряет узел Yggdrasil каждые 10 с."))
+        addView(note("Серверы закрыты: нужен ключ от владельца (QR, ссылка или адрес + ключ). Без ключа при подключении владельцу уйдёт запрос доступа. 🔑 — ключ есть, 🌐 — публичный. Нажмите на сервер — подключиться, долгое нажатие — меню."))
         serversBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
         tvRoot = mono("Корень сети: …").also { addView(it) }
         btnVpn = bigButton("") { toggleVpn() }.also { addView(it) }
@@ -251,17 +265,28 @@ class MainActivity : Activity() {
 
     private fun buildServer(): LinearLayout = page().apply {
         addView(h1("Сервер выхода"))
-        addView(note("Телефон раздаёт свой интернет любому узлу Yggdrasil, который знает адрес, без ключей. Локальные сети и loopback закрыты."))
+        addView(note("Телефон раздаёт свой интернет через Yggdrasil. Сервер закрыт: пользоваться им могут только устройства с ключом — у каждого устройства свой. Локальные сети и loopback закрыты."))
         tvIdentity = mono("").also { addView(it) }
+        addView(row(smallButton("Копировать адрес") { copy(State.address) }))
+        addView(h2("Доступ"))
+        tvAccess = mono("…").also { addView(it) }
+        addView(label("Новый ключ: для кого и на сколько дней (1–365)"))
+        etKeyName = edit("чьё устройство", "")
+        etKeyDays = edit("30", "30", number = true)
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(etKeyName, LinearLayout.LayoutParams(0, WRAP_CONTENT, 2f))
+            addView(etKeyDays, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(smallButton("Создать") { newKey() })
+        })
         qrBox = LinearLayout(this@MainActivity).apply {
             orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL; visibility = View.GONE
             ivQr = ImageView(this@MainActivity).apply { setBackgroundColor(Color.WHITE) }
             addView(ivQr, LinearLayout.LayoutParams(dp(240), dp(240)).apply { topMargin = dp(8) })
-            addView(note("Клиент: «Клиент» → «Сканировать QR сервера». Можно и обычной камерой телефона.").apply { gravity = Gravity.CENTER })
+            addView(note("На устройстве: Ratatoskr → «Сканировать QR». Ключ подходит одному устройству.").apply { gravity = Gravity.CENTER })
         }
         addView(qrBox)
-        addView(row(smallButton("Копировать адрес") { copy(State.address) },
-            smallButton("Поделиться") { shareAddress() }))
+        accessBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
         addView(h2("Ограничение скорости, Мбит/с (0 — без ограничения)"))
         addView(label("Весь сервер: приём клиентами ↓ и отдача ↑"))
         etLimTotalDown = edit("0", mbitText(prefs.limTotalDown), decimal = true)
@@ -318,6 +343,7 @@ class MainActivity : Activity() {
             startActivity(Intent(this@MainActivity, SimpleActivity::class.java))
             finish()
         })
+        addView(smallButton("Проверить обновления (версия ${Updates.current(this@MainActivity)})") { Updates.check(this@MainActivity, prefs, manual = true) })
         addView(h1("VPN-клиент"))
         cbUdp = check("UDP через udpgw (QUIC, игры, звонки)", prefs.udp).also { addView(it) }
         cbIpv6 = check("IPv6-сайты через сервер", prefs.ipv6).also { addView(it) }
@@ -451,7 +477,10 @@ class MainActivity : Activity() {
         if (requestCode == REQ_SCAN && resultCode == RESULT_OK) {
             val text = data?.getStringExtra(ScanActivity.EXTRA_TEXT) ?: return
             val server = Ygg.serverFromText(text)
-            if (server == null) toast("Это не адрес сервера Ratatoskr") else connectTo(server)
+            if (server == null) toast("Это не адрес сервера Ratatoskr") else {
+                Ygg.keyFromText(text)?.let { prefs.setKey(server, it) }
+                connectTo(server)
+            }
         }
         if (requestCode == REQ_EXPORT && resultCode == RESULT_OK) {
             val uri = data?.data ?: return
@@ -509,11 +538,12 @@ class MainActivity : Activity() {
         i.data = null // handle once (not again on recreate)
         val server = Ygg.serverFromText(data.toString())
         if (server == null) { toast("Неверная ссылка Ratatoskr"); return }
+        val key = Ygg.keyFromText(data.toString())
         select(0)
         AlertDialog.Builder(this)
             .setTitle("Подключиться к серверу?")
-            .setMessage("Весь трафик пойдёт через сервер выхода\n$server")
-            .setPositiveButton("Подключить") { _, _ -> connectTo(server) }
+            .setMessage("Весь трафик пойдёт через сервер выхода\n$server" + if (key != null) "\n(с ключом доступа)" else "")
+            .setPositiveButton("Подключить") { _, _ -> key?.let { prefs.setKey(server, it) }; connectTo(server) }
             .setNegativeButton("Отмена", null)
             .show()
     }
@@ -526,6 +556,9 @@ class MainActivity : Activity() {
     private fun addServerFromInput() {
         val s = Ygg.serverFromText(etServer.text.toString())
         if (s == null) { toast("Адрес сервера: IPv6 из 200::/7, например 200:…"); return }
+        val key = Ygg.keyFromText(etServer.text.toString()) ?: Ygg.normKey(etKey.text.toString()).takeIf { it.isNotEmpty() }
+        if (key != null) prefs.setKey(s, key)
+        etKey.setText("")
         prefs.addServer(s)
         if (Ygg.parseServer(prefs.server) == null) prefs.server = s
         writeMonitors()
@@ -550,10 +583,11 @@ class MainActivity : Activity() {
             val exits = LinkedHashMap<String, Long>()
             val newTrackers = mutableListOf<String>()
             val ok = mutableListOf<String>()
+            val public = HashSet<String>()
             for (t in prefs.trackerList()) {
                 val e = Ygg.fetchTracker(t, "/exits") ?: continue
                 ok += t
-                Ygg.parseExits(e, exits)
+                Ygg.parseExits(e, exits, public)
                 Ygg.fetchTracker(t, "/trackers")?.optJSONArray("trackers")?.let { a ->
                     for (k in 0 until a.length()) Ygg.serverFromText(a.getJSONObject(k).optString("address"))?.let { newTrackers += it }
                 }
@@ -575,7 +609,7 @@ class MainActivity : Activity() {
             val known = prefs.trackerList()
             val add = newTrackers.distinct().filter { it !in known }
             if (add.isNotEmpty()) prefs.trackers = (known + add).joinToString("\n")
-            if (ok.isNotEmpty()) State.trackerExits = exits.map { it.key to it.value }.take(50)
+            if (ok.isNotEmpty()) { State.trackerExits = exits.map { it.key to it.value }.take(50); State.trackerPublic = public }
             val time = java.text.SimpleDateFormat("HH:mm", java.util.Locale.US).format(java.util.Date())
             State.trackerStatus = if (ok.isEmpty()) "$time: трекеры недоступны"
                 else "$time: серверов ${exits.size} от ${ok.size} трекер(ов)$peersNote" + if (add.isNotEmpty()) ", новых трекеров ${add.size}" else ""
@@ -591,12 +625,21 @@ class MainActivity : Activity() {
     }
 
     private fun serverMenu(addr: String) {
-        val items = arrayOf("Подключиться", "Копировать адрес", "Удалить из списка")
+        val items = arrayOf("Подключиться", "Копировать адрес", "Ключ доступа…", "Удалить из списка")
         AlertDialog.Builder(this).setTitle(addr).setItems(items) { _, w ->
             when (w) {
                 0 -> connectTo(addr)
                 1 -> copy(addr)
                 2 -> {
+                    val e = edit("ключ от владельца сервера", prefs.keyFor(addr) ?: "")
+                    AlertDialog.Builder(this).setTitle("Ключ доступа").setView(e)
+                        .setPositiveButton("Сохранить") { _, _ ->
+                            prefs.setKey(addr, Ygg.normKey(e.text.toString()))
+                            serversSig = null; refreshNow(); toast("Ключ сохранён")
+                        }
+                        .setNegativeButton("Отмена", null).show()
+                }
+                3 -> {
                     if (prefs.vpnEnabled && prefs.server == addr) { toast("Сначала отключите VPN от этого сервера"); return@setItems }
                     prefs.removeServer(addr)
                     if (prefs.server == addr) prefs.server = prefs.serverList().firstOrNull() ?: ""
@@ -612,7 +655,7 @@ class MainActivity : Activity() {
         val byAddr = Ygg.rttByAddr(rtt)
         val list = prefs.serverList()
         val fromTrackers = State.trackerExits.filter { it.first !in list }
-        val sig = list.joinToString() + "|" + fromTrackers.joinToString { it.first } + "|" + prefs.server + "|" + prefs.vpnEnabled + State.vpnActive + "|" +
+        val sig = list.joinToString() + "|" + fromTrackers.joinToString { it.first } + "|" + prefs.serverKeys + State.trackerPublic + "|" + prefs.server + "|" + prefs.vpnEnabled + State.vpnActive + "|" +
             list.joinToString { byAddr[it]?.let { o -> o.opt("rtt_ms").toString() + o.opt("avg_ms") } ?: "-" }
         if (sig != serversSig) {
             serversSig = sig
@@ -627,7 +670,8 @@ class MainActivity : Activity() {
                 }
                 val sel = a == prefs.server
                 val mark = when { sel && prefs.vpnEnabled && State.vpnActive -> "● подключено"; sel && prefs.vpnEnabled -> "◐ подключается"; sel -> "○ выбран"; else -> "" }
-                serversBox.addView(mono("$a\n    пинг: $ping  $mark").apply {
+                val kind = if (prefs.keyFor(a) != null) "🔑 " else if (a in State.trackerPublic) "🌐 " else ""
+                serversBox.addView(mono("$kind$a\n    пинг: $ping  $mark").apply {
                     setTextIsSelectable(false)
                     if (sel) setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
                     setBackgroundResource(android.R.drawable.list_selector_background)
@@ -645,7 +689,8 @@ class MainActivity : Activity() {
                         trackerRtt >= 0 -> "нет ответа (у трекера $trackerRtt мс)"
                         else -> "нет ответа"
                     }
-                    serversBox.addView(mono("$a\n    пинг: $ping").apply {
+                    val kind = if (a in State.trackerPublic) "🌐 " else "🔒 "
+                    serversBox.addView(mono("$kind$a\n    пинг: $ping").apply {
                         setTextIsSelectable(false)
                         setTextColor(Color.DKGRAY)
                         setBackgroundResource(android.R.drawable.list_selector_background)
@@ -701,10 +746,118 @@ class MainActivity : Activity() {
         try { startActivityForResult(i, REQ_EXPORT) } catch (e: Exception) { toast("Нет приложения для сохранения файлов") }
     }
 
-    private fun shareAddress() {
-        val addr = State.address ?: run { toast("Пока нет данных"); return }
-        val text = "Сервер Ratatoskr: $addr\n${Ygg.connectLink(addr)}"
-        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Адрес сервера"))
+    private fun shareKey(k: JSONObject) {
+        val addr = State.address ?: run { toast("Адрес появится после запуска узла"); return }
+        val text = "Сервер Ratatoskr (ключ для одного устройства, ${k.optInt("days")} дн.)\n" +
+            "${Ygg.connectLink(addr, k.optString("key"))}\nАдрес: $addr\nКлюч: ${k.optString("key")}"
+        startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Ключ доступа"))
+    }
+
+    // --------------------------------------------------------------------------- access (server)
+
+    /** Run `access …` off the UI thread, then show the new state ([msg] when it worked). */
+    private fun accessOp(msg: String, vararg args: String) {
+        bg.execute {
+            val r = Ygg.accessCmd(this, *args)
+            ui.post {
+                r.onSuccess { lastAccess = it; accessSig = null; renderAccess(); toast(msg) }
+                    .onFailure { toast("Ошибка: ${it.message}") }
+            }
+        }
+    }
+
+    private fun newKey() {
+        val days = etKeyDays.text.toString().toIntOrNull()?.takeIf { it in 1..365 } ?: run { toast("Срок: от 1 до 365 дней"); return }
+        qrKeyId = ""
+        accessOp("Ключ создан — покажите QR-код устройству", "new", etKeyName.text.toString().trim(), days.toString())
+        etKeyName.setText("")
+    }
+
+    private fun keyList(): List<JSONObject> = lastAccess?.optJSONArray("keys")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } } ?: emptyList()
+
+    /** The key shown as a QR code: the chosen one, or the newest unused after «Создать». */
+    private fun qrKey(): JSONObject? {
+        val id = qrKeyId ?: return null
+        val keys = keyList()
+        return if (id.isEmpty()) keys.filter { it.isNull("addr") }.maxByOrNull { it.optLong("created") }
+        else keys.firstOrNull { it.optString("id") == id }
+    }
+
+    private fun keyMenu(k: JSONObject) {
+        val id = k.optString("id")
+        val bound = !k.isNull("addr")
+        val items = mutableListOf<Pair<String, () -> Unit>>()
+        if (!bound) items += "Показать QR-код" to { qrKeyId = id; renderButtons() }
+        if (!bound) items += "Поделиться ссылкой" to { shareKey(k) }
+        items += "Продлить на ${k.optInt("days")} дн. от сегодня" to { accessOp("Ключ продлён", "renew", id) }
+        if (bound) items += "Отвязать от устройства" to { accessOp("Ключ отвязан: им сможет войти новое устройство", "unbind", id) }
+        items += "Удалить (доступ сразу закрыт)" to { accessOp("Ключ удалён", "revoke", id) }
+        AlertDialog.Builder(this).setTitle("Ключ ${k.optString("name").ifEmpty { id }}")
+            .setItems(items.map { it.first }.toTypedArray()) { _, w -> items[w].second() }.show()
+    }
+
+    private fun requestMenu(r: JSONObject) {
+        val addr = r.optString("addr")
+        val days = etKeyDays.text.toString().toIntOrNull()?.takeIf { it in 1..365 } ?: 30
+        AlertDialog.Builder(this).setTitle("Запрос доступа")
+            .setMessage("${r.optString("name")}\n$addr\nпопыток: ${r.optInt("count")}")
+            .setPositiveButton("Одобрить на $days дн.") { _, _ -> accessOp("Доступ одобрен", "approve", addr, days.toString()) }
+            .setNegativeButton("Отклонить") { _, _ -> accessOp("Запрос отклонён", "deny", addr) }
+            .setNeutralButton("Отмена", null).show()
+    }
+
+    private fun publicDialog() {
+        val cb = check("Я понимаю последствия и принимаю риск", false)
+        val box = page().apply { addView(note(Ygg.PUBLIC_RISK)); addView(cb) }
+        val d = AlertDialog.Builder(this).setTitle("Сделать сервер публичным?").setView(scrollPage(box))
+            .setPositiveButton("Сделать публичным") { _, _ -> accessOp("Сервер стал публичным", "public", "on", "--accept-risk") }
+            .setNegativeButton("Отмена", null).show()
+        val ok = d.getButton(AlertDialog.BUTTON_POSITIVE)
+        ok.isEnabled = false
+        cb.setOnCheckedChangeListener { _, v -> ok.isEnabled = v }
+    }
+
+    private fun renderAccess() {
+        val a = lastAccess ?: return
+        val now = System.currentTimeMillis() / 1000
+        val sig = a.toString() + (now / 60)
+        if (sig == accessSig) return
+        accessSig = sig
+        renderButtons()
+        val public = a.optBoolean("public")
+        tvAccess.text = if (public) "ПУБЛИЧНЫЙ: пользоваться может любой, кто найдёт сервер." else "Закрыт — только по ключам."
+        tvAccess.setTextColor(if (public) Color.parseColor("#B04010") else Color.BLACK)
+        accessBox.removeAllViews()
+        accessBox.addView(if (public) smallButton("Закрыть сервер (только по ключам)") { accessOp("Сервер закрыт", "public", "off") }
+            else smallButton("Сделать публичным…") { publicDialog() })
+        val keys = keyList()
+        accessBox.addView(h2("Ключи (${keys.size})"))
+        if (keys.isEmpty()) accessBox.addView(note("Ключей пока нет."))
+        for (k in keys) {
+            val exp = k.optLong("expires")
+            val left = if (exp > now) "ещё ${Ygg.dur(exp - now)}" else "ИСТЁК"
+            val dev = if (k.isNull("addr")) "ещё не использован" else "${k.optString("device")} ${k.optString("addr")}"
+            accessBox.addView(mono("${k.optString("name").ifEmpty { k.optString("id") }} · ${k.optInt("days")} дн., $left\n    $dev").apply {
+                setTextIsSelectable(false)
+                if (exp <= now) setTextColor(Color.GRAY)
+                setBackgroundResource(android.R.drawable.list_selector_background)
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+                setOnClickListener { keyMenu(k) }
+            })
+        }
+        val reqs = a.optJSONArray("requests")
+        if (reqs != null && reqs.length() > 0) {
+            accessBox.addView(h2("Запросы доступа (${reqs.length()})"))
+            for (i in 0 until reqs.length()) {
+                val r = reqs.getJSONObject(i)
+                accessBox.addView(mono("${r.optString("name")}\n    ${r.optString("addr")} · ${Ygg.dur(now - r.optLong("last"))} назад").apply {
+                    setTextIsSelectable(false)
+                    setBackgroundResource(android.R.drawable.list_selector_background)
+                    setPadding(dp(4), dp(8), dp(4), dp(8))
+                    setOnClickListener { requestMenu(r) }
+                })
+            }
+        }
     }
 
     private fun kbit(e: EditText) = ((e.text.toString().replace(',', '.').toDoubleOrNull() ?: 0.0) * 1000).toInt().coerceAtLeast(0)
@@ -760,6 +913,7 @@ class MainActivity : Activity() {
         if (!::tvStatus.isInitialized) return
         renderButtons()
         refreshTrackers()
+        if (current == 1 && accessCounter++ % 3 == 0) bg.execute { Ygg.accessCmd(this, "list").onSuccess { lastAccess = it; ui.post { renderAccess() } } }
         if (current <= 2) {
             // Exit probe every ~6 s on its own thread: it may wait on the network.
             if (current == 2 && prefs.vpnEnabled && (probeCounter++ % 6 == 0)) {
@@ -796,16 +950,16 @@ class MainActivity : Activity() {
             !prefs.vpnEnabled -> "VPN выключен"
             State.vpnActive -> "VPN работает → ${State.vpnTarget}\n↓ ${Ygg.human(State.tunRx)}  ↑ ${Ygg.human(State.tunTx)}"
             else -> "VPN запускается…" + (State.lastError?.let { "\n$it" } ?: "")
-        }
+        } + if (prefs.vpnEnabled) "\nдоступ: " + Ygg.accessText(State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }?.second) else ""
         val addr = State.address
-        val link = addr?.let { Ygg.connectLink(it) }
+        val link = addr?.let { a -> qrKey()?.let { Ygg.connectLink(a, it.optString("key")) } }
         if (link != qrText) {
             qrText = link
             ivQr.setImageBitmap(link?.let { Qr.bitmap(it, dp(240)) })
             qrBox.visibility = if (link == null) View.GONE else View.VISIBLE
         }
         tvIdentity.text = if (addr == null) "Адрес появится после запуска узла."
-        else "Адрес для клиентов: $addr" +
+        else "Адрес сервера: $addr" +
             if (prefs.serverEnabled) "\n${if (State.exitActive) "Работает" else "Запускается…"} · соединений ${State.srvConns} (всего ${State.srvTotal}, отказов ${State.srvDenied})\n" +
                 "отдано ${Ygg.human(State.srvTx)} · принято ${Ygg.human(State.srvRx)}" else ""
     }

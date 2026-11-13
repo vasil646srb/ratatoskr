@@ -95,13 +95,15 @@ pub struct Client {
     pub server: String,
     /// Saved exits (addresses), pinged for the server list.
     pub servers: Vec<String>,
+    /// Access keys of closed servers: address → key.
+    pub keys: std::collections::BTreeMap<String, String>,
     pub udp: bool,
     pub ipv6: bool,
 }
 
 impl Default for Client {
     fn default() -> Self {
-        Self { enabled: false, server: String::new(), servers: Vec::new(), udp: true, ipv6: true }
+        Self { enabled: false, server: String::new(), servers: Vec::new(), keys: Default::default(), udp: true, ipv6: true }
     }
 }
 
@@ -188,6 +190,28 @@ pub fn connect_link(addr: &str) -> String {
     format!("yggproxy://c?a={addr}")
 }
 
+/// The access key in a `yggproxy://c?a=…&k=KEY` link, if any.
+pub fn link_key(input: &str) -> Option<String> {
+    let q = input.trim().strip_prefix("yggproxy://")?.split_once('?')?.1;
+    let k = q.split('&').find_map(|kv| kv.strip_prefix("k="))?;
+    let k = crate::access::norm_secret(k);
+    (!k.is_empty()).then_some(k)
+}
+
+/// Where a closed exit keeps its keys and requests.
+pub fn access_path() -> PathBuf {
+    state_dir().join("access.json")
+}
+
+/// This device's name, sent with a key or an access request.
+pub fn device_name() -> String {
+    let h = std::env::var("COMPUTERNAME").ok()
+        .or_else(|| std::fs::read_to_string("/etc/hostname").ok())
+        .unwrap_or_default();
+    let h = crate::access::clean_name(h.trim());
+    if h.is_empty() { "Ratatoskr".into() } else { h }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -205,6 +229,9 @@ mod tests {
         }
         assert_eq!(parse_server("fd00::1"), None);
         assert_eq!(parse_server("garbage"), None);
+        assert_eq!(parse_server("yggproxy://c?a=200:99b:4003:b216:f139:24e7:df8f:5d3a&k=AbCd-123"), Some(a));
+        assert_eq!(link_key("yggproxy://c?a=200::1&k=AbCd-123").as_deref(), Some("abcd123"));
+        assert_eq!(link_key("yggproxy://c?a=200::1"), None);
     }
 
     #[test]

@@ -13,7 +13,16 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
 
 Сервер выхода:
   yggproxy server on|off       включить/выключить раздачу интернета
-  yggproxy qr                  адрес сервера и QR-код для клиента
+  yggproxy qr                  адрес сервера (сервер закрыт: клиенту нужен ключ)
+  yggproxy access              ключи доступа и запросы устройств
+  yggproxy access new ИМЯ ДНЕЙ новый ключ (1–365 дней) — QR-код и ссылка для одного устройства
+  yggproxy access qr ID        снова показать QR-код ключа
+  yggproxy access approve АДРЕС ДНЕЙ [ИМЯ]   одобрить запрос устройства
+  yggproxy access deny АДРЕС   отклонить запрос
+  yggproxy access renew ID ДНЕЙ  продлить ключ
+  yggproxy access unbind ID    отвязать ключ от устройства (для переустановки)
+  yggproxy access revoke ID    удалить ключ (доступ сразу закрыт)
+  yggproxy access public on|off  сделать сервер публичным (после предупреждения) или закрыть
   yggproxy clients             подключённые клиенты и их трафик
   yggproxy limit               показать ограничения скорости
   yggproxy limit total|client DOWN UP
@@ -23,7 +32,8 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
 
 Клиент (VPN):
   yggproxy servers             серверы выхода: сохранённые и от трекеров, с пингом
-  yggproxy connect [АДРЕС]     подключиться к серверу (200:… или yggproxy://c?a=…);
+  yggproxy connect [АДРЕС [КЛЮЧ]]  подключиться к серверу (200:… или ссылка yggproxy://c?a=…&k=…);
+                               без ключа к закрытому серверу уходит запрос владельцу;
                                без адреса — к серверу с наименьшим пингом
   yggproxy forget АДРЕС        убрать сервер из сохранённых
   yggproxy disconnect          отключиться
@@ -44,6 +54,7 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
                                trackers (через запятую), use_trackers, keep_node (узел без
                                клиента и сервера: пинги серверов и трекеры)
   yggproxy refresh-peers       скачать публичный список пиров заново
+  yggproxy update              проверить новую версию на GitHub (с sudo на Linux — установить)
   yggproxy gui                 окно (если собрано с GUI)";
 
 fn print_qr(text: &str) {
@@ -68,6 +79,9 @@ fn status() -> Result<(), String> {
     let s = api::status()?;
     let n = &s["node"];
     println!("yggproxy {} · порт прокси в Yggdrasil: {}", s["version"].as_str().unwrap_or("?"), s["port"]);
+    if let Some(v) = s["update"]["version"].as_str() {
+        println!("Доступна новая версия {v}: yggproxy update");
+    }
     println!("Узел: {}", if n["running"].as_bool() == Some(true) { "работает" } else { "не запущен" });
     if let Some(a) = n["address"].as_str() {
         println!("  адрес: {a}");
@@ -102,6 +116,12 @@ fn status() -> Result<(), String> {
             human(sv["tx"].as_u64().unwrap_or(0)),
             human(sv["rx"].as_u64().unwrap_or(0))
         );
+        let a = &sv["access"];
+        if a["public"].as_bool() == Some(true) {
+            println!("  ПУБЛИЧНЫЙ: пользоваться может любой");
+        } else {
+            println!("  закрытый: ключей {} (действуют {}), запросов {} — yggproxy access", a["keys"], a["active"], a["requests"]);
+        }
         let l = &sv["limits"];
         println!(
             "  ограничения: сервер ↓ {} ↑ {} · клиент ↓ {} ↑ {}",
@@ -123,6 +143,11 @@ fn status() -> Result<(), String> {
             human(c["tx"].as_u64().unwrap_or(0))
         );
         println!("  пинг до сервера: {}", c["server_rtt"].as_str().unwrap_or("измеряю…"));
+        match c["access"].as_str() {
+            Some(code) if code.starts_with("error: ") => println!("  доступ: не проверен ({})", &code[7..]),
+            Some(code) => println!("  доступ: {}", crate::daemon::access_text(code)),
+            None => println!("  доступ: проверяю…"),
+        }
         if let Some(sw) = c["last_swap"].as_str() {
             println!("  замена пира: {sw}");
         }
@@ -237,6 +262,88 @@ fn logs(follow: bool) -> Result<(), String> {
     }
 }
 
+fn access(args: &[String]) -> Result<(), String> {
+    let a = |i: usize| args.get(i).map(|s| s.as_str());
+    let days = |s: Option<&str>| -> Result<u64, String> {
+        s.and_then(|d| d.parse::<u64>().ok()).filter(|d| (1..=365).contains(d)).ok_or_else(|| "срок: от 1 до 365 дней".to_string())
+    };
+    let req = match a(1) {
+        None | Some("list") | Some("qr") => json!({"cmd": "access", "op": "list"}),
+        Some("new") => json!({"cmd": "access", "op": "new", "name": a(2).unwrap_or(""), "days": days(a(3).or(Some("30")))?}),
+        Some("approve") => json!({"cmd": "access", "op": "approve", "addr": a(2).ok_or("АДРЕС")?, "days": days(a(3))?, "name": a(4).unwrap_or("")}),
+        Some("deny") => json!({"cmd": "access", "op": "deny", "addr": a(2).ok_or("АДРЕС")?}),
+        Some("renew") => json!({"cmd": "access", "op": "renew", "id": a(2).ok_or("ID")?, "days": days(a(3))?}),
+        Some("unbind") => json!({"cmd": "access", "op": "unbind", "id": a(2).ok_or("ID")?}),
+        Some("revoke") => json!({"cmd": "access", "op": "revoke", "id": a(2).ok_or("ID")?}),
+        Some("public") => match a(2) {
+            Some("off") => json!({"cmd": "access", "op": "public", "on": false}),
+            Some("on") => {
+                let r: Value = api::request(json!({"cmd": "access", "op": "list"}))?;
+                println!("ВНИМАНИЕ!\n{}\n", r["risk"].as_str().unwrap_or(""));
+                let accepted = args.iter().any(|x| x == "--accept-risk") || {
+                    print!("Напишите «принимаю», чтобы сделать сервер публичным: ");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    let mut l = String::new();
+                    let _ = std::io::stdin().read_line(&mut l);
+                    l.trim().to_lowercase() == "принимаю"
+                };
+                if !accepted {
+                    return Err("отменено: сервер остаётся закрытым".into());
+                }
+                json!({"cmd": "access", "op": "public", "on": true, "accept_risk": true})
+            }
+            _ => return Err("yggproxy access public on|off".into()),
+        },
+        Some(other) => return Err(format!("неизвестная команда access {other}")),
+    };
+    let r = api::request(req)?;
+    let now = r["now"].as_u64().unwrap_or(0);
+    let keys = r["keys"].as_array().cloned().unwrap_or_default();
+    let show_qr = |k: &Value| {
+        if let Some(l) = k["link"].as_str() {
+            print_qr(l);
+            println!("Ссылка: {l}");
+        }
+        println!("Адрес: {}\nКлюч:  {}", r["server"].as_str().unwrap_or("? (узел не запущен)"), k["key"].as_str().unwrap_or(""));
+        println!("Ключ подходит одному устройству и действует {} дн.", k["days"]);
+    };
+    match a(1) {
+        Some("new") => {
+            if let Some(k) = keys.last() {
+                show_qr(k);
+            }
+            return Ok(());
+        }
+        Some("qr") => {
+            let id = a(2).ok_or("yggproxy access qr ID")?;
+            let k = keys.iter().find(|k| k["id"].as_str() == Some(id)).ok_or("нет такого ключа")?;
+            show_qr(k);
+            return Ok(());
+        }
+        _ => {}
+    }
+    println!("Сервер: {}", if r["public"].as_bool() == Some(true) { "ПУБЛИЧНЫЙ — пользоваться может любой" } else { "закрытый — только по ключам" });
+    println!("Ключи ({}):", keys.len());
+    for k in &keys {
+        let exp = k["expires"].as_u64().unwrap_or(0);
+        let left = if exp > now { format!("ещё {}", dur(exp - now)) } else { "ИСТЁК".into() };
+        let dev = match k["addr"].as_str() {
+            Some(ad) => format!("{} {ad}", k["device"].as_str().unwrap_or("")),
+            None => "не использован".into(),
+        };
+        println!("  {}  {:<16} {:<12} {}", k["id"].as_str().unwrap_or(""), k["name"].as_str().unwrap_or(""), left, dev);
+    }
+    let reqs = r["requests"].as_array().cloned().unwrap_or_default();
+    if !reqs.is_empty() {
+        println!("Запросы доступа ({}) — yggproxy access approve АДРЕС ДНЕЙ:", reqs.len());
+        for q in reqs {
+            println!("  {}  {}  {} назад, попыток {}", q["addr"].as_str().unwrap_or(""), q["name"].as_str().unwrap_or(""),
+                dur(now.saturating_sub(q["last"].as_u64().unwrap_or(0))), q["count"]);
+        }
+    }
+    Ok(())
+}
+
 fn mbit_arg(s: &str) -> Result<u64, String> {
     let v: f64 = s.replace(',', ".").parse().map_err(|_| format!("не число: {s}"))?;
     if v < 0.0 {
@@ -321,6 +428,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             }
             print_qr(&config::connect_link(addr));
             println!("Адрес сервера: {addr}\nСсылка: {}", config::connect_link(addr));
+            println!("Сервер закрыт: по этой ссылке клиент только отправит запрос доступа.\nКлюч для устройства: yggproxy access new ИМЯ ДНЕЙ");
             Ok(())
         }
         "limit" => match (a(1).map(|s| s.as_str()), a(2), a(3)) {
@@ -348,7 +456,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!("{addr} убран из сохранённых");
             Ok(())
         }
+        "access" => access(args),
         "connect" => {
+            let key = a(2).map(|k| crate::access::norm_secret(k)).or_else(|| a(1).and_then(|l| config::link_key(l)));
             let addr = match a(1) {
                 Some(s) => config::parse_server(s).ok_or("нужен адрес сервера 200:… или ссылка yggproxy://c?a=…")?,
                 None => {
@@ -366,6 +476,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 c.client.server = addr.to_string();
                 if !c.client.servers.iter().any(|x| config::parse_server(x) == Some(addr)) {
                     c.client.servers.push(addr.to_string());
+                }
+                if let Some(k) = key.clone().filter(|k| !k.is_empty()) {
+                    c.client.keys.insert(addr.to_string(), k);
                 }
             })?;
             println!("подключаюсь к {addr} (порт {}) — состояние: yggproxy status", config::PORT);

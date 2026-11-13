@@ -12,6 +12,10 @@ class Prefs(ctx: Context) {
     private fun i(k: String, d: Int) = p.getInt(k, d)
     private fun put(f: SharedPreferences.Editor.() -> Unit) = p.edit().apply(f).apply()
 
+    /** Update check (GitHub releases): when it last ran, and a version the user chose to skip. */
+    var updateCheckedAt: Long get() = p.getLong("update_at", 0); set(v) = put { putLong("update_at", v) }
+    var updateSkipped: String get() = s("update_skip", ""); set(v) = put { putString("update_skip", v) }
+
     // Client
     var vpnEnabled: Boolean get() = b("vpn", false); set(v) = put { putBoolean("vpn", v) }
     /** Server: Yggdrasil address (or 64-hex public key) of the exit node. */
@@ -36,6 +40,15 @@ class Prefs(ctx: Context) {
     /** The node's ping list: servers, the trackers' exits and the trackers (pings keep their routes warm). */
     fun monitorList(): List<String> =
         (serverList() + State.trackerExits.map { it.first } + (if (useTrackers) trackerList() else emptyList())).distinct()
+
+    /** Access keys of closed servers, one `address key` per line. */
+    var serverKeys: String get() = s("server_keys", ""); set(v) = put { putString("server_keys", v) }
+    fun keyFor(addr: String): String? =
+        serverKeys.lines().map { it.trim().split(' ') }.firstOrNull { it.size == 2 && it[0] == addr }?.get(1)
+    fun setKey(addr: String, key: String?) {
+        val rest = serverKeys.lines().filter { it.isNotBlank() && it.trim().split(' ')[0] != addr }
+        serverKeys = (rest + listOfNotNull(key?.takeIf { it.isNotEmpty() }?.let { "$addr $it" })).joinToString("\n")
+    }
 
     fun serverList(): List<String> = servers.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     fun addServer(addr: String) { if (addr !in serverList()) servers = (serverList() + addr).joinToString("\n") }

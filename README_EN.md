@@ -15,7 +15,8 @@ Ratatoskr turns any phone or computer connected to Yggdrasil into an **exit serv
 its internet connection with other nodes of the network. Another device becomes a **client**: all
 of its traffic goes into Yggdrasil and reaches the internet through the exit.
 
-- **A client needs only the server's address.** No keys, no configuration: scan a QR code and connect.
+- **Servers are closed, every device has its own key.** The owner makes a key valid for 1–365 days
+  and shows its QR code: scan it and connect. Without a key a device can ask the owner for access.
 - **Servers find themselves.** Trackers crawl the Yggdrasil network and collect working exit
   servers; the app lists them with the ping to each one.
 - **No root and no separate Yggdrasil install on the phone.** Inside is a lightweight node,
@@ -32,8 +33,10 @@ apps → VPN (TUN) → tun2proxy ─SOCKS5→ tcp_node ══ Yggdrasil ══ t
 | | |
 |---|---|
 | **Client** | all device traffic through the VPN; TCP, UDP (QUIC, calls, games) over udpgw, IPv4 and IPv6 |
-| **Exit server** | open to any Yggdrasil node on port **27080**; the server's LAN, loopback and Yggdrasil itself are closed through the exit |
-| **Quick connect** | QR code or a `yggproxy://c?a=ADDRESS` link (the system camera opens it too) |
+| **Exit server** | port **27080**, closed by default: only devices with a key; can be made public after a warning about the risks. The server's LAN, loopback and Yggdrasil itself are closed through the exit |
+| **Access keys** | a key (1–365 days) binds to the first device that uses it; renew, unbind, delete; access requests from devices without a key — approve or deny |
+| **Quick connect** | QR code or a `yggproxy://c?a=ADDRESS&k=KEY` link (the system camera opens it too), or the address and key typed in |
+| **Updates** | the app and the service check GitHub releases and offer new versions; `sudo yggproxy update` on Linux downloads and installs one |
 | **Server list** | saved servers plus servers from trackers, ping to each and to the network root |
 | **Peer selection** | the client replaces its Yggdrasil peers while the ping to the server is above a threshold |
 | **Speed limits** | for the whole server and per client, download and upload separately; applied live, no reconnects |
@@ -58,10 +61,12 @@ apps → VPN (TUN) → tun2proxy ─SOCKS5→ tcp_node ══ Yggdrasil ══ t
 ### Android
 
 1. Install the APK.
-2. **Server** (a phone with internet): "Сервер" tab → "Запустить сервер". The address and a QR code
-   appear. Allow unrestricted battery use so the exit does not fall asleep.
-3. **Client**: "Клиент" tab → "Сканировать QR сервера" (or type the address, or pick a server from
-   the trackers' list) → "Подключить VPN".
+2. **Server** (a phone with internet): "Сервер" tab → "Запустить сервер". Allow unrestricted battery
+   use so the exit does not fall asleep. Under "Доступ" create a key for a device (name and 1–365
+   days): a QR code appears. Requests from devices without a key are listed there too.
+3. **Client**: simple mode — "Ключ" → "Сканировать QR" → "Подключиться". Expert mode — "Клиент" tab →
+   "Сканировать QR сервера" (or type the address and key). Connecting to a tracker's server without
+   a key sends its owner an access request.
 
 Network, tracker settings and logs are on the "Настройки" tab.
 
@@ -75,10 +80,13 @@ wget -O yggproxy https://github.com/vasil646srb/ratatoskr/releases/latest/downlo
 chmod +x yggproxy
 sudo ./yggproxy install             # systemd service, yggproxy group for control without sudo
 yggproxy server on                  # share the internet connection
-yggproxy qr                         # address and QR code for clients
+yggproxy access new Phone 30        # a 30-day key: QR code and link for one device
+yggproxy access                     # keys and access requests
+yggproxy access approve ADDR 30     # approve a device's request
 yggproxy servers                    # servers from trackers, with ping
-yggproxy connect                    # connect to the server with the lowest ping
+yggproxy connect 'yggproxy://c?a=…&k=…'   # connect with a key link (or: ADDR KEY)
 yggproxy gui                        # window
+sudo yggproxy update                # update to the latest release
 ```
 
 Details: [desktop/README.md](desktop/README.md).
@@ -153,8 +161,9 @@ Tracker schedule (configurable in `/etc/yggproxy/tracker.json`):
 
 ## Security
 
-- An exit server is **open to anyone** who knows its address: people can browse the internet as
-  you. Use speed limits. The server's LAN is closed (unless "Разрешить клиентам доступ в мою LAN"
+- An exit server is **closed**: only devices with your keys reach the internet through it. A key
+  binds to one device; delete or unbind a lost one. A public exit is open to anyone who finds it and
+  people browse the internet as you, so the app warns about the consequences first. Use speed limits. The server's LAN is closed (unless "Разрешить клиентам доступ в мою LAN"
   is checked).
 - Traffic inside Yggdrasil is encrypted by the network; from the exit to a website it is as usual
   (HTTPS stays HTTPS).

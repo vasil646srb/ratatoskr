@@ -75,8 +75,87 @@ object Ygg {
     /** Overlay port of the proxy, the same on every server (not the common SOCKS 1080). */
     const val PORT = 27080
 
-    /** Quick-connect link shown as a QR code: yggproxy://c?a=ADDR (the port is always [PORT]). */
-    fun connectLink(addr: String) = "yggproxy://c?a=$addr"
+    /** Quick-connect link shown as a QR code: yggproxy://c?a=ADDR&k=KEY (the port is always [PORT]). */
+    fun connectLink(addr: String, key: String? = null) = "yggproxy://c?a=$addr" + (key?.let { "&k=$it" } ?: "")
+
+    /** Keys are typed by hand: case, spaces and dashes don't matter. */
+    fun normKey(s: String) = s.filter { it.isLetterOrDigit() && it.code < 128 }.lowercase()
+
+    /** The access key in a `yggproxy://c?a=…&k=KEY` link, if any. */
+    fun keyFromText(text: String): String? {
+        val t = text.trim()
+        if (!t.startsWith("yggproxy:", ignoreCase = true)) return null
+        return android.net.Uri.parse(t).getQueryParameter("k")?.let { normKey(it) }?.takeIf { it.isNotEmpty() }
+    }
+
+    /** This device's name, sent with a key or an access request. */
+    fun deviceName(): String = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim().take(40)
+
+    /**
+     * Access to a closed exit (see ygghelper access.rs), through the node's SOCKS (no VPN needed):
+     * `ok`, `pending` (a request is with the owner), `bad_key`, `expired`, `other_device`,
+     * `closed` (no key and [ask] off: nothing was sent), or `error: …`.
+     */
+    fun probeAccess(server: String, key: String?, ask: Boolean): String = try {
+        val a = (InetAddress.getByName(server) as Inet6Address).address
+        Socket().use { s ->
+            s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
+            s.soTimeout = 40000
+            val o = s.getOutputStream()
+            val i = s.getInputStream()
+            o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
+            o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((PORT shr 8).toByte(), (PORT and 0xff).toByte()))
+            if (readN(i, 22)[1].toInt() != 0) return "error: сервер недоступен"
+            val withKey = !key.isNullOrEmpty() || ask
+            o.write(if (withKey) byteArrayOf(5, 2, 0, 2) else byteArrayOf(5, 1, 0))
+            val m = readN(i, 2)[1].toInt() and 0xff
+            when (m) {
+                0 -> "ok"
+                2 -> {
+                    val u = deviceName().toByteArray().take(255).toByteArray()
+                    val k = (key ?: "").toByteArray()
+                    o.write(byteArrayOf(1, u.size.toByte()) + u + byteArrayOf(k.size.toByte()) + k)
+                    when (readN(i, 2)[1].toInt()) {
+                        0 -> "ok"; 1 -> "pending"; 2 -> "bad_key"; 3 -> "expired"; 4 -> "other_device"
+                        else -> "error: неизвестный ответ"
+                    }
+                }
+                else -> "closed"
+            }
+        }
+    } catch (e: Exception) { "error: ${e.message ?: e.javaClass.simpleName}" }
+
+    fun accessText(code: String?): String = when {
+        code == null -> "проверяю…"
+        code == "ok" -> "доступ есть"
+        code == "pending" -> "нет доступа — запрос отправлен владельцу сервера, ждите одобрения"
+        code == "bad_key" -> "неверный ключ доступа"
+        code == "expired" -> "срок ключа истёк — попросите владельца продлить"
+        code == "other_device" -> "ключ уже привязан к другому устройству"
+        code == "closed" -> "сервер закрыт: нужен ключ от владельца"
+        else -> "не проверен (${code.removePrefix("error: ")})"
+    }
+
+    /**
+     * Keys and requests of our own exit: `libygghelper.so access FILE ARGS…` (one implementation
+     * with the exit itself, which writes the same file). The whole file as JSON, or an error.
+     */
+    fun accessCmd(ctx: android.content.Context, vararg args: String): Result<JSONObject> = try {
+        val p = ProcessBuilder(listOf("${ctx.applicationInfo.nativeLibraryDir}/libygghelper.so", "access", File(ctx.filesDir, "access.json").path) + args)
+            .redirectErrorStream(false).start()
+        val out = p.inputStream.bufferedReader().readText().trim()
+        p.waitFor()
+        val line = out.lines().lastOrNull { it.isNotBlank() } ?: ""
+        if (line.startsWith("ERROR ")) Result.failure(Exception(line.removePrefix("ERROR "))) else Result.success(JSONObject(line))
+    } catch (e: Exception) { Result.failure(e) }
+
+    /** Shown before the owner makes the exit public (same text as the desktop). */
+    const val PUBLIC_RISK = "Публичный сервер может использовать любой, кто найдёт его через трекер.\n" +
+        "• Весь их трафик выходит в интернет с вашего IP-адреса: за нарушения закона, спам, взломы, пиратство и блокировки отвечать придётся вам — жалобы и запросы придут вашему провайдеру.\n" +
+        "• Чужие люди займут ваш канал и могут исчерпать лимит трафика.\n" +
+        "• Сайты и сервисы могут заблокировать ваш IP или показывать капчу.\n" +
+        "• Вы не узнаете, кто именно пользуется сервером.\n" +
+        "Включайте, только если понимаете и принимаете эти последствия."
 
     /** Server from a scanned QR / opened link: the yggproxy:// link, `[addr]:port`, `addr` or a key. */
     fun serverFromText(text: String): String? {
@@ -145,11 +224,14 @@ object Ygg {
     }
 
     /** A tracker's `/exits` reply into [into]: address -> ping the tracker measured (-1 unknown). */
-    fun parseExits(reply: JSONObject, into: MutableMap<String, Long>) {
+    fun parseExits(reply: JSONObject, into: MutableMap<String, Long>, public: MutableSet<String>? = null) {
         val a = reply.optJSONArray("exits") ?: return
         for (k in 0 until a.length()) {
             val o = a.getJSONObject(k)
-            serverFromText(o.optString("address"))?.let { into.putIfAbsent(it, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms")) }
+            serverFromText(o.optString("address"))?.let {
+                into.putIfAbsent(it, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms"))
+                if (o.optBoolean("public")) public?.add(it)
+            }
         }
     }
 

@@ -25,9 +25,18 @@
 //!     Client: creates the Wintun adapter NAME (wintun.dll next to the exe) and runs tun2proxy on
 //!     it. The caller sets routes and DNS. Exits when stdin closes.
 //!
+//!     `--access FILE`: the exit is closed — only addresses with a key in FILE (or every address,
+//!     when it is public) may use it; see `access.rs`. Prints `ACCESS bind ID ADDR` and
+//!     `ACCESS request ADDR` when a key is used or access is asked for.
+//!
+//! `ygghelper access FILE list | new NAME DAYS | approve ADDR DAYS [NAME] | renew ID [DAYS] |
+//!     unbind ID | revoke ID | deny ADDR | public on --accept-risk | public off`
+//!     Manage FILE (the Android app); prints the whole file as JSON (or `ERROR ...`).
+//!
 //! Status lines on stdout, for the app: `STAT tun tx=N rx=N`,
 //! `STAT server active=N total=N denied=N tx=N rx=N`, `READY ...`, `ERROR ...`.
 
+mod access;
 mod limit;
 mod udpgw_server;
 
@@ -57,7 +66,9 @@ fn die(msg: &str) -> ! {
 
 const USAGE: &str = "usage:
   ygghelper server --socks ADDR [--udpgw ADDR] [--speedtest ADDR] [--allow-lan]
-                   [--proxy-protocol] [--limits FILE] [--fwmark N] [-v LEVEL]
+                   [--proxy-protocol] [--limits FILE] [--access FILE] [--fwmark N] [-v LEVEL]
+  ygghelper access FILE list|new NAME DAYS|approve ADDR DAYS [NAME]|renew ID [DAYS]|unbind ID|
+                        revoke ID|deny ADDR|public on --accept-risk|public off
   ygghelper tun --ctl PATH --socks ADDR [--udpgw ADDR] [--mtu N] [--ipv6] [-v LEVEL]";
 
 struct Opts {
@@ -66,6 +77,7 @@ struct Opts {
     speedtest: Option<SocketAddr>,
     proxy_protocol: bool,
     limits: Option<String>,
+    access: Option<String>,
     fwmark: u32,
     ctl: Option<String>,
     name: Option<String>,
@@ -81,7 +93,7 @@ struct Opts {
 }
 
 fn parse(args: &[String]) -> Opts {
-    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
+    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
     let mut it = args.iter();
     let addr = |v: Option<&String>, f: &str| -> SocketAddr {
         v.and_then(|s| s.parse().ok()).unwrap_or_else(|| die(&format!("{f}: want IP:PORT")))
@@ -99,6 +111,7 @@ fn parse(args: &[String]) -> Opts {
                     .unwrap_or_else(|| die("--fwmark: want N or 0xN"))
             }
             "--limits" => o.limits = Some(it.next().cloned().unwrap_or_else(|| die("--limits: want FILE"))),
+            "--access" => o.access = Some(it.next().cloned().unwrap_or_else(|| die("--access: want FILE"))),
             "--ctl" => o.ctl = Some(it.next().cloned().unwrap_or_else(|| die("--ctl: want PATH"))),
             "--dns" => o.dns = it.next().cloned().filter(|d| d == "virtual" || d == "over-tcp").unwrap_or_else(|| die("--dns: virtual or over-tcp")),
             "--dns-addr" => o.dns_addr = it.next().cloned().filter(|a| a.parse::<IpAddr>().is_ok()).unwrap_or_else(|| die("--dns-addr: want IP")),
@@ -120,6 +133,13 @@ fn parse(args: &[String]) -> Opts {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { die(USAGE) };
+    if cmd == "access" {
+        match access_cli(&args[1..]) {
+            Ok(v) => out(&v),
+            Err(e) => die(&e),
+        }
+        return;
+    }
     let o = parse(&args[1..]);
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(o.verbosity.clone()))
         .format_timestamp_secs()
@@ -207,7 +227,12 @@ async fn server_main(o: Opts) -> Result<(), String> {
             }
         });
     }
-    let policy = Arc::new(Policy { allow_lan: o.allow_lan, local_ok: [o.udpgw, o.speedtest].into_iter().flatten().collect(), fwmark: o.fwmark });
+    let gate = o.access.clone().map(|p| {
+        let g = Arc::new(Gate::new(std::path::PathBuf::from(p)));
+        tokio::spawn(g.clone().watch());
+        g
+    });
+    let policy = Arc::new(Policy { allow_lan: o.allow_lan, local_ok: [o.udpgw, o.speedtest].into_iter().flatten().collect(), fwmark: o.fwmark, gate });
     let limit = Arc::new(tokio::sync::Semaphore::new(1024));
     loop {
         let (conn, _) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
@@ -234,6 +259,125 @@ struct Policy {
     local_ok: Vec<SocketAddr>,
     /// SO_MARK for outbound connections (Linux): keeps them out of a VPN on the same host.
     fwmark: u32,
+    /// `--access`: closed exit.
+    gate: Option<Arc<Gate>>,
+}
+
+/// The access file, re-read when it changes; the exit writes it on a bind or a request.
+struct Gate {
+    path: std::path::PathBuf,
+    cur: std::sync::Mutex<(access::Access, Option<std::time::SystemTime>)>,
+}
+
+impl Gate {
+    fn new(path: std::path::PathBuf) -> Gate {
+        let g = Gate { path, cur: Default::default() };
+        g.reload();
+        g
+    }
+
+    fn reload(&self) {
+        let m = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        let mut c = self.cur.lock().unwrap();
+        if m != c.1 || m.is_none() {
+            *c = (access::Access::load(&self.path), m);
+        }
+    }
+
+    async fn watch(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            self.reload();
+        }
+    }
+
+    fn granted(&self, addr: &str) -> bool {
+        self.cur.lock().unwrap().0.granted(addr, access::now())
+    }
+
+    /// Method 2: bind a key or record a request (written to the file).
+    async fn check(self: &Arc<Self>, addr: String, device: String, secret: String) -> access::Auth {
+        let g = self.clone();
+        let r = tokio::task::spawn_blocking(move || {
+            let mut changed = false;
+            let res = access::Access::update(&g.path, |a| {
+                let (r, c) = a.check(&addr, &device, &secret, access::now());
+                changed = c;
+                (r, a.keys.iter().find(|k| k.addr.as_deref() == Some(addr.as_str())).map(|k| k.id.clone()))
+            });
+            match res {
+                Ok((r, id)) => {
+                    if changed {
+                        match r {
+                            access::Auth::Ok => out(&format!("ACCESS bind {} {addr}", id.unwrap_or_default())),
+                            _ => out(&format!("ACCESS request {addr}")),
+                        }
+                        g.reload_now();
+                    }
+                    r
+                }
+                Err(e) => {
+                    log::warn!("access file: {e}");
+                    access::Auth::Pending
+                }
+            }
+        })
+        .await;
+        r.unwrap_or(access::Auth::Pending)
+    }
+
+    fn reload_now(&self) {
+        let m = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+        *self.cur.lock().unwrap() = (access::Access::load(&self.path), m);
+    }
+}
+
+/// `ygghelper access FILE ...` (see the module docs).
+fn access_cli(args: &[String]) -> Result<String, String> {
+    use access::Access;
+    let path = std::path::PathBuf::from(args.first().ok_or(USAGE)?);
+    let a = |i: usize| args.get(i).map(String::as_str);
+    let t = access::now();
+    let days = |s: Option<&str>| -> Result<u32, String> {
+        s.and_then(|d| d.parse::<u32>().ok()).filter(|d| (1..=access::MAX_DAYS).contains(d)).ok_or_else(|| "DAYS: 1..365".to_string())
+    };
+    let addr = |s: Option<&str>| s.and_then(access::norm_addr).ok_or_else(|| "ADDR: a Yggdrasil address".to_string());
+    let r: Result<(), String> = match a(1).unwrap_or("list") {
+        "list" => Ok(()),
+        "new" => {
+            let (name, d) = (a(2).unwrap_or("").to_string(), days(a(3))?);
+            Access::update(&path, |x| { x.create(&name, d, None, t); }).map_err(|e| e.to_string())
+        }
+        "approve" => {
+            let (ad, d, name) = (addr(a(2))?, days(a(3))?, a(4).unwrap_or("").to_string());
+            Access::update(&path, |x| { x.create(&name, d, Some(&ad), t); }).map_err(|e| e.to_string())
+        }
+        "renew" => {
+            let id = a(2).ok_or("ID")?.to_string();
+            let d = match a(3) { Some(_) => Some(days(a(3))?), None => None };
+            Access::update(&path, |x| x.renew(&id, d, t).map(|_| ())).map_err(|e| e.to_string())?.ok_or("no such key".into())
+        }
+        "unbind" => {
+            let id = a(2).ok_or("ID")?.to_string();
+            Access::update(&path, |x| x.unbind(&id).map(|_| ())).map_err(|e| e.to_string())?.ok_or("no such key".into())
+        }
+        "revoke" => {
+            let id = a(2).ok_or("ID")?.to_string();
+            Access::update(&path, |x| x.revoke(&id)).map_err(|e| e.to_string()).map(|_| ())
+        }
+        "deny" => {
+            let ad = addr(a(2))?;
+            Access::update(&path, |x| x.deny(&ad)).map_err(|e| e.to_string()).map(|_| ())
+        }
+        "public" => {
+            let on = match a(2) { Some("on") => true, Some("off") => false, _ => return Err("public on|off".into()) };
+            let accept = args.iter().any(|x| x == "--accept-risk");
+            Access::update(&path, |x| x.set_public(on, accept, t)).map_err(|e| e.to_string())?.map_err(String::from)
+        }
+        other => Err(format!("unknown access command {other}")),
+    };
+    r?;
+    Ok(serde_json::to_string(&Access::load(&path)).unwrap())
 }
 
 /// Outbound TCP connect, with `--fwmark` set before connecting.
@@ -339,14 +483,22 @@ async fn pump(
 
 async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, lim: &limit::Limiter, pp: bool) -> Result<(), String> {
     let _ = c.set_nodelay(true);
+    let mut peer: Option<IpAddr> = None;
     let client = if pp {
         let ip = tokio::time::timeout(Duration::from_secs(10), read_proxy_v1(&mut c))
             .await
             .map_err(|_| "no PROXY line".to_string())?
             .map_err(|e| e.to_string())?;
+        peer = Some(ip);
         Some(lim.client(ip))
     } else {
         None
+    };
+    // Closed exit: the client's address (from the PROXY line) must have access.
+    let addr = peer.map(|ip| ip.to_string()).unwrap_or_default();
+    let open = match &policy.gate {
+        None => true,
+        Some(g) => g.granted(&addr),
     };
     let hs = async {
         // greeting
@@ -357,11 +509,34 @@ async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, l
         }
         let mut m = vec![0u8; h[1] as usize];
         c.read_exact(&mut m).await?;
-        if !m.contains(&0) {
+        if open && m.contains(&0) {
+            c.write_all(&[5, 0]).await?;
+        } else if m.contains(&2) && (open || peer.is_some()) {
+            // RFC 1929: user = device name, password = key (empty: ask the owner).
+            c.write_all(&[5, 2]).await?;
+            let mut v = [0u8; 2];
+            c.read_exact(&mut v).await?;
+            let mut user = vec![0u8; v[1] as usize];
+            c.read_exact(&mut user).await?;
+            let mut l = [0u8; 1];
+            c.read_exact(&mut l).await?;
+            let mut pass = vec![0u8; l[0] as usize];
+            c.read_exact(&mut pass).await?;
+            let res = match (&policy.gate, open) {
+                (Some(g), false) => {
+                    let (u, p) = (String::from_utf8_lossy(&user).to_string(), String::from_utf8_lossy(&pass).to_string());
+                    g.check(addr.clone(), u, p).await
+                }
+                _ => access::Auth::Ok,
+            };
+            c.write_all(&[1, res as u8]).await?;
+            if res != access::Auth::Ok {
+                return Err(std::io::Error::other(format!("access {}", res.name())));
+            }
+        } else {
             c.write_all(&[5, 0xff]).await?;
             return Err(std::io::Error::other("no acceptable auth"));
         }
-        c.write_all(&[5, 0]).await?;
         // request
         let mut r = [0u8; 4];
         c.read_exact(&mut r).await?;

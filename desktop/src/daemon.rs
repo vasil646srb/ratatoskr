@@ -57,8 +57,12 @@ pub struct St {
     /// tcp_node /api/rtt: ping to saved and tracker servers, and to the root.
     node_rtt: Option<Value>,
     /// Exits from the trackers: (address, rtt the tracker measured).
-    tracker_exits: Vec<(String, Option<u64>)>,
+    tracker_exits: Vec<(String, Option<u64>, bool)>,
     tracker_status: Option<String>,
+    /// Client: access to the selected server (server, `ok`/`pending`/… or an error, when).
+    access: Option<(String, String, Instant)>,
+    /// A newer release on GitHub (`{version, url, page, notes}`).
+    update: Option<Value>,
 }
 
 type Shared = Arc<Mutex<St>>;
@@ -297,7 +301,7 @@ fn write_monitors(st: &Shared, dir: &Path, cfg: &Config) {
 /// Ask the trackers for exits and more trackers (and, hourly, checked public peers).
 fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peers: bool) {
     let trackers: Vec<std::net::Ipv6Addr> = crate::tracker_client::with_defaults(&cfg.lock().unwrap().network.trackers).iter().filter_map(|t| config::parse_server(t)).collect();
-    let mut exits: Vec<(String, Option<u64>)> = Vec::new();
+    let mut exits: Vec<(String, Option<u64>, bool)> = Vec::new();
     let mut found: Vec<String> = Vec::new();
     let mut ok = 0;
     let mut peers_note = String::new();
@@ -307,7 +311,7 @@ fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peer
         for e in v["exits"].as_array().into_iter().flatten() {
             if let Some(a) = e["address"].as_str().and_then(config::parse_server).map(|a| a.to_string())
                 && !exits.iter().any(|x| x.0 == a) {
-                    exits.push((a, e["rtt_ms"].as_u64()));
+                    exits.push((a, e["rtt_ms"].as_u64(), e["public"].as_bool() == Some(true)));
                 }
         }
         if let Ok(v) = crate::tracker_client::fetch(*t, "/trackers") {
@@ -625,6 +629,13 @@ fn helper_line(st: &Shared, tag: &str, l: &str) {
             }
     } else if let Some(e) = l.strip_prefix("ERROR ") {
         error(st, tag, e);
+    } else if let Some(a) = l.strip_prefix("ACCESS ") {
+        let f: Vec<&str> = a.split(' ').collect();
+        match f.as_slice() {
+            ["bind", id, addr] => log(st, "access", &format!("ключ {id} привязан к устройству {addr}")),
+            ["request", addr] => log(st, "access", &format!("запрос доступа от {addr} — одобрить: yggproxy access")),
+            _ => log(st, "access", a),
+        }
     } else if l.starts_with("ygghelper: ") {
         // stderr copy of an ERROR line
     } else {
@@ -843,6 +854,9 @@ impl Daemon {
                 "--proxy-protocol".into(),
                 "--limits".into(),
                 limits.display().to_string(),
+                // Closed by default: only devices with a key (or everyone, when made public).
+                "--access".into(),
+                config::access_path().display().to_string(),
                 "-v".into(),
                 "warn".into(),
             ];
@@ -902,6 +916,164 @@ impl Daemon {
 }
 
 // ------------------------------------------------------------------------------------------
+// Access to a closed exit
+
+fn access_summary() -> Value {
+    let a = crate::access::Access::load(&config::access_path());
+    let t = crate::access::now();
+    json!({"public": a.public, "keys": a.keys.len(), "active": a.keys.iter().filter(|k| k.addr.is_some() && k.expires > t).count(),
+           "requests": a.requests.len()})
+}
+
+/// `{"cmd":"access","op":…}`: list (default), new, approve, renew, unbind, revoke, deny, public.
+fn access_cmd(req: &Value, st: &Shared) -> Value {
+    use crate::access::{self, Access};
+    let path = config::access_path();
+    let t = access::now();
+    let s = |k: &str| req[k].as_str().unwrap_or("").to_string();
+    let days = req["days"].as_u64().unwrap_or(30).clamp(1, access::MAX_DAYS as u64) as u32;
+    let addr = access::norm_addr(&s("addr"));
+    let op = req["op"].as_str().unwrap_or("list");
+    let r: Result<(), String> = match op {
+        "list" => Ok(()),
+        "new" => Access::update(&path, |a| { a.create(&s("name"), days, None, t); }).map_err(|e| e.to_string()),
+        "approve" => match &addr {
+            Some(ad) => Access::update(&path, |a| { a.create(&s("name"), days, Some(ad), t); }).map_err(|e| e.to_string()),
+            None => Err("нужен адрес Yggdrasil".into()),
+        },
+        "renew" => Access::update(&path, |a| a.renew(&s("id"), Some(days), t).is_some()).map_err(|e| e.to_string())
+            .and_then(|ok| if ok { Ok(()) } else { Err("нет такого ключа".into()) }),
+        "unbind" => Access::update(&path, |a| a.unbind(&s("id")).is_some()).map_err(|e| e.to_string())
+            .and_then(|ok| if ok { Ok(()) } else { Err("нет такого ключа".into()) }),
+        "revoke" => Access::update(&path, |a| a.revoke(&s("id"))).map(|_| ()).map_err(|e| e.to_string()),
+        "deny" => match &addr {
+            Some(ad) => Access::update(&path, |a| a.deny(ad)).map(|_| ()).map_err(|e| e.to_string()),
+            None => Err("нужен адрес Yggdrasil".into()),
+        },
+        "public" => {
+            let on = req["on"].as_bool().unwrap_or(false);
+            Access::update(&path, |a| a.set_public(on, req["accept_risk"].as_bool().unwrap_or(false), t))
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.map_err(|_| "сначала нужно принять риск публичного сервера".to_string()))
+        }
+        other => Err(format!("неизвестная операция {other:?}")),
+    };
+    if let Err(e) = r {
+        return json!({"error": e});
+    }
+    let msg = match op {
+        "new" => Some("создан новый ключ доступа".to_string()),
+        "approve" => Some(format!("доступ для {} одобрен на {days} дн.", s("addr"))),
+        "renew" => Some(format!("ключ {} продлён на {days} дн.", s("id"))),
+        "unbind" => Some(format!("ключ {} отвязан от устройства", s("id"))),
+        "revoke" => Some(format!("ключ {} удалён", s("id"))),
+        "deny" => Some(format!("запрос {} отклонён", s("addr"))),
+        "public" => Some(if req["on"].as_bool() == Some(true) { "сервер стал ПУБЛИЧНЫМ: риск принят".into() } else { "сервер снова закрыт".into() }),
+        _ => None,
+    };
+    if let Some(m) = msg {
+        log(st, "access", &m);
+    }
+    let a = Access::load(&path);
+    let server = st.lock().unwrap().address.clone();
+    let keys: Vec<Value> = a.keys.iter().map(|k| {
+        let mut v = serde_json::to_value(k).unwrap();
+        if let Some(srv) = &server {
+            v["link"] = json!(access::link(srv, &k.key));
+        }
+        v["active"] = json!(k.expires > t);
+        v
+    }).collect();
+    json!({"public": a.public, "public_accepted": a.public_accepted, "keys": keys, "requests": a.requests,
+           "now": t, "server": server, "risk": access::PUBLIC_RISK_RU})
+}
+
+/// Client: ask the selected server for access through the node (`--socks`): our address with
+/// access → ok; else the key (or, without one, a request to the owner).
+pub fn probe_access(server: &str, key: &str, device: &str) -> Result<crate::access::Auth, String> {
+    let ip: std::net::Ipv6Addr = server.trim().parse().map_err(|_| "неверный адрес сервера")?;
+    let mut s = TcpStream::connect_timeout(&([127, 0, 0, 1], config::NODE_SOCKS).into(), Duration::from_secs(2)).map_err(|e| format!("узел: {e}"))?;
+    s.set_read_timeout(Some(Duration::from_secs(40))).ok();
+    let mut b = [0u8; 22];
+    s.write_all(&[5, 1, 0]).map_err(|e| e.to_string())?;
+    s.read_exact(&mut b[..2]).map_err(|e| e.to_string())?;
+    let p = config::PORT.to_be_bytes();
+    let mut req = vec![5, 1, 0, 4];
+    req.extend_from_slice(&ip.octets());
+    req.extend_from_slice(&p);
+    s.write_all(&req).map_err(|e| e.to_string())?;
+    s.read_exact(&mut b).map_err(|_| "сервер недоступен".to_string())?;
+    if b[1] != 0 {
+        return Err("сервер недоступен".into());
+    }
+    s.write_all(&[5, 2, 0, 2]).map_err(|e| e.to_string())?;
+    s.read_exact(&mut b[..2]).map_err(|_| "сервер не ответил".to_string())?;
+    match b[1] {
+        0 => Ok(crate::access::Auth::Ok),
+        2 => {
+            let (u, k) = (device.as_bytes(), key.as_bytes());
+            let mut m = vec![1, u.len().min(255) as u8];
+            m.extend_from_slice(&u[..u.len().min(255)]);
+            m.push(k.len().min(255) as u8);
+            m.extend_from_slice(&k[..k.len().min(255)]);
+            s.write_all(&m).map_err(|e| e.to_string())?;
+            s.read_exact(&mut b[..2]).map_err(|_| "сервер не ответил".to_string())?;
+            crate::access::Auth::from_code(b[1]).ok_or_else(|| format!("неизвестный ответ {}", b[1]))
+        }
+        _ => Err("сервер не принимает ключи (старая версия?)".into()),
+    }
+}
+
+pub fn access_text(code: &str) -> &'static str {
+    match code {
+        "ok" => "доступ есть",
+        "pending" => "нет доступа — запрос отправлен владельцу сервера, ждите одобрения",
+        "bad_key" => "неверный ключ доступа",
+        "expired" => "срок ключа истёк — попросите владельца продлить",
+        "other_device" => "этот ключ уже привязан к другому устройству",
+        _ => "",
+    }
+}
+
+/// Client: check access to the selected server — every 20 s until it is granted, then every 5 min.
+fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
+    let mut last: Option<(String, String, Instant)> = None;
+    while !platform::stopping() {
+        std::thread::sleep(Duration::from_secs(2));
+        let c = cfg.lock().unwrap().client.clone();
+        let server = c.server.trim().to_string();
+        if !c.enabled || config::parse_server(&server).is_none() || !st.lock().unwrap().node_running {
+            last = None;
+            continue;
+        }
+        let key = c.keys.get(&server).cloned().unwrap_or_default();
+        let sig = format!("{server} {key}");
+        let wait = match &last {
+            Some((s, code, t)) if *s == sig => {
+                if code == "ok" { Duration::from_secs(300) } else { Duration::from_secs(20) }
+                    .saturating_sub(t.elapsed())
+            }
+            _ => Duration::ZERO,
+        };
+        if !wait.is_zero() {
+            continue;
+        }
+        let code = match probe_access(&server, &key, &config::device_name()) {
+            Ok(a) => a.name().to_string(),
+            Err(e) => format!("error: {e}"),
+        };
+        if last.as_ref().map(|l| (&l.0, &l.1)) != Some((&sig, &code)) {
+            let text = access_text(&code);
+            if !text.is_empty() {
+                if code == "ok" { log(&st, "access", &format!("{server}: {text}")) } else { error(&st, "access", &format!("{server}: {text}")) }
+            }
+        }
+        st.lock().unwrap().access = Some((server, code.clone(), Instant::now()));
+        last = Some((sig, code, Instant::now()));
+    }
+}
+
+// ------------------------------------------------------------------------------------------
 // Control socket
 
 enum Msg {
@@ -926,14 +1098,17 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
         "server": {"enabled": cfg.server.enabled, "active": s.exit_active,
                    "link": s.address.as_ref().map(|a| config::connect_link(a)),
                    "active_conns": s.srv[0], "total": s.srv[1], "denied": s.srv[2], "tx": s.srv[3], "rx": s.srv[4],
-                   "clients": clients, "limits": cfg.server.limits},
+                   "clients": clients, "limits": cfg.server.limits,
+                   "access": access_summary()},
         "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "active": s.vpn_active,
                    "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
-                   "servers": cfg.client.servers},
+                   "servers": cfg.client.servers,
+                   "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone())},
         "rtt": s.node_rtt,
         "trackers": {"enabled": cfg.network.use_trackers, "list": cfg.network.trackers, "status": s.tracker_status,
-                     "exits": s.tracker_exits.iter().map(|(a, r)| json!({"address": a, "tracker_rtt_ms": r})).collect::<Vec<_>>()},
+                     "exits": s.tracker_exits.iter().map(|(a, r, p)| json!({"address": a, "tracker_rtt_ms": r, "public": p})).collect::<Vec<_>>()},
         "last_error": s.last_error,
+        "update": s.update,
     })
 }
 
@@ -975,6 +1150,7 @@ fn handle_conn(conn: platform::Stream, st: Shared, cfg: Arc<Mutex<Config>>, tx: 
                 st.lock().unwrap().logs.clear();
                 json!({"ok": true})
             }
+            "access" => access_cmd(&req, &st),
             "refresh_trackers" => {
                 let _ = tx.send(Msg::RefreshTrackers);
                 json!({"ok": true})
@@ -1047,6 +1223,35 @@ pub fn main() -> Result<(), String> {
     {
         let (st, dir, cfg) = (st.clone(), dir.clone(), cfg.clone());
         std::thread::spawn(move || peer_journal(st, dir, cfg));
+    }
+
+    // New versions on GitHub: a minute after the start, then every 12 h.
+    {
+        let st = st.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(60));
+            while !platform::stopping() {
+                if let Ok(u) = crate::update::available() {
+                    if let Some(v) = &u {
+                        let known = st.lock().unwrap().update.as_ref().map(|x| x["version"].clone());
+                        if known.as_ref() != Some(&v["version"]) {
+                            log(&st, "update", &format!("доступна версия {} — yggproxy update", v["version"].as_str().unwrap_or("?")));
+                        }
+                    }
+                    st.lock().unwrap().update = u;
+                }
+                for _ in 0..(12 * 3600 / 5) {
+                    if platform::stopping() { break; }
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
+        });
+    }
+
+    // Client: access to a closed server (a key, or a request to its owner).
+    {
+        let (st, cfg) = (st.clone(), cfg.clone());
+        std::thread::spawn(move || access_watch(st, cfg));
     }
 
     let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, exit: None, vpn: None };

@@ -2105,9 +2105,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
+ "getrandom 0.2.17",
  "libc",
  "log",
  "nix 0.31.3",
+ "serde",
+ "serde_json",
  "socks5-impl",
  "tokio",
  "tokio-util",

@@ -21,6 +21,10 @@ object State {
     @Volatile var stoppedByUser = false
     /** Exit servers from the trackers: address -> rtt as the tracker measured it (ms, -1 unknown). */
     @Volatile var trackerExits: List<Pair<String, Long>> = emptyList()
+    /** Exits the trackers list as public (anyone may use them); the rest need a key. */
+    @Volatile var trackerPublic: Set<String> = emptySet()
+    /** Client: access to the selected server — (server, `ok`/`pending`/… or `error: …`). */
+    @Volatile var access: Pair<String, String>? = null
     @Volatile var trackerStatus: String = "ещё не запрашивались"
     @Volatile var trackerAt = 0L
     /** Last time public peers were taken from a tracker (hourly). */

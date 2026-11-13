@@ -16,6 +16,8 @@ struct Data {
     toast: Option<(String, Instant)>,
     speed: Vec<String>,
     speed_running: bool,
+    /// Server: keys and requests (`{"cmd":"access"}`).
+    access: Option<Value>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -36,8 +38,15 @@ struct App {
     lim: [String; 4],
     qr: Option<(String, egui::TextureHandle)>,
     peer_detail: Option<Value>,
-    /// Client tab: address being typed.
+    /// Client tab: address (or link) and key being typed.
     add_text: String,
+    key_text: String,
+    /// Server tab: new key's name and days, days for approvals; the key whose QR is shown.
+    new_name: String,
+    new_days: u32,
+    qr_key: Option<String>,
+    /// The risk dialog before making the server public (and its checkbox).
+    public_dialog: Option<bool>,
     /// Network tab: tracker list being edited, and the list it was loaded from.
     trackers_text: String,
     trackers_loaded: Vec<String>,
@@ -51,6 +60,7 @@ fn poller(data: Arc<Mutex<Data>>, ctx: egui::Context) {
         let st = api::status();
         let since = data.lock().unwrap().log_seq;
         let logs = api::request(json!({"cmd": "logs", "since": since}));
+        let access = api::request(json!({"cmd": "access"})).ok();
         {
             let mut d = data.lock().unwrap();
             match st {
@@ -63,6 +73,7 @@ fn poller(data: Arc<Mutex<Data>>, ctx: egui::Context) {
                     d.error = Some(e);
                 }
             }
+            d.access = access;
             if let Ok(l) = logs {
                 for x in l["lines"].as_array().into_iter().flatten() {
                     d.logs.push(x.as_str().unwrap_or("").to_string());
@@ -92,7 +103,7 @@ impl App {
         let data = Arc::new(Mutex::new(Data::default()));
         let (d, ctx) = (data.clone(), cc.egui_ctx.clone());
         std::thread::spawn(move || poller(d, ctx));
-        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None, add_text: String::new(), trackers_text: String::new(), trackers_loaded: Vec::new(),
+        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None, add_text: String::new(), key_text: String::new(), new_name: String::new(), new_days: 30, qr_key: None, public_dialog: None, trackers_text: String::new(), trackers_loaded: Vec::new(),
             shot: std::env::var("YGGPROXY_SHOT").ok().map(|d| (d, 0, Instant::now())) };
         app.reload_config();
         app
@@ -137,14 +148,20 @@ impl App {
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut self.add_text).desired_width(330.0).hint_text("адрес сервера 200:… или ссылка yggproxy://c?a=…"));
+            ui.add(egui::TextEdit::singleline(&mut self.add_text).desired_width(330.0).hint_text("адрес сервера 200:… или ссылка yggproxy://c?a=…&k=…"));
+            ui.add(egui::TextEdit::singleline(&mut self.key_text).desired_width(170.0).hint_text("ключ доступа"));
             if ui.button("Добавить").clicked() {
                 match config::parse_server(&self.add_text) {
                     Some(a) => {
+                        let key = config::link_key(&self.add_text).unwrap_or_else(|| crate::access::norm_secret(&self.key_text));
                         let c = self.cfg.as_mut().unwrap();
                         if !c.client.servers.contains(&a.to_string()) {
                             c.client.servers.push(a.to_string());
                         }
+                        if !key.is_empty() {
+                            c.client.keys.insert(a.to_string(), key);
+                        }
+                        self.key_text.clear();
                         if config::parse_server(&c.client.server).is_none() {
                             c.client.server = a.to_string();
                         }
@@ -159,6 +176,11 @@ impl App {
         // Saved servers and the trackers' exits, with the node's ping.
         ui.add_space(4.0);
         ui.label("Серверы (нажмите — подключиться). Пинг меряет узел Yggdrasil каждые 10 с.");
+        ui.label("Серверы закрыты: нужен ключ от владельца. Без ключа при подключении ему уйдёт запрос доступа. 🔑 — ключ есть, 🌐 — публичный.");
+        let keys = self.cfg.as_ref().unwrap().client.keys.clone();
+        let public: std::collections::HashSet<String> = st
+            .map(|s| s["trackers"]["exits"].as_array().into_iter().flatten().filter(|e| e["public"].as_bool() == Some(true)).filter_map(|e| e["address"].as_str().map(String::from)).collect())
+            .unwrap_or_default();
         let ping = st.map(api::ping_map).unwrap_or_default();
         let saved = self.cfg.as_ref().unwrap().client.servers.clone();
         let tracker: Vec<String> = st
@@ -173,8 +195,9 @@ impl App {
         let mut row = |ui: &mut egui::Ui, a: &String, is_saved: bool| {
             let p = ping.get(a).map(|r| format!("{r} мс")).unwrap_or("нет ответа".into());
             let mark = if *a == cur && on && active { "● " } else if *a == cur && on { "◐ " } else if *a == cur { "○ " } else { "  " };
+            let kind = if keys.contains_key(a) { "🔑" } else if public.contains(a) { "🌐" } else { "  " };
             ui.horizontal(|ui| {
-                let txt = egui::RichText::new(format!("{mark}{a}   {p}")).monospace();
+                let txt = egui::RichText::new(format!("{mark}{kind} {a}   {p}")).monospace();
                 if ui.add(egui::Button::new(if *a == cur { txt.strong() } else { txt }).frame(false)).clicked() {
                     connect = Some(a.clone());
                 }
@@ -252,12 +275,17 @@ impl App {
                 "VPN выключен".to_string()
             } else {
                 format!(
-                    "VPN {} → {}\n↓ {}  ↑ {}\nпинг до сервера: {}",
+                    "VPN {} → {}\n↓ {}  ↑ {}\nпинг до сервера: {}\nдоступ: {}",
                     if cl["active"].as_bool() == Some(true) { "работает" } else { "запускается…" },
                     cl["server"].as_str().unwrap_or(""),
                     human(cl["rx"].as_u64().unwrap_or(0)),
                     human(cl["tx"].as_u64().unwrap_or(0)),
-                    cl["server_rtt"].as_str().unwrap_or("измеряю…")
+                    cl["server_rtt"].as_str().unwrap_or("измеряю…"),
+                    match cl["access"].as_str() {
+                        Some(e) if e.starts_with("error: ") => format!("не проверен ({})", &e[7..]),
+                        Some(code) => crate::daemon::access_text(code).to_string(),
+                        None => "проверяю…".into(),
+                    }
                 )
             });
         }
@@ -292,48 +320,65 @@ impl App {
         }
     }
 
+    /// A QR code texture for `link` (cached while the link stays the same).
+    fn qr_texture(&mut self, ctx: &egui::Context, link: &str) {
+        if self.qr.as_ref().map(|q| q.0.as_str()) == Some(link) {
+            return;
+        }
+        if let Some((m, w)) = api::qr(link) {
+            let q = 2;
+            let side = w + 2 * q;
+            let mut px = vec![255u8; side * side];
+            for y in 0..w {
+                for x in 0..w {
+                    if m[y * w + x] {
+                        px[(y + q) * side + x + q] = 0;
+                    }
+                }
+            }
+            let img = egui::ColorImage::from_gray([side, side], &px);
+            self.qr = Some((link.to_string(), ctx.load_texture("qr", img, egui::TextureOptions::NEAREST)));
+        }
+    }
+
+    /// An access command to the service, off the UI thread; `msg` is shown when it worked.
+    fn access_op(&self, req: Value, msg: String) {
+        let data = self.data.clone();
+        std::thread::spawn(move || {
+            let r = api::request(req);
+            let mut d = data.lock().unwrap();
+            match r {
+                Ok(v) if v["error"].is_null() => {
+                    d.toast = Some((msg, Instant::now()));
+                    d.access = Some(v);
+                }
+                Ok(v) => d.toast = Some((format!("Ошибка: {}", v["error"].as_str().unwrap_or("?")), Instant::now())),
+                Err(e) => d.toast = Some((format!("Ошибка: {e}"), Instant::now())),
+            }
+        });
+    }
+
     fn server_tab(&mut self, ui: &mut egui::Ui, st: Option<&Value>) {
         ui.heading("Сервер выхода");
         ui.label(format!(
-            "Компьютер раздаёт свой интернет любому узлу Yggdrasil, который знает адрес, без ключей (порт {} у всех серверов одинаковый). Локальные сети закрыты.",
+            "Компьютер раздаёт свой интернет через Yggdrasil (порт {}). Сервер закрыт: пользоваться им могут только устройства с ключом — у каждого устройства свой. Локальные сети закрыты.",
             config::PORT
         ));
         let addr = st.and_then(|s| s["node"]["address"].as_str()).map(String::from);
-        if let Some(a) = &addr {
-            let link = config::connect_link(a);
-            if self.qr.as_ref().map(|q| &q.0) != Some(&link)
-                && let Some((m, w)) = api::qr(&link) {
-                    let q = 2;
-                    let side = w + 2 * q;
-                    let mut px = vec![255u8; side * side];
-                    for y in 0..w {
-                        for x in 0..w {
-                            if m[y * w + x] {
-                                px[(y + q) * side + x + q] = 0;
-                            }
-                        }
-                    }
-                    let img = egui::ColorImage::from_gray([side, side], &px);
-                    self.qr = Some((link.clone(), ui.ctx().load_texture("qr", img, egui::TextureOptions::NEAREST)));
-                }
-            ui.add_space(4.0);
-            ui.monospace(format!("Адрес для клиентов: {a}"));
-            if let Some((_, tex)) = &self.qr {
-                ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(220.0, 220.0)));
-            }
-            ui.horizontal(|ui| {
+        match &addr {
+            Some(a) => {
+                ui.monospace(format!("Адрес сервера: {a}"));
                 if ui.button("Копировать адрес").clicked() {
                     ui.ctx().copy_text(a.clone());
                     self.toast("Скопировано");
                 }
-                if ui.button("Копировать ссылку").clicked() {
-                    ui.ctx().copy_text(link.clone());
-                    self.toast("Скопировано");
-                }
-            });
-        } else {
-            ui.monospace("Адрес появится после запуска узла.");
+            }
+            None => {
+                ui.monospace("Адрес появится после запуска узла.");
+            }
         }
+        self.access_section(ui);
+        ui.separator();
         let Some(c) = self.cfg.as_mut() else { return };
         ui.checkbox(&mut c.server.allow_lan, "Разрешить клиентам доступ в мою LAN");
         let on = c.server.enabled;
@@ -390,6 +435,131 @@ impl App {
                 human(cl["tx"].as_u64().unwrap_or(0)),
                 human(cl["rx"].as_u64().unwrap_or(0))
             ));
+        }
+    }
+
+    fn access_section(&mut self, ui: &mut egui::Ui) {
+        let Some(acc) = self.data.lock().unwrap().access.clone() else { return };
+        let now = acc["now"].as_u64().unwrap_or(0);
+        ui.separator();
+        ui.heading("Доступ");
+        if acc["public"].as_bool() == Some(true) {
+            ui.colored_label(egui::Color32::from_rgb(210, 90, 30), "Сервер ПУБЛИЧНЫЙ: пользоваться им может любой, кто его найдёт.");
+            if ui.button("Закрыть сервер (только по ключам)").clicked() {
+                self.access_op(json!({"cmd": "access", "op": "public", "on": false}), "Сервер закрыт".into());
+            }
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Сервер закрыт — только по ключам.");
+                if ui.small_button("Сделать публичным…").clicked() {
+                    self.public_dialog = Some(false);
+                }
+            });
+        }
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Новый ключ для");
+            ui.add(egui::TextEdit::singleline(&mut self.new_name).desired_width(150.0).hint_text("чьё устройство"));
+            ui.label("на");
+            ui.add(egui::DragValue::new(&mut self.new_days).range(1..=365).suffix(" дн."));
+            if ui.button("Создать").clicked() {
+                self.access_op(json!({"cmd": "access", "op": "new", "name": self.new_name, "days": self.new_days}), "Ключ создан — покажите QR-код устройству".into());
+                self.new_name.clear();
+                self.qr_key = Some(String::new()); // the newest key
+            }
+        });
+        let keys = acc["keys"].as_array().cloned().unwrap_or_default();
+        if self.qr_key.as_deref() == Some("") {
+            if let Some(id) = keys.iter().filter(|k| k["addr"].is_null()).max_by_key(|k| k["created"].as_u64()).and_then(|k| k["id"].as_str()) {
+                self.qr_key = Some(id.to_string());
+            }
+        }
+        if let Some(k) = keys.iter().find(|k| k["id"].as_str() == self.qr_key.as_deref()).cloned()
+            && let Some(link) = k["link"].as_str() {
+                self.qr_texture(ui.ctx(), link);
+                ui.group(|ui| {
+                    ui.label(format!("Ключ «{}» — отсканируйте QR в приложении Ratatoskr или введите адрес и ключ вручную:", k["name"].as_str().unwrap_or("")));
+                    if let Some((_, tex)) = &self.qr {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(220.0, 220.0)));
+                    }
+                    ui.monospace(format!("Ключ: {}", k["key"].as_str().unwrap_or("")));
+                    ui.horizontal(|ui| {
+                        if ui.button("Копировать ссылку").clicked() {
+                            ui.ctx().copy_text(link.to_string());
+                            self.toast("Ссылка скопирована");
+                        }
+                        if ui.button("Копировать ключ").clicked() {
+                            ui.ctx().copy_text(k["key"].as_str().unwrap_or("").to_string());
+                            self.toast("Ключ скопирован");
+                        }
+                        if ui.button("Скрыть").clicked() {
+                            self.qr_key = None;
+                        }
+                    });
+                });
+            }
+        if keys.is_empty() {
+            ui.label("Ключей пока нет.");
+        }
+        for k in &keys {
+            let id = k["id"].as_str().unwrap_or("").to_string();
+            let exp = k["expires"].as_u64().unwrap_or(0);
+            let left = if exp > now { format!("ещё {}", dur(exp - now)) } else { "ИСТЁК".into() };
+            let dev = match k["addr"].as_str() {
+                Some(a) => format!("{} {a}", k["device"].as_str().unwrap_or("")),
+                None => "ещё не использован".into(),
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.monospace(format!("{} · {} · {} дн., {} · {}", id, k["name"].as_str().unwrap_or(""), k["days"], left, dev));
+                if k["addr"].is_null() && ui.small_button("QR").clicked() {
+                    self.qr_key = Some(id.clone());
+                }
+                if ui.small_button("продлить").on_hover_text("ещё на столько же дней от сегодня").clicked() {
+                    self.access_op(json!({"cmd": "access", "op": "renew", "id": id, "days": k["days"]}), "Ключ продлён".into());
+                }
+                if !k["addr"].is_null() && ui.small_button("отвязать").on_hover_text("тем же ключом сможет войти новое устройство").clicked() {
+                    self.access_op(json!({"cmd": "access", "op": "unbind", "id": id}), "Ключ отвязан".into());
+                }
+                if ui.small_button("удалить").clicked() {
+                    self.access_op(json!({"cmd": "access", "op": "revoke", "id": id}), "Ключ удалён, доступ закрыт".into());
+                }
+            });
+        }
+        let reqs = acc["requests"].as_array().cloned().unwrap_or_default();
+        if !reqs.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("Запросы доступа ({}) — одобрить на {} дн.:", reqs.len(), self.new_days)).strong());
+            for q in &reqs {
+                let a = q["addr"].as_str().unwrap_or("").to_string();
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(format!("{} · {} · {} назад", q["name"].as_str().unwrap_or(""), a, dur(now.saturating_sub(q["last"].as_u64().unwrap_or(0)))));
+                    if ui.small_button("одобрить").clicked() {
+                        self.access_op(json!({"cmd": "access", "op": "approve", "addr": a, "days": self.new_days}), "Доступ одобрен".into());
+                    }
+                    if ui.small_button("отклонить").clicked() {
+                        self.access_op(json!({"cmd": "access", "op": "deny", "addr": a}), "Запрос отклонён".into());
+                    }
+                });
+            }
+        }
+        if let Some(mut accepted) = self.public_dialog {
+            let mut open = true;
+            let mut done = false;
+            egui::Window::new("Сделать сервер публичным?").open(&mut open).collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+                ui.label(acc["risk"].as_str().unwrap_or(""));
+                ui.add_space(6.0);
+                ui.checkbox(&mut accepted, "Я понимаю последствия и принимаю риск");
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(accepted, egui::Button::new("Сделать публичным")).clicked() {
+                        self.access_op(json!({"cmd": "access", "op": "public", "on": true, "accept_risk": true}), "Сервер стал публичным".into());
+                        done = true;
+                    }
+                    if ui.button("Отмена").clicked() {
+                        done = true;
+                    }
+                });
+            });
+            self.public_dialog = if open && !done { Some(accepted) } else { None };
         }
     }
 
@@ -620,6 +790,25 @@ impl eframe::App for App {
                 }
             });
         });
+        if let Some(u) = status.as_ref().map(|s| s["update"].clone()).filter(|u| u.is_object()) {
+            egui::TopBottomPanel::top("update").show(ctx, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(format!("Доступна версия {} (у вас {})", u["version"].as_str().unwrap_or("?"), crate::update::CURRENT)).strong());
+                    if let Some(url) = u["url"].as_str()
+                        && ui.button("Скачать").clicked() {
+                            crate::update::open_url(url);
+                        }
+                    if ui.button("Что нового").clicked() {
+                        crate::update::open_url(u["page"].as_str().unwrap_or(crate::update::PAGE));
+                    }
+                    #[cfg(unix)]
+                    if ui.button("Обновить (pkexec)").clicked()
+                        && let Ok(me) = std::env::current_exe() {
+                            let _ = std::process::Command::new("pkexec").arg(me).arg("update").spawn();
+                        }
+                });
+            });
+        }
         egui::CentralPanel::default().show(ctx, |ui| {
             if let Some(e) = &error {
                 ui.colored_label(egui::Color32::from_rgb(200, 60, 40), e);
