@@ -8,7 +8,7 @@ license = "MIT"
 [features]
 default = ["gui"]
 # The desktop window (egui). Servers can build without it: cargo build --no-default-features
-gui = ["dep:eframe"]
+gui = ["dep:eframe", "dep:wgpu"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -27,8 +27,12 @@ libc = "0.2"
 eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "x11", "wayland", "default_fonts"] }
 
 [target.'cfg(windows)'.dependencies]
-eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "default_fonts"] }
-windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
+# Windows: wgpu draws the window through DirectX 12 (in a VM without 3D, through WARP, the
+# software rasterizer), with Vulkan and OpenGL ES as fallbacks; glow (OpenGL 2.0+) stays
+# selectable with YGGPROXY_RENDERER=glow. The basic display driver of a VM has only OpenGL 1.1.
+eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "wgpu", "default_fonts"] }
+wgpu = { version = "27", optional = true, default-features = false, features = ["dx12", "vulkan", "gles", "wgsl"] }
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis"] }
 windows-service = "0.8"
 
 [profile.release]

@@ -682,9 +682,24 @@ impl eframe::App for App {
     }
 }
 
+/// How the window is drawn. Linux: OpenGL (glow). Windows: wgpu — DirectX 12, which also works
+/// in virtual machines without 3D acceleration (WARP), then Vulkan and OpenGL ES.
+/// `YGGPROXY_RENDERER=glow|wgpu` overrides.
+fn renderer() -> eframe::Renderer {
+    match std::env::var("YGGPROXY_RENDERER").as_deref() {
+        #[cfg(windows)]
+        Ok("glow") => eframe::Renderer::Glow,
+        #[cfg(windows)]
+        _ => eframe::Renderer::Wgpu,
+        #[cfg(not(windows))]
+        _ => eframe::Renderer::Glow,
+    }
+}
+
 pub fn run() -> Result<(), String> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("Ratatoskr").with_inner_size([560.0, 760.0]),
+        renderer: renderer(),
         ..Default::default()
     };
     eframe::run_native("Ratatoskr", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| format!("окно: {e}"))

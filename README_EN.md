@@ -89,7 +89,8 @@ Download `yggproxy-windows-x86_64.exe` from the [releases](https://github.com/va
 and run it. A window opens; press "Установить и запустить службу" and confirm the administrator
 prompt. The program is copied to `C:\Program Files\Ratatoskr`, the **Ratatoskr** service starts
 with Windows, and a Start menu shortcut appears. The same console commands work in a command
-prompt: `yggproxy status`, `yggproxy connect`, `yggproxy server on`. Windows 10/11 x64.
+prompt: `yggproxy status`, `yggproxy connect`, `yggproxy server on`. Windows 10/11 x64; the window
+is drawn with DirectX 12 and opens in virtual machines without 3D acceleration too.
 
 ## How it works
 

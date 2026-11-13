@@ -57,7 +57,21 @@ fn gui() -> Result<(), String> {
             FreeConsole();
         }
     }
-    gui::run()
+    let r = gui::run();
+    // Windows: the console is gone (or was never seen): say what happened in a message box.
+    #[cfg(windows)]
+    if let Err(e) = &r {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+        let text = format!(
+            "Не удалось открыть окно Ratatoskr:\n{e}\n\nСлужба и консольные команды работают без окна: \
+             yggproxy status, yggproxy connect, yggproxy server on.\n\nМожно попробовать другой способ отрисовки: \
+             переменная окружения YGGPROXY_RENDERER=glow."
+        );
+        let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+        let (t, c) = (w(&text), w("Ratatoskr"));
+        unsafe { MessageBoxW(0, t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONERROR) };
+    }
+    r
 }
 
 #[cfg(not(feature = "gui"))]
