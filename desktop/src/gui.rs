@@ -41,6 +41,8 @@ struct App {
     /// Client tab: address (or link) and key being typed.
     add_text: String,
     key_text: String,
+    /// Client tab: message for an access request.
+    req_msg: String,
     /// Server tab: new key's name and days, days for approvals; the key whose QR is shown.
     new_name: String,
     new_days: u32,
@@ -103,7 +105,7 @@ impl App {
         let data = Arc::new(Mutex::new(Data::default()));
         let (d, ctx) = (data.clone(), cc.egui_ctx.clone());
         std::thread::spawn(move || poller(d, ctx));
-        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None, add_text: String::new(), key_text: String::new(), new_name: String::new(), new_days: 30, qr_key: None, public_dialog: None, trackers_text: String::new(), trackers_loaded: Vec::new(),
+        let mut app = App { data, tab: Tab::Client, cfg: None, peers_text: String::new(), lim: Default::default(), qr: None, peer_detail: None, add_text: String::new(), key_text: String::new(), req_msg: String::new(), new_name: String::new(), new_days: 30, qr_key: None, public_dialog: None, trackers_text: String::new(), trackers_loaded: Vec::new(),
             shot: std::env::var("YGGPROXY_SHOT").ok().map(|d| (d, 0, Instant::now())) };
         app.reload_config();
         app
@@ -237,6 +239,7 @@ impl App {
             }
             c.client.server = a;
             c.client.enabled = true;
+            c.client.ygg_only = false;
             self.apply("Подключаюсь…");
         }
 
@@ -247,6 +250,9 @@ impl App {
             if on {
                 c.client.enabled = false;
                 self.apply("VPN выключен");
+            } else if c.client.ygg_only {
+                c.client.enabled = true;
+                self.apply("VPN только для Yggdrasil");
             } else {
                 // The selected server, else the best by ping, else the first in the list.
                 let pick = config::parse_server(&c.client.server).map(|a| a.to_string())
@@ -268,11 +274,22 @@ impl App {
         let c = self.cfg.as_mut().unwrap();
         ui.checkbox(&mut c.client.udp, "UDP через udpgw (QUIC, игры, звонки)");
         ui.checkbox(&mut c.client.ipv6, "IPv6-сайты через сервер");
+        let (ys, yo) = (c.client.ygg_sites, c.client.ygg_only);
+        ui.checkbox(&mut c.client.ygg_sites, "Сайты Yggdrasil и ALFIS (.ygg, .anon…) — через свой узел, рядом с интернетом")
+            .on_hover_text("Адреса 200::/7 и имена ALFIS идут в сеть Yggdrasil напрямую, остальное — через сервер выхода. Только TCP: сайты, SSH, чаты.");
+        ui.checkbox(&mut c.client.ygg_only, "Только Yggdrasil: VPN без сервера выхода (интернет как обычно)");
+        if (ys, yo) != (c.client.ygg_sites, c.client.ygg_only) {
+            self.apply("Сохранено");
+        }
         if let Some(s) = st {
             let cl = &s["client"];
             ui.add_space(6.0);
             ui.monospace(if cl["enabled"].as_bool() != Some(true) {
                 "VPN выключен".to_string()
+            } else if cl["ygg_only"].as_bool() == Some(true) {
+                format!("VPN {}: только сайты Yggdrasil и ALFIS\n↓ {}  ↑ {}",
+                    if cl["active"].as_bool() == Some(true) { "работает" } else { "запускается…" },
+                    human(cl["rx"].as_u64().unwrap_or(0)), human(cl["tx"].as_u64().unwrap_or(0)))
             } else {
                 format!(
                     "VPN {} → {}\n↓ {}  ↑ {}\nпинг до сервера: {}\nдоступ: {}",
@@ -283,10 +300,31 @@ impl App {
                     cl["server_rtt"].as_str().unwrap_or("измеряю…"),
                     match cl["access"].as_str() {
                         Some(e) if e.starts_with("error: ") => format!("не проверен ({})", &e[7..]),
-                        Some(code) => crate::daemon::access_text(code).to_string(),
+                        Some(code) => format!("{}{}", crate::daemon::access_text(code), api::key_left(cl["access_expires"].as_u64().unwrap_or(0))),
                         None => "проверяю…".into(),
                     }
                 )
+            });
+        }
+        // Access request to the selected server (no key): a message for its owner.
+        let cur = self.cfg.as_ref().map(|c| c.client.server.clone()).unwrap_or_default();
+        if config::parse_server(&cur).is_some() && !self.cfg.as_ref().unwrap().client.keys.contains_key(&cur) {
+            ui.add_space(6.0);
+            ui.label(format!("Нет ключа к {cur}? Попросите доступ у владельца:"));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.req_msg).desired_width(330.0).hint_text("сообщение владельцу (кто вы, зачем)"));
+                if ui.button("Запросить доступ").clicked() {
+                    let (data, server, msg) = (self.data.clone(), cur.clone(), self.req_msg.clone());
+                    self.req_msg.clear();
+                    std::thread::spawn(move || {
+                        let t = match api::request(json!({"cmd": "request_access", "server": server, "message": msg})) {
+                            Ok(v) if v["error"].is_null() => v["text"].as_str().unwrap_or("").to_string(),
+                            Ok(v) => format!("Ошибка: {}", v["error"].as_str().unwrap_or("?")),
+                            Err(e) => format!("Ошибка: {e}"),
+                        };
+                        data.lock().unwrap().toast = Some((t, Instant::now()));
+                    });
+                }
             });
         }
         ui.separator();
@@ -533,6 +571,9 @@ impl App {
                 let a = q["addr"].as_str().unwrap_or("").to_string();
                 ui.horizontal_wrapped(|ui| {
                     ui.monospace(format!("{} · {} · {} назад", q["name"].as_str().unwrap_or(""), a, dur(now.saturating_sub(q["last"].as_u64().unwrap_or(0)))));
+                    if let Some(m) = q["message"].as_str().filter(|m| !m.is_empty()) {
+                        ui.label(format!("«{m}»"));
+                    }
                     if ui.small_button("одобрить").clicked() {
                         self.access_op(json!({"cmd": "access", "op": "approve", "addr": a, "days": self.new_days}), "Доступ одобрен".into());
                     }

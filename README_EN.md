@@ -34,8 +34,9 @@ apps → VPN (TUN) → tun2proxy ─SOCKS5→ tcp_node ══ Yggdrasil ══ t
 |---|---|
 | **Client** | all device traffic through the VPN; TCP, UDP (QUIC, calls, games) over udpgw, IPv4 and IPv6 |
 | **Exit server** | port **27080**, closed by default: only devices with a key; can be made public after a warning about the risks. The server's LAN, loopback and Yggdrasil itself are closed through the exit |
-| **Access keys** | a key (1–365 days) binds to the first device that uses it; renew, unbind, delete; access requests from devices without a key — approve or deny |
+| **Access keys** | a key (1–365 days) binds to the first device that uses it; renew, unbind, delete; the client shows how long its key is still valid; access requests (with a message to the owner) from devices without a key — approve or deny |
 | **Quick connect** | QR code or a `yggproxy://c?a=ADDRESS&k=KEY` link (the system camera opens it too), or the address and key typed in |
+| **Yggdrasil and ALFIS sites** | `200::/7` addresses (and `300::/8` subnets) and ALFIS names (`.ygg`, `.anon`, `.btn`, `.conf`, `.index`, `.merch`, `.mirror`, `.mob`, `.screen`, `.srv`) go through the device's own node, next to the internet through the exit; a "Yggdrasil only" mode runs the VPN without an exit server. TCP only: sites, SSH, chats |
 | **Updates** | the app and the service check GitHub releases and offer new versions; `sudo yggproxy update` on Linux downloads and installs one |
 | **Server list** | saved servers plus servers from trackers, ping to each and to the network root |
 | **Peer selection** | the client replaces its Yggdrasil peers while the ping to the server is above a threshold |
@@ -87,6 +88,8 @@ yggproxy servers                    # servers from trackers, with ping
 yggproxy connect 'yggproxy://c?a=…&k=…'   # connect with a key link (or: ADDR KEY)
 yggproxy gui                        # window
 sudo yggproxy update                # update to the latest release
+yggproxy request ADDR Hi, it's Masha      # ask for access with a message
+yggproxy ygg                        # VPN only for Yggdrasil and ALFIS sites (wiki.ygg …)
 ```
 
 Details: [desktop/README.md](desktop/README.md).

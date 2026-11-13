@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "yggproxy"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "eframe",
  "getrandom 0.2.17",

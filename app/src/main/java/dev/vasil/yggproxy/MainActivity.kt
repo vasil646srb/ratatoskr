@@ -58,6 +58,8 @@ class MainActivity : Activity() {
     private lateinit var etKey: EditText
     private lateinit var cbUdp: CheckBox
     private lateinit var cbIpv6: CheckBox
+    private lateinit var cbYggSites: CheckBox
+    private lateinit var cbYggOnly: CheckBox
     private lateinit var btnVpn: Button
     private lateinit var btnApps: Button
     private lateinit var serversBox: LinearLayout
@@ -347,6 +349,9 @@ class MainActivity : Activity() {
         addView(h1("VPN-клиент"))
         cbUdp = check("UDP через udpgw (QUIC, игры, звонки)", prefs.udp).also { addView(it) }
         cbIpv6 = check("IPv6-сайты через сервер", prefs.ipv6).also { addView(it) }
+        cbYggSites = check("Сайты Yggdrasil и ALFIS (.ygg, .anon…) — через свой узел, рядом с интернетом", prefs.yggSites).also { addView(it) }
+        cbYggOnly = check("Только Yggdrasil: VPN без сервера выхода (интернет как обычно)", prefs.yggOnly).also { addView(it) }
+        addView(note("Адреса 200::/7 и имена ALFIS идут в сеть Yggdrasil напрямую через узел телефона. Только TCP: сайты, SSH, чаты; UDP и ping — нет."))
         addView(h1("Узел Yggdrasil"))
         cbKeepNode = check("Работать в фоне: пинговать серверы и корень, когда приложение свёрнуто", prefs.keepNode).also { addView(it) }
         addView(note("Без VPN и сервера узел работает в фоне с уведомлением. Выключите, чтобы экономить батарею: тогда он работает только при открытом приложении."))
@@ -425,6 +430,8 @@ class MainActivity : Activity() {
         prefs.keepNode = cbKeepNode.isChecked
         prefs.trackers = etTrackers.text.toString()
         prefs.ipv6 = cbIpv6.isChecked
+        prefs.yggSites = cbYggSites.isChecked
+        prefs.yggOnly = cbYggOnly.isChecked
         prefs.limTotalDown = kbit(etLimTotalDown)
         prefs.limTotalUp = kbit(etLimTotalUp)
         prefs.limClientDown = kbit(etLimClientDown)
@@ -450,7 +457,7 @@ class MainActivity : Activity() {
             YggService.send(this, YggService.ACTION_RECONCILE)
             return
         }
-        if (Ygg.parseServer(prefs.server) == null) {
+        if (Ygg.parseServer(prefs.server) == null && !prefs.yggOnly) {
             // Nothing selected yet: take what was typed, else the first saved server.
             val typed = Ygg.serverFromText(etServer.text.toString())
             val pick = typed ?: prefs.serverList().firstOrNull()
@@ -516,6 +523,7 @@ class MainActivity : Activity() {
     /** Quick connect: remember the server and bring the VPN up (or switch it to this server). */
     private fun connectTo(server: String) {
         saveAll()
+        if (prefs.yggOnly) { prefs.yggOnly = false; cbYggOnly.isChecked = false }
         prefs.addServer(server)
         prefs.server = server
         writeMonitors()
@@ -625,7 +633,7 @@ class MainActivity : Activity() {
     }
 
     private fun serverMenu(addr: String) {
-        val items = arrayOf("Подключиться", "Копировать адрес", "Ключ доступа…", "Удалить из списка")
+        val items = arrayOf("Подключиться", "Копировать адрес", "Ключ доступа…", "Удалить из списка", "Запросить доступ у владельца…")
         AlertDialog.Builder(this).setTitle(addr).setItems(items) { _, w ->
             when (w) {
                 0 -> connectTo(addr)
@@ -636,6 +644,20 @@ class MainActivity : Activity() {
                         .setPositiveButton("Сохранить") { _, _ ->
                             prefs.setKey(addr, Ygg.normKey(e.text.toString()))
                             serversSig = null; refreshNow(); toast("Ключ сохранён")
+                        }
+                        .setNegativeButton("Отмена", null).show()
+                }
+                4 -> {
+                    val e = edit("сообщение владельцу: кто вы и зачем", "", lines = 2)
+                    e.filters = arrayOf(android.text.InputFilter.LengthFilter(200))
+                    AlertDialog.Builder(this).setTitle("Запрос доступа").setView(e)
+                        .setMessage("Владелец увидит имя устройства (${Ygg.deviceName()}) и сообщение.")
+                        .setPositiveButton("Отправить") { _, _ ->
+                            val msg = e.text.toString()
+                            bg.execute {
+                                val (code, _) = Ygg.probeAccess(addr, null, ask = true, message = msg)
+                                ui.post { toast(if (code == "pending") "Запрос отправлен — ждите одобрения" else Ygg.accessText(code)) }
+                            }
                         }
                         .setNegativeButton("Отмена", null).show()
                 }
@@ -800,7 +822,8 @@ class MainActivity : Activity() {
         val addr = r.optString("addr")
         val days = etKeyDays.text.toString().toIntOrNull()?.takeIf { it in 1..365 } ?: 30
         AlertDialog.Builder(this).setTitle("Запрос доступа")
-            .setMessage("${r.optString("name")}\n$addr\nпопыток: ${r.optInt("count")}")
+            .setMessage("${r.optString("name")}\n$addr\nпопыток: ${r.optInt("count")}" +
+                r.optString("message").takeIf { it.isNotEmpty() }?.let { "\n\n«$it»" }.orEmpty())
             .setPositiveButton("Одобрить на $days дн.") { _, _ -> accessOp("Доступ одобрен", "approve", addr, days.toString()) }
             .setNegativeButton("Отклонить") { _, _ -> accessOp("Запрос отклонён", "deny", addr) }
             .setNeutralButton("Отмена", null).show()
@@ -850,7 +873,8 @@ class MainActivity : Activity() {
             accessBox.addView(h2("Запросы доступа (${reqs.length()})"))
             for (i in 0 until reqs.length()) {
                 val r = reqs.getJSONObject(i)
-                accessBox.addView(mono("${r.optString("name")}\n    ${r.optString("addr")} · ${Ygg.dur(now - r.optLong("last"))} назад").apply {
+                val msg = r.optString("message").takeIf { it.isNotEmpty() }?.let { "\n    «$it»" }.orEmpty()
+                accessBox.addView(mono("${r.optString("name")}\n    ${r.optString("addr")} · ${Ygg.dur(now - r.optLong("last"))} назад$msg").apply {
                     setTextIsSelectable(false)
                     setBackgroundResource(android.R.drawable.list_selector_background)
                     setPadding(dp(4), dp(8), dp(4), dp(8))
@@ -948,9 +972,11 @@ class MainActivity : Activity() {
         btnExit.text = if (prefs.serverEnabled) "Остановить сервер" else "Запустить сервер"
         tvClientState.text = when {
             !prefs.vpnEnabled -> "VPN выключен"
+            prefs.yggOnly -> if (State.vpnActive) "VPN работает: только сайты Yggdrasil и ALFIS" else "VPN запускается…"
             State.vpnActive -> "VPN работает → ${State.vpnTarget}\n↓ ${Ygg.human(State.tunRx)}  ↑ ${Ygg.human(State.tunTx)}"
             else -> "VPN запускается…" + (State.lastError?.let { "\n$it" } ?: "")
-        } + if (prefs.vpnEnabled) "\nдоступ: " + Ygg.accessText(State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }?.second) else ""
+        } + if (prefs.vpnEnabled && !prefs.yggOnly) State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
+            .let { "\nдоступ: " + Ygg.accessText(it?.second) + (it?.let { a -> Ygg.keyLeft(a.third) } ?: "") } else ""
         val addr = State.address
         val link = addr?.let { a -> qrKey()?.let { Ygg.connectLink(a, it.optString("key")) } }
         if (link != qrText) {

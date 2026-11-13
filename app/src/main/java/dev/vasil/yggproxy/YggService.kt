@@ -95,18 +95,18 @@ class YggService : VpnService() {
      */
     private fun accessTick() { try {
         val server = Ygg.serverFromText(prefs.server)
-        if (!prefs.vpnEnabled || server == null || !State.nodeRunning) { accessLast = null; return }
+        if (!prefs.vpnEnabled || prefs.yggOnly || server == null || !State.nodeRunning) { accessLast = null; return }
         val key = prefs.keyFor(server) ?: ""
         val sig = "$server $key"
         val last = accessLast
         val now = System.currentTimeMillis()
         if (last != null && last.first == sig && now - last.third < if (last.second == "ok") 300_000 else 20_000) return
-        val code = Ygg.probeAccess(server, key, ask = true)
+        val (code, exp) = Ygg.probeAccess(server, key, ask = true)
         if (last == null || last.first != sig || last.second != code) {
             val text = Ygg.accessText(code)
             if (code == "ok") State.log("access", "$server: $text") else State.error("access", "$server: $text")
         }
-        State.access = server to code
+        State.access = Triple(server, code, exp)
         accessLast = Triple(sig, code, now)
     } catch (_: Exception) {} }
 
@@ -227,13 +227,14 @@ class YggService : VpnService() {
     }
 
     private fun reconcileInner() {
-        val target = clientTarget()
-        if (prefs.vpnEnabled && target == null) State.error("vpn", "не задан адрес сервера выхода")
+        val only = prefs.yggOnly
+        val target = if (only) null else clientTarget()
+        if (prefs.vpnEnabled && target == null && !only) State.error("vpn", "не задан адрес сервера выхода")
         if (prefs.vpnEnabled && VpnService.prepare(this) != null) {
             State.error("vpn", "нет разрешения на VPN: откройте приложение и нажмите «Подключить»")
             prefs.vpnEnabled = false
         }
-        val wantVpn = prefs.vpnEnabled && target != null
+        val wantVpn = prefs.vpnEnabled && (target != null || only)
         val wantExit = prefs.serverEnabled
 
         // With the app on screen the node runs anyway: it pings the saved servers and the root.
@@ -251,12 +252,12 @@ class YggService : VpnService() {
         // 1. Yggdrasil node.
         // The server goes to the node through a file: switching servers or turning the VPN on and
         // off keeps the node, its peers and its paths.
-        val connectLine = if (wantVpn) "[${target!!.first}]:${target.second}" else ""
+        val connectLine = if (wantVpn && target != null) "[${target.first}]:${target.second}" else ""
         if (connectLine != lastTarget) {
             Ygg.writeIfChanged(connectFile, connectLine)
             if (lastTarget != null) State.serverRtt = null
             lastTarget = connectLine
-            if (wantVpn) State.log("vpn", "сервер выхода: ${target!!.first} (узел не перезапускается)")
+            if (target != null && wantVpn) State.log("vpn", "сервер выхода: ${target.first} (узел не перезапускается)")
         }
         val nodeCmd = nodeArgs(wantExit)
         if (node?.cmd != nodeCmd) {
@@ -298,8 +299,8 @@ class YggService : VpnService() {
         // 3. VPN.
         if (wantVpn) {
             // The server is not part of it: a switch needs no new VPN interface.
-            val sig = "${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}"
-            State.vpnTarget = target!!.first
+            val sig = "${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}|${prefs.yggSites}|$only"
+            State.vpnTarget = target?.first
             if (vpnPfd == null || sig != vpnSig) {
                 stopVpn()
                 startVpn(target)
@@ -408,15 +409,21 @@ class YggService : VpnService() {
     // ---------------------------------------------------------------------------------------
     // VPN
 
-    private fun startVpn(target: Pair<String, Int>) {
+    /** [target] null: Yggdrasil only (no exit server). */
+    private fun startVpn(target: Pair<String, Int>?) {
         val b = Builder()
-            .setSession("Yggdrasil → [${target.first}]")
+            .setSession(if (target == null) "Yggdrasil" else "Yggdrasil → [${target.first}]")
             .setMtu(1500)
             .addAddress("10.111.222.2", 24)
-            .addRoute("0.0.0.0", 0)
             .addDnsServer("10.111.222.53")
             .addAddress("fd59:7967:6772::2", 64)
-            .addRoute("::", 0)
+        if (target != null) {
+            b.addRoute("0.0.0.0", 0).addRoute("::", 0)
+        } else {
+            // Only Yggdrasil: 200::/7, the DNS server and tun2proxy's addresses for names (the
+            // names of normal sites go straight to the internet from the router).
+            b.addRoute("200::", 7).addRoute("10.111.222.0", 24).addRoute("198.18.0.0", 15)
+        }
         // Our own UID carries the Yggdrasil peer links: it must bypass the VPN.
         b.addDisallowedApplication(packageName)
         for (app in prefs.excludedAppList()) {
@@ -429,15 +436,18 @@ class YggService : VpnService() {
         val pfd = b.establish() ?: throw IllegalStateException("VPN не установлен (нет разрешения)")
         vpnPfd = pfd
         State.resetTraffic()
-        State.vpnTarget = target.first
+        State.vpnTarget = target?.first
 
         File(ctlPath).delete()
         val cmd = buildList {
             add("$bin/libygghelper.so"); add("tun")
             add("--ctl"); add(ctlPath)
             add("--socks"); add("127.0.0.1:${Ygg.CLIENT_SOCKS}")
-            if (prefs.udp) { add("--udpgw"); add("127.0.0.1:${Ygg.UDPGW}") }
+            if (prefs.udp && target != null) { add("--udpgw"); add("127.0.0.1:${Ygg.UDPGW}") }
             if (prefs.ipv6) add("--ipv6")
+            // Yggdrasil addresses and ALFIS names through our own node (ygghelper router.rs).
+            if (prefs.yggSites || target == null) { add("--ygg-socks"); add("127.0.0.1:${Ygg.NODE_SOCKS}") }
+            if (target == null) add("--no-exit")
             add("--mtu"); add("1500")
             add("-v"); add("warn")
         }
@@ -451,7 +461,8 @@ class YggService : VpnService() {
                     }
                 }
             }).start()
-        State.log("vpn", "интерфейс поднят, выход через [${target.first}]:${target.second}")
+        State.log("vpn", if (target == null) "интерфейс поднят: только сайты Yggdrasil и ALFIS"
+            else "интерфейс поднят, выход через [${target.first}]:${target.second}" + if (prefs.yggSites) ", сайты Yggdrasil и ALFIS — через свой узел" else "")
     }
 
     /** Hand the VPN fd to the helper over its control socket (SCM_RIGHTS). */

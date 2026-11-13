@@ -93,10 +93,12 @@ object Ygg {
 
     /**
      * Access to a closed exit (see ygghelper access.rs), through the node's SOCKS (no VPN needed):
-     * `ok`, `pending` (a request is with the owner), `bad_key`, `expired`, `other_device`,
-     * `closed` (no key and [ask] off: nothing was sent), or `error: …`.
+     * code `ok`, `pending` (a request is with the owner), `bad_key`, `expired`, `other_device`,
+     * `closed` (no key and [ask] off: nothing was sent), or `error: …`; and when the access ends
+     * (unix seconds, 0: public or unknown). With [ask] a missing key becomes a request to the
+     * owner, with [message] for them.
      */
-    fun probeAccess(server: String, key: String?, ask: Boolean): String = try {
+    fun probeAccess(server: String, key: String?, ask: Boolean, message: String = ""): Pair<String, Long> = try {
         val a = (InetAddress.getByName(server) as Inet6Address).address
         Socket().use { s ->
             s.connect(InetSocketAddress("127.0.0.1", NODE_SOCKS), 1000)
@@ -105,25 +107,41 @@ object Ygg {
             val i = s.getInputStream()
             o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
             o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((PORT shr 8).toByte(), (PORT and 0xff).toByte()))
-            if (readN(i, 22)[1].toInt() != 0) return "error: сервер недоступен"
-            val withKey = !key.isNullOrEmpty() || ask
-            o.write(if (withKey) byteArrayOf(5, 2, 0, 2) else byteArrayOf(5, 1, 0))
-            val m = readN(i, 2)[1].toInt() and 0xff
-            when (m) {
-                0 -> "ok"
-                2 -> {
-                    val u = deviceName().toByteArray().take(255).toByteArray()
-                    val k = (key ?: "").toByteArray()
-                    o.write(byteArrayOf(1, u.size.toByte()) + u + byteArrayOf(k.size.toByte()) + k)
-                    when (readN(i, 2)[1].toInt()) {
-                        0 -> "ok"; 1 -> "pending"; 2 -> "bad_key"; 3 -> "expired"; 4 -> "other_device"
-                        else -> "error: неизвестный ответ"
-                    }
+            if (readN(i, 22)[1].toInt() != 0) return "error: сервер недоступен" to 0L
+            val user = (if (message.isBlank()) deviceName() else deviceName() + "\u001f" + message.trim().replace('\n', ' '))
+                .toByteArray().let { it.copyOf(minOf(it.size, 255)) }
+            val k = (key ?: "").toByteArray()
+            // 0x80: our own method (status and the key's end); 2 for older servers.
+            o.write(byteArrayOf(5, 3, 0x80.toByte(), 2, 0))
+            when (readN(i, 2)[1].toInt() and 0xff) {
+                0 -> "ok" to 0L
+                0x80 -> {
+                    o.write(byteArrayOf(1, if (ask) 1 else 0, user.size.toByte()) + user + byteArrayOf(k.size.toByte()) + k)
+                    val r = readN(i, 10)
+                    val exp = java.nio.ByteBuffer.wrap(r, 2, 8).long
+                    codeName(r[1].toInt()) to exp
                 }
-                else -> "closed"
+                2 -> {
+                    if (k.isEmpty() && !ask) return "closed" to 0L
+                    o.write(byteArrayOf(1, user.size.toByte()) + user + byteArrayOf(k.size.toByte()) + k)
+                    codeName(readN(i, 2)[1].toInt()) to 0L
+                }
+                else -> "closed" to 0L
             }
         }
-    } catch (e: Exception) { "error: ${e.message ?: e.javaClass.simpleName}" }
+    } catch (e: Exception) { "error: ${e.message ?: e.javaClass.simpleName}" to 0L }
+
+    private fun codeName(c: Int) = when (c) {
+        0 -> "ok"; 1 -> "pending"; 2 -> "bad_key"; 3 -> "expired"; 4 -> "other_device"; 5 -> "closed"
+        else -> "error: неизвестный ответ $c"
+    }
+
+    /** " · ключ ещё 12д 3ч" for an access that ends (0: no end date). */
+    fun keyLeft(expires: Long): String {
+        if (expires <= 0) return ""
+        val left = expires - System.currentTimeMillis() / 1000
+        return if (left > 0) " · ключ ещё ${dur(left)}" else " · ключ истёк"
+    }
 
     fun accessText(code: String?): String = when {
         code == null -> "проверяю…"
@@ -132,7 +150,7 @@ object Ygg {
         code == "bad_key" -> "неверный ключ доступа"
         code == "expired" -> "срок ключа истёк — попросите владельца продлить"
         code == "other_device" -> "ключ уже привязан к другому устройству"
-        code == "closed" -> "сервер закрыт: нужен ключ от владельца"
+        code == "closed" -> "сервер закрыт: нужен ключ или запрос доступа"
         else -> "не проверен (${code.removePrefix("error: ")})"
     }
 

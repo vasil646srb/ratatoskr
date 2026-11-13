@@ -60,7 +60,7 @@ pub struct St {
     tracker_exits: Vec<(String, Option<u64>, bool)>,
     tracker_status: Option<String>,
     /// Client: access to the selected server (server, `ok`/`pending`/… or an error, when).
-    access: Option<(String, String, Instant)>,
+    access: Option<(String, String, Instant, u64)>,
     /// A newer release on GitHub (`{version, url, page, notes}`).
     update: Option<Value>,
 }
@@ -363,6 +363,8 @@ struct Vpn {
     ctl: Arc<Mutex<Option<UnixStream>>>,
     ipv6: bool,
     sig: String,
+    /// Yggdrasil-only: no policy routing to undo.
+    only: bool,
 }
 
 #[cfg(unix)]
@@ -446,16 +448,36 @@ fn routes(st: &Shared, add: bool, ipv6: bool) {
 fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vpn, String> {
     let tun = open_tun(config::TUN_NAME).map_err(|e| format!("TUN {}: {e}", config::TUN_NAME))?;
     let dev = config::TUN_NAME;
+    let (ygg, only) = (cfg.client.ygg_sites || cfg.client.ygg_only, cfg.client.ygg_only);
     run(st, &["ip", "addr", "replace", "10.111.222.2/24", "dev", dev]);
-    if cfg.client.ipv6 {
+    if cfg.client.ipv6 || ygg {
         run(st, &["ip", "-6", "addr", "replace", "fd59:7967:6772::2/64", "dev", dev]);
     }
     run(st, &["ip", "link", "set", dev, "mtu", "1500", "up"]);
-    routes(st, true, cfg.client.ipv6);
+    if only {
+        // Only Yggdrasil into the tunnel: 200::/7 (a yggdrasil-go on this host keeps its own
+        // route, ours has a higher metric) and tun2proxy's names for ALFIS sites.
+        run(st, &["ip", "-6", "route", "replace", "200::/7", "dev", dev, "metric", "2000"]);
+        run(st, &["ip", "route", "replace", "198.18.0.0/15", "dev", dev]);
+    } else {
+        routes(st, true, cfg.client.ipv6);
+        if ygg && !cfg.client.ipv6 {
+            // IPv6 to the internet is off, Yggdrasil still goes into the tunnel.
+            run(st, &["ip", "-6", "route", "replace", "200::/7", "dev", dev, "table", &config::TABLE.to_string()]);
+        }
+    }
     if have("resolvectl") {
         run(st, &["resolvectl", "dns", dev, "10.111.222.53"]);
-        run(st, &["resolvectl", "domain", dev, "~."]);
-        run(st, &["resolvectl", "default-route", dev, "yes"]);
+        if only {
+            let zones: Vec<String> = ALFIS_ZONES.iter().map(|z| format!("~{z}")).collect();
+            let mut a = vec!["resolvectl", "domain", dev];
+            a.extend(zones.iter().map(String::as_str));
+            run(st, &a);
+            run(st, &["resolvectl", "default-route", dev, "no"]);
+        } else {
+            run(st, &["resolvectl", "domain", dev, "~."]);
+            run(st, &["resolvectl", "default-route", dev, "yes"]);
+        }
     } else {
         log(st, "vpn", "нет resolvectl (systemd-resolved): DNS идёт мимо VPN-DNS, но запросы всё равно через туннель");
     }
@@ -472,13 +494,14 @@ fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vp
         "--socks".into(),
         format!("127.0.0.1:{}", config::CLIENT_SOCKS),
     ];
-    if cfg.client.udp {
+    if cfg.client.udp && !cfg.client.ygg_only {
         cmd.push("--udpgw".into());
         cmd.push(format!("127.0.0.1:{}", config::UDPGW));
     }
     if cfg.client.ipv6 {
         cmd.push("--ipv6".into());
     }
+    cmd.extend(ygg_args(cfg));
     cmd.extend(["--mtu".into(), "1500".into(), "-v".into(), "warn".into()]);
     let ctl: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
     use std::os::fd::AsRawFd;
@@ -495,15 +518,19 @@ fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vp
             st2.lock().unwrap().vpn_active = true;
         }
     }));
-    log(st, "vpn", &format!("интерфейс {dev} поднят, выход через {}", cfg.client.server));
-    Ok(Vpn { tun, helper, ctl, ipv6: cfg.client.ipv6, sig: vpn_sig(cfg) })
+    log(st, "vpn", &if only { format!("интерфейс {dev} поднят: только сайты Yggdrasil и ALFIS") } else {
+        format!("интерфейс {dev} поднят, выход через {}{}", cfg.client.server, if ygg { ", сайты Yggdrasil и ALFIS — через свой узел" } else { "" })
+    });
+    Ok(Vpn { tun, helper, ctl, ipv6: cfg.client.ipv6, sig: vpn_sig(cfg), only })
 }
 
 #[cfg(unix)]
 fn vpn_down(st: &Shared, v: Vpn) {
     *v.ctl.lock().unwrap() = None;
     v.helper.stop(st, "tun", "VPN выключен");
-    routes(st, false, v.ipv6);
+    if !v.only {
+        routes(st, false, v.ipv6);
+    }
     if have("resolvectl") {
         quiet(&["resolvectl", "revert", config::TUN_NAME]);
     }
@@ -516,6 +543,7 @@ fn vpn_down(st: &Shared, v: Vpn) {
 struct Vpn {
     helper: Proc,
     sig: String,
+    only: bool,
 }
 
 /// Interface index of the adapter with this alias (0 while it does not exist).
@@ -536,7 +564,7 @@ fn if_index(alias: &str) -> u32 {
 /// Routes and DNS for the Wintun adapter once it exists. They are bound to the adapter, so
 /// Windows drops them by itself when ygghelper removes it.
 #[cfg(windows)]
-fn win_net_setup(st: &Shared) {
+fn win_net_setup(st: &Shared, only: bool) {
     let dev = config::TUN_NAME;
     let t0 = Instant::now();
     let idx = loop {
@@ -551,6 +579,18 @@ fn win_net_setup(st: &Shared) {
         std::thread::sleep(Duration::from_millis(300));
     };
     let i = idx.to_string();
+    if only {
+        // Only Yggdrasil: 200::/7 into the tunnel, and the ALFIS zones' DNS to the adapter
+        // (NRPT rules); the rest of the traffic and DNS stays as it is.
+        quiet(&["netsh", "interface", "ipv6", "add", "route", "prefix=200::/7", &format!("interface={i}"), "metric=1", "store=active"]);
+        let zones = ALFIS_ZONES.iter().map(|z| format!("'.{z}'")).collect::<Vec<_>>().join(",");
+        run(st, &["powershell", "-NoProfile", "-Command", &format!(
+            "Get-DnsClientNrptRule | Where-Object Comment -eq 'Ratatoskr' | Remove-DnsClientNrptRule -Force; Add-DnsClientNrptRule -Namespace {zones} -NameServers 10.0.0.1 -Comment 'Ratatoskr'")]);
+        quiet(&["ipconfig", "/flushdns"]);
+        st.lock().unwrap().vpn_active = true;
+        log(st, "vpn", &format!("адаптер {dev} (#{idx}): только Yggdrasil (200::/7) и имена ALFIS"));
+        return;
+    }
     run(st, &["netsh", "interface", "ipv4", "set", "interface", &i, "metric=1"]);
     for p in ["0.0.0.0/1", "128.0.0.0/1"] {
         run(st, &["netsh", "interface", "ipv4", "add", "route", &format!("prefix={p}"), &format!("interface={i}"), "nexthop=10.0.0.1", "metric=1", "store=active"]);
@@ -580,38 +620,66 @@ fn vpn_up(st: &Shared, _dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<V
         "--dns-addr".into(),
         "8.8.8.8".into(),
     ];
-    if cfg.client.udp {
+    let only = cfg.client.ygg_only;
+    if cfg.client.udp && !only {
         cmd.push("--udpgw".into());
         cmd.push(format!("127.0.0.1:{}", config::UDPGW));
     }
-    if cfg.client.ipv6 {
+    // DNS answers are real here (over TCP): IPv6 on keeps the AAAA of Yggdrasil sites.
+    if cfg.client.ipv6 || cfg.client.ygg_sites || only {
         cmd.push("--ipv6".into());
     }
+    cmd.extend(ygg_args(cfg));
     cmd.extend(["--mtu".into(), "1500".into(), "-v".into(), "warn".into()]);
     let st2 = st.clone();
     let helper = Proc::start(st, "tun", cmd, Arc::new(move |l: &str| {
         helper_line(&st2, "tun", l);
         if l.starts_with("STATE tun running") {
             let st3 = st2.clone();
-            std::thread::spawn(move || win_net_setup(&st3));
+            std::thread::spawn(move || win_net_setup(&st3, only));
         } else if l == "STATE tun stopped" {
             st2.lock().unwrap().vpn_active = false;
         }
     }));
-    log(st, "vpn", &format!("VPN включается, выход через {}", cfg.client.server));
-    Ok(Vpn { helper, sig: vpn_sig(cfg) })
+    log(st, "vpn", &if only { "VPN включается: только сайты Yggdrasil и ALFIS".to_string() } else { format!("VPN включается, выход через {}", cfg.client.server) });
+    Ok(Vpn { helper, sig: vpn_sig(cfg), only })
 }
 
 #[cfg(windows)]
 fn vpn_down(st: &Shared, v: Vpn) {
     v.helper.stop(st, "tun", "VPN выключен");
+    if v.only {
+        quiet(&["powershell", "-NoProfile", "-Command", "Get-DnsClientNrptRule | Where-Object Comment -eq 'Ratatoskr' | Remove-DnsClientNrptRule -Force"]);
+    }
     quiet(&["ipconfig", "/flushdns"]);
     st.lock().unwrap().vpn_active = false;
 }
 
 fn vpn_sig(cfg: &Config) -> String {
     // The server is not part of it: the node switches servers by itself (connect.txt).
-    format!("{}|{}", cfg.client.udp, cfg.client.ipv6)
+    let c = &cfg.client;
+    format!("{}|{}|{}|{}|{}", c.udp, c.ipv6, c.ygg_sites, c.ygg_only, c.alfis.join(","))
+}
+
+/// ALFIS zones: on Linux and Windows only these names go to the tunnel's DNS in the
+/// Yggdrasil-only mode (the rest of DNS stays as it is).
+const ALFIS_ZONES: &[&str] = &["ygg", "anon", "btn", "conf", "index", "merch", "mirror", "mob", "screen", "srv"];
+
+/// ygghelper tun options for Yggdrasil sites (router in front of tun2proxy, see router.rs).
+fn ygg_args(cfg: &Config) -> Vec<String> {
+    let c = &cfg.client;
+    if !c.ygg_sites && !c.ygg_only {
+        return Vec::new();
+    }
+    let mut a = vec!["--ygg-socks".to_string(), format!("127.0.0.1:{}", config::NODE_SOCKS)];
+    let res: Vec<String> = c.alfis.iter().filter_map(|x| config::parse_server(x)).map(|x| x.to_string()).collect();
+    if !res.is_empty() {
+        a.extend(["--alfis".into(), res.join(",")]);
+    }
+    if c.ygg_only {
+        a.push("--no-exit".into());
+    }
+    a
 }
 
 fn helper_line(st: &Shared, tag: &str, l: &str) {
@@ -803,16 +871,17 @@ impl Daemon {
     }
 
     fn reconcile(&mut self, cfg: &Config) {
-        let client = cfg.client.enabled && config::parse_server(&cfg.client.server).is_some();
+        let with_exit = config::parse_server(&cfg.client.server).is_some() && !cfg.client.ygg_only;
+        let client = cfg.client.enabled && (with_exit || cfg.client.ygg_only);
         if cfg.client.enabled && !client {
             error(&self.st, "vpn", "не задан адрес сервера выхода");
         }
         let any = client || cfg.server.enabled || cfg.network.keep_node;
 
         write_monitors(&self.st, &self.dir, cfg);
-        let line = if client { format!("[{}]:{}", cfg.client.server.trim(), config::PORT) } else { String::new() };
+        let line = if client && with_exit { format!("[{}]:{}", cfg.client.server.trim(), config::PORT) } else { String::new() };
         if platform::write_if_changed(&self.dir.join("connect.txt"), &line)
-            && client {
+            && client && with_exit {
                 log(&self.st, "vpn", &format!("сервер выхода: {} (узел не перезапускается)", cfg.client.server));
                 self.st.lock().unwrap().server_rtt = None;
             }
@@ -988,9 +1057,10 @@ fn access_cmd(req: &Value, st: &Shared) -> Value {
            "now": t, "server": server, "risk": access::PUBLIC_RISK_RU})
 }
 
-/// Client: ask the selected server for access through the node (`--socks`): our address with
-/// access → ok; else the key (or, without one, a request to the owner).
-pub fn probe_access(server: &str, key: &str, device: &str) -> Result<crate::access::Auth, String> {
+/// Client: ask a server about access through the node (`--socks`): our address with access →
+/// ok; else the key (or, without one and with `record`, a request with `message` to the owner).
+/// Also when the access ends (unix time; 0: public or unknown).
+pub fn probe_access(server: &str, key: &str, device: &str, message: &str, record: bool) -> Result<(crate::access::Auth, u64), String> {
     let ip: std::net::Ipv6Addr = server.trim().parse().map_err(|_| "неверный адрес сервера")?;
     let mut s = TcpStream::connect_timeout(&([127, 0, 0, 1], config::NODE_SOCKS).into(), Duration::from_secs(2)).map_err(|e| format!("узел: {e}"))?;
     s.set_read_timeout(Some(Duration::from_secs(40))).ok();
@@ -1006,19 +1076,35 @@ pub fn probe_access(server: &str, key: &str, device: &str) -> Result<crate::acce
     if b[1] != 0 {
         return Err("сервер недоступен".into());
     }
-    s.write_all(&[5, 2, 0, 2]).map_err(|e| e.to_string())?;
+    let user = if message.trim().is_empty() { device.to_string() } else { format!("{device}\x1f{}", message.trim()) };
+    let (u, k) = (&user.as_bytes()[..user.len().min(255)], &key.as_bytes()[..key.len().min(255)]);
+    // 0x80: our own method (status and the key's end); 2 for older servers.
+    s.write_all(&[5, 3, 0x80, 2, 0]).map_err(|e| e.to_string())?;
     s.read_exact(&mut b[..2]).map_err(|_| "сервер не ответил".to_string())?;
     match b[1] {
-        0 => Ok(crate::access::Auth::Ok),
+        0 => Ok((crate::access::Auth::Ok, 0)),
+        0x80 => {
+            let mut m = vec![1, record as u8, u.len() as u8];
+            m.extend_from_slice(u);
+            m.push(k.len() as u8);
+            m.extend_from_slice(k);
+            s.write_all(&m).map_err(|e| e.to_string())?;
+            let mut r = [0u8; 10];
+            s.read_exact(&mut r).map_err(|_| "сервер не ответил".to_string())?;
+            let a = crate::access::Auth::from_code(r[1]).ok_or_else(|| format!("неизвестный ответ {}", r[1]))?;
+            Ok((a, u64::from_be_bytes(r[2..10].try_into().unwrap())))
+        }
         2 => {
-            let (u, k) = (device.as_bytes(), key.as_bytes());
-            let mut m = vec![1, u.len().min(255) as u8];
-            m.extend_from_slice(&u[..u.len().min(255)]);
-            m.push(k.len().min(255) as u8);
-            m.extend_from_slice(&k[..k.len().min(255)]);
+            if key.is_empty() && !record {
+                return Ok((crate::access::Auth::Closed, 0));
+            }
+            let mut m = vec![1, u.len() as u8];
+            m.extend_from_slice(u);
+            m.push(k.len() as u8);
+            m.extend_from_slice(k);
             s.write_all(&m).map_err(|e| e.to_string())?;
             s.read_exact(&mut b[..2]).map_err(|_| "сервер не ответил".to_string())?;
-            crate::access::Auth::from_code(b[1]).ok_or_else(|| format!("неизвестный ответ {}", b[1]))
+            crate::access::Auth::from_code(b[1]).map(|a| (a, 0)).ok_or_else(|| format!("неизвестный ответ {}", b[1]))
         }
         _ => Err("сервер не принимает ключи (старая версия?)".into()),
     }
@@ -1031,6 +1117,7 @@ pub fn access_text(code: &str) -> &'static str {
         "bad_key" => "неверный ключ доступа",
         "expired" => "срок ключа истёк — попросите владельца продлить",
         "other_device" => "этот ключ уже привязан к другому устройству",
+        "closed" => "сервер закрыт: нужен ключ или запрос доступа",
         _ => "",
     }
 }
@@ -1042,7 +1129,7 @@ fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
         std::thread::sleep(Duration::from_secs(2));
         let c = cfg.lock().unwrap().client.clone();
         let server = c.server.trim().to_string();
-        if !c.enabled || config::parse_server(&server).is_none() || !st.lock().unwrap().node_running {
+        if !c.enabled || c.ygg_only || config::parse_server(&server).is_none() || !st.lock().unwrap().node_running {
             last = None;
             continue;
         }
@@ -1058,9 +1145,9 @@ fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
         if !wait.is_zero() {
             continue;
         }
-        let code = match probe_access(&server, &key, &config::device_name()) {
-            Ok(a) => a.name().to_string(),
-            Err(e) => format!("error: {e}"),
+        let (code, exp) = match probe_access(&server, &key, &config::device_name(), "", true) {
+            Ok((a, exp)) => (a.name().to_string(), exp),
+            Err(e) => (format!("error: {e}"), 0),
         };
         if last.as_ref().map(|l| (&l.0, &l.1)) != Some((&sig, &code)) {
             let text = access_text(&code);
@@ -1068,7 +1155,7 @@ fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
                 if code == "ok" { log(&st, "access", &format!("{server}: {text}")) } else { error(&st, "access", &format!("{server}: {text}")) }
             }
         }
-        st.lock().unwrap().access = Some((server, code.clone(), Instant::now()));
+        st.lock().unwrap().access = Some((server, code.clone(), Instant::now(), exp));
         last = Some((sig, code, Instant::now()));
     }
 }
@@ -1102,8 +1189,9 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
                    "access": access_summary()},
         "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "active": s.vpn_active,
                    "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
-                   "servers": cfg.client.servers,
-                   "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone())},
+                   "servers": cfg.client.servers, "ygg_sites": cfg.client.ygg_sites, "ygg_only": cfg.client.ygg_only,
+                   "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone()),
+                   "access_expires": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.3)},
         "rtt": s.node_rtt,
         "trackers": {"enabled": cfg.network.use_trackers, "list": cfg.network.trackers, "status": s.tracker_status,
                      "exits": s.tracker_exits.iter().map(|(a, r, p)| json!({"address": a, "tracker_rtt_ms": r, "public": p})).collect::<Vec<_>>()},
@@ -1151,6 +1239,17 @@ fn handle_conn(conn: platform::Stream, st: Shared, cfg: Arc<Mutex<Config>>, tx: 
                 json!({"ok": true})
             }
             "access" => access_cmd(&req, &st),
+            // Client: an access request with a message to a server's owner.
+            "request_access" => {
+                let server = req["server"].as_str().unwrap_or("").to_string();
+                match probe_access(&server, "", &config::device_name(), req["message"].as_str().unwrap_or(""), true) {
+                    Ok((a, exp)) => {
+                        log(&st, "access", &format!("{server}: запрос доступа — {}", access_text(a.name())));
+                        json!({"status": a.name(), "text": access_text(a.name()), "expires": exp})
+                    }
+                    Err(e) => json!({"error": e}),
+                }
+            }
             "refresh_trackers" => {
                 let _ = tx.send(Msg::RefreshTrackers);
                 json!({"ok": true})

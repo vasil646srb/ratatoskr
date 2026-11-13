@@ -111,6 +111,16 @@ pub fn mbit(bytes_per_sec: u64) -> String {
     }
 }
 
+/// The client's access to its server: "ключ ещё 12д 3ч" (0: no end date known).
+pub fn key_left(expires: u64) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    match expires {
+        0 => String::new(),
+        e if e > now => format!(" · ключ ещё {}", dur(e - now)),
+        _ => " · ключ истёк".into(),
+    }
+}
+
 pub fn dur(s: u64) -> String {
     match s {
         s if s < 60 => format!("{s}с"),

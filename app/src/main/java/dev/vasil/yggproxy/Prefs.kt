@@ -22,6 +22,10 @@ class Prefs(ctx: Context) {
     var server: String get() = s("server", ""); set(v) = put { putString("server", v.trim()) }
     var udp: Boolean get() = b("udp", true); set(v) = put { putBoolean("udp", v) }
     var ipv6: Boolean get() = b("ipv6", true); set(v) = put { putBoolean("ipv6", v) }
+    /** Yggdrasil sites (200::/7) and ALFIS names (.ygg, .anon…) through our own node, next to the internet. */
+    var yggSites: Boolean get() = b("ygg_sites", true); set(v) = put { putBoolean("ygg_sites", v) }
+    /** VPN only for Yggdrasil sites, without an exit server. */
+    var yggOnly: Boolean get() = b("ygg_only", false); set(v) = put { putBoolean("ygg_only", v) }
     var excludedApps: String get() = s("excluded", ""); set(v) = put { putString("excluded", v) }
     /** Saved exit servers (Yggdrasil addresses, one per line); [server] is the selected one. */
     var servers: String get() = s("servers", server); set(v) = put { putString("servers", v) }

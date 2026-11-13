@@ -24,7 +24,7 @@ object State {
     /** Exits the trackers list as public (anyone may use them); the rest need a key. */
     @Volatile var trackerPublic: Set<String> = emptySet()
     /** Client: access to the selected server — (server, `ok`/`pending`/… or `error: …`). */
-    @Volatile var access: Pair<String, String>? = null
+    @Volatile var access: Triple<String, String, Long>? = null
     @Volatile var trackerStatus: String = "ещё не запрашивались"
     @Volatile var trackerAt = 0L
     /** Last time public peers were taken from a tracker (hourly). */

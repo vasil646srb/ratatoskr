@@ -38,6 +38,7 @@
 
 mod access;
 mod limit;
+mod router;
 mod udpgw_server;
 
 use std::io::Write;
@@ -69,7 +70,8 @@ const USAGE: &str = "usage:
                    [--proxy-protocol] [--limits FILE] [--access FILE] [--fwmark N] [-v LEVEL]
   ygghelper access FILE list|new NAME DAYS|approve ADDR DAYS [NAME]|renew ID [DAYS]|unbind ID|
                         revoke ID|deny ADDR|public on --accept-risk|public off
-  ygghelper tun --ctl PATH --socks ADDR [--udpgw ADDR] [--mtu N] [--ipv6] [-v LEVEL]";
+  ygghelper tun --ctl PATH --socks ADDR [--udpgw ADDR] [--mtu N] [--ipv6] [-v LEVEL]
+                [--ygg-socks ADDR [--alfis IP,IP] [--no-exit]]";
 
 struct Opts {
     socks: Option<SocketAddr>,
@@ -78,6 +80,12 @@ struct Opts {
     proxy_protocol: bool,
     limits: Option<String>,
     access: Option<String>,
+    /// tun: the node's SOCKS into Yggdrasil — Yggdrasil addresses and ALFIS names go there.
+    ygg_socks: Option<SocketAddr>,
+    /// tun: ALFIS resolvers (Yggdrasil addresses); default: router::RESOLVERS.
+    alfis: Vec<std::net::Ipv6Addr>,
+    /// tun: Yggdrasil only — no exit, the rest of the tunnel's traffic goes direct.
+    no_exit: bool,
     fwmark: u32,
     ctl: Option<String>,
     name: Option<String>,
@@ -93,7 +101,7 @@ struct Opts {
 }
 
 fn parse(args: &[String]) -> Opts {
-    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
+    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, ygg_socks: None, alfis: Vec::new(), no_exit: false, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
     let mut it = args.iter();
     let addr = |v: Option<&String>, f: &str| -> SocketAddr {
         v.and_then(|s| s.parse().ok()).unwrap_or_else(|| die(&format!("{f}: want IP:PORT")))
@@ -111,6 +119,11 @@ fn parse(args: &[String]) -> Opts {
                     .unwrap_or_else(|| die("--fwmark: want N or 0xN"))
             }
             "--limits" => o.limits = Some(it.next().cloned().unwrap_or_else(|| die("--limits: want FILE"))),
+            "--ygg-socks" => o.ygg_socks = Some(addr(it.next(), "--ygg-socks")),
+            "--alfis" => {
+                o.alfis = it.next().map(|v| v.split(',').filter_map(|a| a.trim().parse().ok()).collect()).unwrap_or_default()
+            }
+            "--no-exit" => o.no_exit = true,
             "--access" => o.access = Some(it.next().cloned().unwrap_or_else(|| die("--access: want FILE"))),
             "--ctl" => o.ctl = Some(it.next().cloned().unwrap_or_else(|| die("--ctl: want PATH"))),
             "--dns" => o.dns = it.next().cloned().filter(|d| d == "virtual" || d == "over-tcp").unwrap_or_else(|| die("--dns: virtual or over-tcp")),
@@ -152,6 +165,8 @@ fn main() {
     let res = match cmd.as_str() {
         "server" => rt.block_on(server_main(o)),
         "tun" => tun_main(&rt, o),
+        // Testing aid: only the router (prints `ROUTER addr`), until killed.
+        "router" => proxy_addr(&rt, &o).map(|_| rt.block_on(std::future::pending::<()>())),
         _ => die(USAGE),
     };
     if let Err(e) = res {
@@ -295,18 +310,19 @@ impl Gate {
         self.cur.lock().unwrap().0.granted(addr, access::now())
     }
 
-    /// Method 2: bind a key or record a request (written to the file).
-    async fn check(self: &Arc<Self>, addr: String, device: String, secret: String) -> access::Auth {
+    /// Bind a key or record a request (written to the file); also when the access ends.
+    async fn check(self: &Arc<Self>, addr: String, user: String, secret: String, record: bool) -> (access::Auth, u64) {
         let g = self.clone();
         let r = tokio::task::spawn_blocking(move || {
             let mut changed = false;
             let res = access::Access::update(&g.path, |a| {
-                let (r, c) = a.check(&addr, &device, &secret, access::now());
+                let t = access::now();
+                let (r, c) = a.check(&addr, &user, &secret, record, t);
                 changed = c;
-                (r, a.keys.iter().find(|k| k.addr.as_deref() == Some(addr.as_str())).map(|k| k.id.clone()))
+                (r, a.keys.iter().find(|k| k.addr.as_deref() == Some(addr.as_str())).map(|k| k.id.clone()), a.expires_of(&addr, t).unwrap_or(0))
             });
             match res {
-                Ok((r, id)) => {
+                Ok((r, id, exp)) => {
                     if changed {
                         match r {
                             access::Auth::Ok => out(&format!("ACCESS bind {} {addr}", id.unwrap_or_default())),
@@ -314,16 +330,20 @@ impl Gate {
                         }
                         g.reload_now();
                     }
-                    r
+                    (r, exp)
                 }
                 Err(e) => {
                     log::warn!("access file: {e}");
-                    access::Auth::Pending
+                    (access::Auth::Pending, 0)
                 }
             }
         })
         .await;
-        r.unwrap_or(access::Auth::Pending)
+        r.unwrap_or((access::Auth::Pending, 0))
+    }
+
+    fn expires_of(&self, addr: &str) -> u64 {
+        self.cur.lock().unwrap().0.expires_of(addr, access::now()).unwrap_or(0)
     }
 
     fn reload_now(&self) {
@@ -509,7 +529,27 @@ async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, l
         }
         let mut m = vec![0u8; h[1] as usize];
         c.read_exact(&mut m).await?;
-        if open && m.contains(&0) {
+        if m.contains(&0x80) && peer.is_some() {
+            // Ratatoskr client: check / key / request, with the key's end date (see access.rs).
+            c.write_all(&[5, 0x80]).await?;
+            let mut v = [0u8; 3];
+            c.read_exact(&mut v).await?;
+            let mut user = vec![0u8; v[2] as usize];
+            c.read_exact(&mut user).await?;
+            let mut l = [0u8; 1];
+            c.read_exact(&mut l).await?;
+            let mut pass = vec![0u8; l[0] as usize];
+            c.read_exact(&mut pass).await?;
+            let (res, exp) = match &policy.gate {
+                Some(g) if open => (access::Auth::Ok, g.expires_of(&addr)),
+                Some(g) => g.check(addr.clone(), String::from_utf8_lossy(&user).to_string(), String::from_utf8_lossy(&pass).to_string(), v[1] & 1 == 1).await,
+                None => (access::Auth::Ok, 0),
+            };
+            let mut r = vec![1, res as u8];
+            r.extend_from_slice(&exp.to_be_bytes());
+            c.write_all(&r).await?;
+            return Err(std::io::Error::other(format!("access check: {}", res.name())));
+        } else if open && m.contains(&0) {
             c.write_all(&[5, 0]).await?;
         } else if m.contains(&2) && (open || peer.is_some()) {
             // RFC 1929: user = device name, password = key (empty: ask the owner).
@@ -525,7 +565,7 @@ async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, l
             let res = match (&policy.gate, open) {
                 (Some(g), false) => {
                     let (u, p) = (String::from_utf8_lossy(&user).to_string(), String::from_utf8_lossy(&pass).to_string());
-                    g.check(addr.clone(), u, p).await
+                    g.check(addr.clone(), u, p, true).await.0
                 }
                 _ => access::Auth::Ok,
             };
@@ -783,9 +823,21 @@ fn tun2proxy_args(o: &Opts, socks: SocketAddr, dev: &[String]) -> Result<tun2pro
     <tun2proxy::Args as clap::Parser>::try_parse_from(&cli).map_err(|e| format!("tun2proxy args: {e}"))
 }
 
+/// What tun2proxy talks to: the exit's SOCKS, or, with `--ygg-socks`, the router in front of
+/// it (Yggdrasil and ALFIS to the node, see router.rs).
+fn proxy_addr(rt: &tokio::runtime::Runtime, o: &Opts) -> Result<SocketAddr, String> {
+    let Some(ygg) = o.ygg_socks else { return o.socks.ok_or("tun: --socks required".to_string()) };
+    let exit = if o.no_exit { None } else { Some(o.socks.ok_or("tun: --socks required (or --no-exit)")?) };
+    let res = if o.alfis.is_empty() { router::RESOLVERS.iter().filter_map(|a| a.parse().ok()).collect() } else { o.alfis.clone() };
+    let r = Arc::new(router::Router::new(exit, ygg, res));
+    let a = rt.block_on(r.start()).map_err(|e| format!("router: {e}"))?;
+    out(&format!("ROUTER {a} yggdrasil={ygg} exit={}", exit.map(|e| e.to_string()).unwrap_or("direct".into())));
+    Ok(a)
+}
+
 #[cfg(windows)]
 fn tun_main(rt: &tokio::runtime::Runtime, o: Opts) -> Result<(), String> {
-    let socks = o.socks.ok_or("tun: --socks required")?;
+    let socks = proxy_addr(rt, &o)?;
     let name = o.name.clone().unwrap_or_else(|| "yggproxy0".into());
     let args = tun2proxy_args(&o, socks, &["--tun".into(), name.clone()])?;
     unsafe { tun2proxy::tun2proxy_set_traffic_status_callback(2, Some(traffic_cb), std::ptr::null_mut()) };
@@ -825,7 +877,7 @@ fn tun_main(rt: &tokio::runtime::Runtime, o: Opts) -> Result<(), String> {
     use std::os::unix::net::UnixListener;
 
     let ctl = o.ctl.clone().ok_or("tun: --ctl required")?;
-    let socks = o.socks.ok_or("tun: --socks required")?;
+    let socks = proxy_addr(rt, &o)?;
     let _ = std::fs::remove_file(&ctl);
     let listener = UnixListener::bind(&ctl).map_err(|e| format!("bind {ctl}: {e}"))?;
     out(&format!("READY tun ctl={ctl}"));

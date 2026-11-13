@@ -35,7 +35,9 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy connect [АДРЕС [КЛЮЧ]]  подключиться к серверу (200:… или ссылка yggproxy://c?a=…&k=…);
                                без ключа к закрытому серверу уходит запрос владельцу;
                                без адреса — к серверу с наименьшим пингом
+  yggproxy request АДРЕС [СООБЩЕНИЕ]  запросить доступ к закрытому серверу (с сообщением владельцу)
   yggproxy forget АДРЕС        убрать сервер из сохранённых
+  yggproxy ygg                 VPN только для сайтов Yggdrasil и ALFIS (.ygg, .anon…), без сервера
   yggproxy disconnect          отключиться
   yggproxy speedtest           тест скорости до сервера (10 с приём, 10 с отдача)
 
@@ -52,7 +54,8 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy set КЛЮЧ ЗНАЧЕНИЕ   настройка сети: rtt_limit, swap_interval, swap_settle, target,
                                lan_discovery, public_peers, peers (через запятую), udp, ipv6,
                                trackers (через запятую), use_trackers, keep_node (узел без
-                               клиента и сервера: пинги серверов и трекеры)
+                               клиента и сервера: пинги серверов и трекеры), ygg_sites (сайты
+                               Yggdrasil и ALFIS рядом с интернетом), alfis (DNS ALFIS, через запятую)
   yggproxy refresh-peers       скачать публичный список пиров заново
   yggproxy update              проверить новую версию на GitHub (с sudo на Linux — установить)
   yggproxy gui                 окно (если собрано с GUI)";
@@ -134,7 +137,14 @@ fn status() -> Result<(), String> {
         println!("Сервер выхода: выключен");
     }
     let c = &s["client"];
-    if c["enabled"].as_bool() == Some(true) {
+    if c["enabled"].as_bool() == Some(true) && c["ygg_only"].as_bool() == Some(true) {
+        println!(
+            "VPN: {} — только сайты Yggdrasil и ALFIS · ↓ {} ↑ {}",
+            if c["active"].as_bool() == Some(true) { "работает" } else { "запускается" },
+            human(c["rx"].as_u64().unwrap_or(0)),
+            human(c["tx"].as_u64().unwrap_or(0))
+        );
+    } else if c["enabled"].as_bool() == Some(true) {
         println!(
             "VPN: {} → {} · ↓ {} ↑ {}",
             if c["active"].as_bool() == Some(true) { "работает" } else { "запускается" },
@@ -145,11 +155,14 @@ fn status() -> Result<(), String> {
         println!("  пинг до сервера: {}", c["server_rtt"].as_str().unwrap_or("измеряю…"));
         match c["access"].as_str() {
             Some(code) if code.starts_with("error: ") => println!("  доступ: не проверен ({})", &code[7..]),
-            Some(code) => println!("  доступ: {}", crate::daemon::access_text(code)),
+            Some(code) => println!("  доступ: {}{}", crate::daemon::access_text(code), api::key_left(c["access_expires"].as_u64().unwrap_or(0))),
             None => println!("  доступ: проверяю…"),
         }
         if let Some(sw) = c["last_swap"].as_str() {
             println!("  замена пира: {sw}");
+        }
+        if c["ygg_sites"].as_bool() == Some(true) {
+            println!("  сайты Yggdrasil и ALFIS (.ygg, .anon…): через свой узел");
         }
     } else {
         println!("VPN: выключен");
@@ -339,6 +352,9 @@ fn access(args: &[String]) -> Result<(), String> {
         for q in reqs {
             println!("  {}  {}  {} назад, попыток {}", q["addr"].as_str().unwrap_or(""), q["name"].as_str().unwrap_or(""),
                 dur(now.saturating_sub(q["last"].as_u64().unwrap_or(0))), q["count"]);
+            if let Some(m) = q["message"].as_str().filter(|m| !m.is_empty()) {
+                println!("      «{m}»");
+            }
         }
     }
     Ok(())
@@ -381,10 +397,12 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             "extra_args" => net.extra_args = val.to_string(),
             "udp" => c.client.udp = b.clone().unwrap_or(c.client.udp),
             "ipv6" => c.client.ipv6 = b.clone().unwrap_or(c.client.ipv6),
+            "ygg_sites" => c.client.ygg_sites = b.clone().unwrap_or(c.client.ygg_sites),
+            "alfis" => c.client.alfis = val.split(',').map(|s| s.trim().to_string()).filter(|s| config::parse_server(s).is_some()).collect(),
             _ => {}
         }
     })?;
-    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6"];
+    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis"];
     if !known.contains(&key) {
         return Err(format!("неизвестная настройка {key}"));
     }
@@ -457,6 +475,16 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "access" => access(args),
+        "request" => {
+            let addr = a(1).and_then(|s| config::parse_server(s)).ok_or("yggproxy request АДРЕС [СООБЩЕНИЕ]")?;
+            let msg = args.get(2..).map(|m| m.join(" ")).unwrap_or_default();
+            let r = api::request(json!({"cmd": "request_access", "server": addr.to_string(), "message": msg}))?;
+            if let Some(e) = r["error"].as_str() {
+                return Err(e.to_string());
+            }
+            println!("{addr}: {}{}", r["text"].as_str().unwrap_or(""), api::key_left(r["expires"].as_u64().unwrap_or(0)));
+            Ok(())
+        }
         "connect" => {
             let key = a(2).map(|k| crate::access::norm_secret(k)).or_else(|| a(1).and_then(|l| config::link_key(l)));
             let addr = match a(1) {
@@ -473,6 +501,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             };
             api::update(|c| {
                 c.client.enabled = true;
+                c.client.ygg_only = false;
                 c.client.server = addr.to_string();
                 if !c.client.servers.iter().any(|x| config::parse_server(x) == Some(addr)) {
                     c.client.servers.push(addr.to_string());
@@ -482,6 +511,14 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }
             })?;
             println!("подключаюсь к {addr} (порт {}) — состояние: yggproxy status", config::PORT);
+            Ok(())
+        }
+        "ygg" => {
+            api::update(|c| {
+                c.client.enabled = true;
+                c.client.ygg_only = true;
+            })?;
+            println!("VPN только для Yggdrasil: адреса 200::/7 и имена ALFIS (.ygg, .anon…) через свой узел, интернет как обычно");
             Ok(())
         }
         "disconnect" => {

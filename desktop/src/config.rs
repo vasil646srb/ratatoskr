@@ -99,11 +99,18 @@ pub struct Client {
     pub keys: std::collections::BTreeMap<String, String>,
     pub udp: bool,
     pub ipv6: bool,
+    /// Yggdrasil sites (200::/7) and ALFIS names (.ygg, .anon…) through our own node, next to
+    /// the internet through the exit.
+    pub ygg_sites: bool,
+    /// VPN only for Yggdrasil sites, without an exit server (the internet stays as it is).
+    pub ygg_only: bool,
+    /// ALFIS resolvers (Yggdrasil addresses); empty: the built-in list.
+    pub alfis: Vec<String>,
 }
 
 impl Default for Client {
     fn default() -> Self {
-        Self { enabled: false, server: String::new(), servers: Vec::new(), keys: Default::default(), udp: true, ipv6: true }
+        Self { enabled: false, server: String::new(), servers: Vec::new(), keys: Default::default(), udp: true, ipv6: true, ygg_sites: true, ygg_only: false, alfis: Vec::new() }
     }
 }
 

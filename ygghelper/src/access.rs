@@ -12,6 +12,11 @@
 //! other client must pick method 2 (RFC 1929 user/password): user = device name, password = the
 //! key, or empty for a request. The status byte tells the client what happened ([Auth]).
 //! A client offering only method 0 without access gets 0xff — nothing is recorded.
+//!
+//! Method 0x80 (private, Ratatoskr clients): `[1, mode, ulen, user, plen, key]` →
+//! `[1, status, expires: u64 BE]` (0: public or no key), then the server closes. `mode` 1 records
+//! a request when there is no access, 0 only checks ([Auth::Closed]). In both methods the user
+//! field is `device name` or `device name \x1f message to the owner`.
 
 #![allow(dead_code)] // shared with yggproxy, which uses the rest
 
@@ -49,6 +54,8 @@ pub struct Key {
 pub struct Request {
     pub addr: String,
     pub name: String,
+    /// What the device wrote to the owner.
+    pub message: String,
     pub first: u64,
     pub last: u64,
     pub count: u32,
@@ -75,6 +82,8 @@ pub enum Auth {
     Expired = 3,
     /// The key is already bound to another device.
     OtherDevice = 4,
+    /// No access and nothing recorded (a check without a request).
+    Closed = 5,
 }
 
 impl Auth {
@@ -85,6 +94,7 @@ impl Auth {
             2 => Auth::BadKey,
             3 => Auth::Expired,
             4 => Auth::OtherDevice,
+            5 => Auth::Closed,
             _ => return None,
         })
     }
@@ -95,6 +105,7 @@ impl Auth {
             Auth::BadKey => "bad_key",
             Auth::Expired => "expired",
             Auth::OtherDevice => "other_device",
+            Auth::Closed => "closed",
         }
     }
 }
@@ -126,6 +137,17 @@ pub fn new_secret() -> String {
         bits = (bits << 8) | x as u128;
     }
     (0..20).map(|i| B32[((bits >> (i * 5)) & 31) as usize] as char).collect()
+}
+
+/// The user field: `device` or `device \x1f message`.
+pub fn split_user(user: &str) -> (String, String) {
+    let (d, m) = user.split_once('\x1f').unwrap_or((user, ""));
+    (clean_name(d), clean_message(m))
+}
+
+/// A message to the owner: one paragraph, at most 200 characters.
+pub fn clean_message(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).take(200).collect::<String>().trim().to_string()
 }
 
 /// Keys are typed by hand: case, spaces and dashes don't matter.
@@ -192,15 +214,30 @@ impl Access {
         self.public || self.keys.iter().any(|k| k.addr.as_deref() == Some(addr) && k.expires > t)
     }
 
-    /// A client asked with method 2. Returns the answer and whether the file must be saved.
-    pub fn check(&mut self, addr: &str, device: &str, secret: &str, t: u64) -> (Auth, bool) {
+    /// When the address's access ends: 0 = public (no end), None = no access.
+    pub fn expires_of(&self, addr: &str, t: u64) -> Option<u64> {
+        if self.public {
+            return Some(0);
+        }
+        self.keys.iter().filter(|k| k.addr.as_deref() == Some(addr) && k.expires > t).map(|k| k.expires).max()
+    }
+
+    /// A client asked (method 2: always `record`). `user` is `device[\x1fmessage]`. Returns the
+    /// answer and whether the file must be saved.
+    pub fn check(&mut self, addr: &str, user: &str, secret: &str, record: bool, t: u64) -> (Auth, bool) {
         if self.granted(addr, t) {
             return (Auth::Ok, false);
         }
+        let (device, message) = split_user(user);
+        let device = device.as_str();
         let secret = norm_secret(secret);
         if secret.is_empty() {
             let had = self.keys.iter().any(|k| k.addr.as_deref() == Some(addr));
-            self.add_request(addr, device, t);
+            if !record {
+                let asked = self.requests.iter().any(|r| r.addr == addr);
+                return (if had { Auth::Expired } else if asked { Auth::Pending } else { Auth::Closed }, false);
+            }
+            self.add_request(addr, device, &message, t);
             return (if had { Auth::Expired } else { Auth::Pending }, true);
         }
         let Some(k) = self.keys.iter_mut().find(|k| eq_ct(&k.key, &secret)) else { return (Auth::BadKey, false) };
@@ -217,11 +254,14 @@ impl Access {
         (Auth::Ok, true)
     }
 
-    fn add_request(&mut self, addr: &str, device: &str, t: u64) {
+    fn add_request(&mut self, addr: &str, device: &str, message: &str, t: u64) {
         if let Some(r) = self.requests.iter_mut().find(|r| r.addr == addr) {
             r.last = t;
             r.count = r.count.saturating_add(1);
             r.name = clean_name(device);
+            if !message.is_empty() {
+                r.message = message.to_string();
+            }
             return;
         }
         if self.requests.len() >= MAX_REQUESTS {
@@ -230,7 +270,7 @@ impl Access {
                 self.requests.remove(i);
             }
         }
-        self.requests.push(Request { addr: addr.into(), name: clean_name(device), first: t, last: t, count: 1 });
+        self.requests.push(Request { addr: addr.into(), name: clean_name(device), message: message.to_string(), first: t, last: t, count: 1 });
     }
 
     /// New key; `addr` given = approved request (bound at once).
@@ -323,29 +363,33 @@ mod tests {
         let k = a.create("phone", 30, None, 1000);
         assert_eq!(k.key.len(), 20);
         assert!(!a.granted(A, 1000));
-        assert_eq!(a.check(A, "Pixel", &k.key.to_uppercase(), 1000), (Auth::Ok, true));
+        assert_eq!(a.check(A, "Pixel", &k.key.to_uppercase(), true, 1000), (Auth::Ok, true));
         assert!(a.granted(A, 1001));
-        assert_eq!(a.check(B, "other", &k.key, 1001), (Auth::OtherDevice, false));
-        assert_eq!(a.check(A, "Pixel", "", 1001), (Auth::Ok, false));
+        assert_eq!(a.check(B, "other", &k.key, true, 1001), (Auth::OtherDevice, false));
+        assert_eq!(a.check(A, "Pixel", "", true, 1001), (Auth::Ok, false));
         assert!(!a.granted(A, 1000 + 30 * 86400));
-        assert_eq!(a.check(A, "Pixel", &k.key, 1000 + 30 * 86400), (Auth::Expired, false));
+        assert_eq!(a.check(A, "Pixel", &k.key, true, 1000 + 30 * 86400), (Auth::Expired, false));
         a.renew(&k.id, Some(7), 5_000_000);
         assert!(a.granted(A, 5_000_001));
         a.unbind(&k.id);
-        assert_eq!(a.check(B, "new", &k.key, 5_000_002), (Auth::Ok, true));
+        assert_eq!(a.check(B, "new", &k.key, true, 5_000_002), (Auth::Ok, true));
     }
 
     #[test]
     fn request_and_approve() {
         let mut a = Access::default();
-        assert_eq!(a.check(A, "laptop\n", "", 10), (Auth::Pending, true));
-        assert_eq!(a.check(A, "laptop", "", 11), (Auth::Pending, true));
+        assert_eq!(a.check(A, "laptop", "", false, 9), (Auth::Closed, false));
+        assert!(a.requests.is_empty());
+        assert_eq!(a.check(A, "laptop\n\x1fэто Маша, пусти", "", true, 10), (Auth::Pending, true));
+        assert_eq!(a.check(A, "laptop", "", true, 11), (Auth::Pending, true));
         assert_eq!(a.requests.len(), 1);
-        assert_eq!(a.requests[0].count, 2);
-        assert_eq!(a.check(A, "x", "wrongkey", 12), (Auth::BadKey, false));
+        assert_eq!((a.requests[0].count, a.requests[0].message.as_str()), (2, "это Маша, пусти"));
+        assert_eq!(a.check(A, "x", "wrongkey", true, 12), (Auth::BadKey, false));
         let k = a.create("", 400, Some(A), 20);
         assert_eq!((k.days, k.name.as_str()), (365, "laptop"));
         assert!(a.requests.is_empty() && a.granted(A, 21));
+        assert_eq!(a.expires_of(A, 21), Some(20 + 365 * 86400));
+        assert_eq!(a.expires_of(B, 21), None);
         assert!(a.set_public(true, false, 30).is_err());
         a.set_public(true, true, 30).unwrap();
         assert!(a.granted(B, 31));
@@ -355,7 +399,7 @@ mod tests {
     fn requests_are_capped() {
         let mut a = Access::default();
         for i in 0..(MAX_REQUESTS + 5) {
-            a.check(&format!("200::{:x}", i + 1), "d", "", i as u64);
+            a.check(&format!("200::{:x}", i + 1), "d", "", true, i as u64);
         }
         assert_eq!(a.requests.len(), MAX_REQUESTS);
     }

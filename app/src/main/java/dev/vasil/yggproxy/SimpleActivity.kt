@@ -107,6 +107,53 @@ class SimpleActivity : Activity() {
                 @Suppress("DEPRECATION")
                 startActivityForResult(Intent(this, ScanActivity::class.java), REQ_SCAN)
             }
+            .setNegativeButton("Запросить доступ…") { _, _ -> requestDialog() }.show()
+    }
+
+    /** Pick a closed server (from the last attempt, else the trackers' list) to ask for access. */
+    private fun requestDialog() {
+        val seen = closedSeen
+        val list: List<Triple<String, Long?, String>> = seen.ifEmpty {
+            (State.trackerExits.map { it.first } + prefs.serverList()).distinct()
+                .filter { prefs.keyFor(it) == null && it !in State.trackerPublic }
+                .map { a -> Triple(a, State.trackerExits.firstOrNull { it.first == a }?.second?.takeIf { it >= 0 }, "closed") }
+        }
+        if (list.isEmpty()) { toast("Закрытых серверов пока нет: нажмите «Подключиться», чтобы получить список"); return }
+        val labels = list.map { (a, ping, code) ->
+            a + (ping?.let { "  —  $it мс" } ?: "") + if (code == "pending") "\n(запрос уже отправлен)" else ""
+        }
+        android.app.AlertDialog.Builder(this).setTitle("Запросить доступ к серверу")
+            .setItems(labels.toTypedArray()) { _, i -> messageDialog(list[i].first) }
+            .setNegativeButton("Отмена", null).show()
+    }
+
+    /** The request itself: a message to the owner, sent through the node (no VPN needed). */
+    private fun messageDialog(server: String) {
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+        box.addView(TextView(this).apply {
+            text = "Владелец сервера увидит название вашего устройства (${Ygg.deviceName()}) и сообщение. Когда он одобрит запрос, подключение заработает само."
+            setTextColor(Color.DKGRAY)
+        })
+        val et = android.widget.EditText(this).apply {
+            hint = "сообщение владельцу: кто вы и зачем"; textSize = 14f; minLines = 2
+            filters = arrayOf(android.text.InputFilter.LengthFilter(200))
+        }
+        box.addView(et)
+        android.app.AlertDialog.Builder(this).setTitle(server).setView(box)
+            .setPositiveButton("Отправить запрос") { _, _ ->
+                val msg = et.text.toString()
+                say("Отправляю запрос доступа к $server")
+                Thread {
+                    val (code, _) = Ygg.probeAccess(server, null, ask = true, message = msg)
+                    ui.post {
+                        prefs.addServer(server)
+                        Ygg.writeMonitors(filesDir, prefs)
+                        if (code == "pending") finish("отправлен — ждите одобрения владельца, затем нажмите «Подключиться»")
+                        else finish(Ygg.accessText(code), ok = code == "ok")
+                        closedSeen = closedSeen.map { if (it.first == server) Triple(it.first, it.second, code) else it }
+                    }
+                }.apply { isDaemon = true; start() }
+            }
             .setNegativeButton("Отмена", null).show()
     }
 
@@ -243,11 +290,12 @@ class SimpleActivity : Activity() {
             !dRootOk -> "пиров $peers, ищу сеть…"
             else -> "подключено ✔ · пиров $peers"
         }
+        val acc = State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
         tvExit.text = "Сервер выхода: ${prefs.server}\n" + when {
             dExitAt == 0L -> "проверяю…"
             dExitMs != null -> "на связи ✔ (ответ ${dExitMs} мс)"
             else -> "не отвечает ✖"
-        }
+        } + (acc?.let { Ygg.keyLeft(it.third) } ?: "")
         tvPing.text = "Пинг: " + (dRtt?.let { "$it мс" } ?: "—") + (dAvg?.let { "  (средний $it мс)" } ?: "")
         val n = rate(1)
         tvNow.text = "Сейчас: " + (n?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
@@ -284,7 +332,7 @@ class SimpleActivity : Activity() {
         headline("Переключаю сервер…")
         say("Переключаю на $server")
         say("Проверяю доступ")
-        val acc = Ygg.probeAccess(server, prefs.keyFor(server), ask = false)
+        val acc = Ygg.probeAccess(server, prefs.keyFor(server), ask = false).first
         if (acc != "ok") throw Stop("$server: ${Ygg.accessText(acc)}")
         finish("доступ есть")
         if (!useServer(server)) throw Stop("VPN к серверу $server не поднялся")
@@ -424,7 +472,12 @@ class SimpleActivity : Activity() {
 
     // ------------------------------------------------------------------------------- the connection
 
-    private class Stop(msg: String) : Exception(msg)
+    private open class Stop(msg: String) : Exception(msg)
+    /** No server we may use: offer an access request. */
+    private class NoAccess(msg: String) : Stop(msg)
+
+    /** Closed servers seen by the last attempt: (address, ping ms, status code). */
+    @Volatile private var closedSeen: List<Triple<String, Long?, String>> = emptyList()
 
     private fun startFlow(body: () -> Unit = { connectFlow() }) {
         if (flow != null) return
@@ -439,6 +492,12 @@ class SimpleActivity : Activity() {
                 finish(e.message ?: "", ok = false)
                 say(e.message ?: "не удалось", Mark.FAIL)
                 headline("Не подключено")
+                if (e is NoAccess && alive()) ui.post {
+                    stepsBox.addView(Button(this).apply {
+                        text = "Запросить доступ у владельца…"; isAllCaps = false
+                        setOnClickListener { requestDialog() }
+                    })
+                }
             } catch (e: InterruptedException) {
                 // cancelled: cancelFlow has already reset the screen
             } catch (e: Exception) {
@@ -551,12 +610,14 @@ class SimpleActivity : Activity() {
         say("Проверяю доступ к серверам")
         val access = java.util.concurrent.ConcurrentHashMap<String, String>()
         pinged.take(12).map { (a, _) ->
-            Thread { access[a] = Ygg.probeAccess(a, prefs.keyFor(a), ask = false) }.apply { start() }
+            Thread { access[a] = Ygg.probeAccess(a, prefs.keyFor(a), ask = false).first }.apply { start() }
         }.forEach { it.join(45_000) }
         if (!alive()) throw InterruptedException()
         val ranked = pinged.filter { access[it.key] == "ok" }
-        for ((a, code) in access) if (code != "ok" && prefs.keyFor(a) != null) say("$a: ${Ygg.accessText(code)}", Mark.INFO)
-        if (ranked.isEmpty()) throw Stop("нет серверов, к которым есть доступ. Серверы закрыты: попросите ключ у владельца сервера (кнопка «Ключ» вверху) или запросите доступ в режиме «Эксперт»")
+        for ((a, code) in access) if (code != "ok" && (prefs.keyFor(a) != null || code == "pending")) say("$a: ${Ygg.accessText(code)}", Mark.INFO)
+        closedSeen = pinged.filter { access[it.key] != "ok" && access[it.key]?.startsWith("error") == false }
+            .map { Triple(it.key, it.value, access[it.key] ?: "closed") }
+        if (ranked.isEmpty()) throw NoAccess("нет серверов, к которым есть доступ. Серверы закрыты: отсканируйте ключ владельца (кнопка «Ключ» вверху) или запросите доступ")
         finish("доступ есть к ${ranked.size} из ${pinged.size}")
 
         // 6. Speed of the best ones by ping: connect to each briefly and measure.
