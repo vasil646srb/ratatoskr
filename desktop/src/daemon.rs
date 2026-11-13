@@ -61,6 +61,8 @@ pub struct St {
     tracker_status: Option<String>,
     /// Client: access to the selected server (server, `ok`/`pending`/… or an error, when).
     access: Option<(String, String, Instant, u64)>,
+    /// Client: our access requests — server → (status code, when it changed).
+    requests: HashMap<String, (String, Instant)>,
     /// A newer release on GitHub (`{version, url, page, notes}`).
     update: Option<Value>,
 }
@@ -1016,7 +1018,11 @@ fn access_cmd(req: &Value, st: &Shared) -> Value {
             .and_then(|ok| if ok { Ok(()) } else { Err("нет такого ключа".into()) }),
         "revoke" => Access::update(&path, |a| a.revoke(&s("id"))).map(|_| ()).map_err(|e| e.to_string()),
         "deny" => match &addr {
-            Some(ad) => Access::update(&path, |a| a.deny(ad)).map(|_| ()).map_err(|e| e.to_string()),
+            Some(ad) => Access::update(&path, |a| a.deny(ad, t)).map(|_| ()).map_err(|e| e.to_string()),
+            None => Err("нужен адрес Yggdrasil".into()),
+        },
+        "forget" => match &addr {
+            Some(ad) => Access::update(&path, |a| a.forget_denied(ad)).map(|_| ()).map_err(|e| e.to_string()),
             None => Err("нужен адрес Yggdrasil".into()),
         },
         "public" => {
@@ -1036,7 +1042,8 @@ fn access_cmd(req: &Value, st: &Shared) -> Value {
         "renew" => Some(format!("ключ {} продлён на {days} дн.", s("id"))),
         "unbind" => Some(format!("ключ {} отвязан от устройства", s("id"))),
         "revoke" => Some(format!("ключ {} удалён", s("id"))),
-        "deny" => Some(format!("запрос {} отклонён", s("addr"))),
+        "deny" => Some(format!("запрос {} отклонён — устройство узнает об этом", s("addr"))),
+        "forget" => Some(format!("{} снова может запросить доступ", s("addr"))),
         "public" => Some(if req["on"].as_bool() == Some(true) { "сервер стал ПУБЛИЧНЫМ: риск принят".into() } else { "сервер снова закрыт".into() }),
         _ => None,
     };
@@ -1053,7 +1060,7 @@ fn access_cmd(req: &Value, st: &Shared) -> Value {
         v["active"] = json!(k.expires > t);
         v
     }).collect();
-    json!({"public": a.public, "public_accepted": a.public_accepted, "keys": keys, "requests": a.requests,
+    json!({"public": a.public, "public_accepted": a.public_accepted, "keys": keys, "requests": a.requests, "denied": a.denied,
            "now": t, "server": server, "risk": access::PUBLIC_RISK_RU})
 }
 
@@ -1118,6 +1125,7 @@ pub fn access_text(code: &str) -> &'static str {
         "expired" => "срок ключа истёк — попросите владельца продлить",
         "other_device" => "этот ключ уже привязан к другому устройству",
         "closed" => "сервер закрыт: нужен ключ или запрос доступа",
+        "denied" => "владелец сервера отклонил запрос доступа",
         _ => "",
     }
 }
@@ -1125,8 +1133,31 @@ pub fn access_text(code: &str) -> &'static str {
 /// Client: check access to the selected server — every 20 s until it is granted, then every 5 min.
 fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
     let mut last: Option<(String, String, Instant)> = None;
+    let mut last_requests = Instant::now();
     while !platform::stopping() {
         std::thread::sleep(Duration::from_secs(2));
+        // Our pending requests, every minute (a check, nothing new is recorded): the owner's
+        // decision is shown and logged; decided ones stay listed for a day.
+        if last_requests.elapsed() >= Duration::from_secs(60) && st.lock().unwrap().node_running {
+            last_requests = Instant::now();
+            let pending: Vec<String> = {
+                let mut s = st.lock().unwrap();
+                s.requests.retain(|_, (c, t)| c == "pending" || t.elapsed() < Duration::from_secs(86400));
+                s.requests.iter().filter(|(_, (c, _))| c == "pending").map(|(k, _)| k.clone()).collect()
+            };
+            for srv in pending {
+                let Ok((a, _)) = probe_access(&srv, "", &config::device_name(), "", false) else { continue };
+                let code = a.name().to_string();
+                if code == "pending" {
+                    continue;
+                }
+                match a {
+                    crate::access::Auth::Ok => log(&st, "access", &format!("{srv}: владелец одобрил запрос — доступ есть")),
+                    _ => error(&st, "access", &format!("{srv}: {}", access_text(&code))),
+                }
+                st.lock().unwrap().requests.insert(srv, (code, Instant::now()));
+            }
+        }
         let c = cfg.lock().unwrap().client.clone();
         let server = c.server.trim().to_string();
         if !c.enabled || c.ygg_only || config::parse_server(&server).is_none() || !st.lock().unwrap().node_running {
@@ -1191,7 +1222,8 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
                    "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
                    "servers": cfg.client.servers, "ygg_sites": cfg.client.ygg_sites, "ygg_only": cfg.client.ygg_only,
                    "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone()),
-                   "access_expires": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.3)},
+                   "access_expires": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.3),
+                   "requests": s.requests.iter().map(|(srv, (c, _))| json!({"server": srv, "status": c, "text": access_text(c)})).collect::<Vec<_>>()},
         "rtt": s.node_rtt,
         "trackers": {"enabled": cfg.network.use_trackers, "list": cfg.network.trackers, "status": s.tracker_status,
                      "exits": s.tracker_exits.iter().map(|(a, r, p)| json!({"address": a, "tracker_rtt_ms": r, "public": p})).collect::<Vec<_>>()},
@@ -1245,6 +1277,8 @@ fn handle_conn(conn: platform::Stream, st: Shared, cfg: Arc<Mutex<Config>>, tx: 
                 match probe_access(&server, "", &config::device_name(), req["message"].as_str().unwrap_or(""), true) {
                     Ok((a, exp)) => {
                         log(&st, "access", &format!("{server}: запрос доступа — {}", access_text(a.name())));
+                        // Followed until the owner decides (see access_watch).
+                        st.lock().unwrap().requests.insert(server.clone(), (a.name().to_string(), Instant::now()));
                         json!({"status": a.name(), "text": access_text(a.name()), "expires": exp})
                     }
                     Err(e) => json!({"error": e}),

@@ -59,17 +59,6 @@ class SimpleActivity : Activity() {
         top.addView(TextView(this).apply {
             text = "Ratatoskr"; textSize = 26f; setTypeface(typeface, Typeface.BOLD); setTextColor(ACCENT)
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        top.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = "Ключ"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
-            setOnClickListener { keyDialog() }
-        })
-        top.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = "Эксперт ›"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
-            setOnClickListener {
-                prefs.advancedMode = true
-                openAdvanced()
-            }
-        })
         root.addView(top)
         root.addView(TextView(this).apply {
             text = "Интернет через Yggdrasil"; textSize = 14f; setTextColor(Color.DKGRAY); setPadding(0, 0, 0, dp(16))
@@ -86,9 +75,131 @@ class SimpleActivity : Activity() {
         stepsBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(16), 0, dp(16)) }
         scroll = ScrollView(this).apply { addView(stepsBox) }
         root.addView(scroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+        // Below: the servers and keys, and the way into the full app.
+        val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        bottom.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
+            text = "Серверы и ключи"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
+            setOnClickListener { serversScreen() }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        bottom.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
+            text = "Эксперт ›"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
+            setOnClickListener {
+                prefs.advancedMode = true
+                openAdvanced()
+            }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        root.addView(bottom)
         setContentView(root)
         if (Build.VERSION.SDK_INT >= 21) window.statusBarColor = ACCENT
         render()
+    }
+
+    /**
+     * Known exit servers at once (saved and from the trackers), each with what we may do there:
+     * connect (our key or public), ask the owner for access, or wait for the answer. The access
+     * is checked without sending any request; a request goes only from its button.
+     */
+    private fun serversScreen() {
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), dp(4), dp(16), dp(8)) }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val status = TextView(this).apply { textSize = 13f; setTextColor(Color.DKGRAY); setPadding(0, dp(4), 0, dp(8)) }
+        list.addView(head)
+        list.addView(status)
+        val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        list.addView(rows)
+        val d = android.app.AlertDialog.Builder(this).setTitle("Серверы и ключи")
+            .setView(ScrollView(this).apply { addView(list) })
+            .setNegativeButton("Закрыть", null).show()
+        fun headButton(t: String, f: () -> Unit) = head.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
+            text = t; isAllCaps = false; textSize = 14f; setTextColor(ACCENT)
+            setOnClickListener { d.dismiss(); f() }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        headButton("Сканировать QR") {
+            @Suppress("DEPRECATION")
+            startActivityForResult(Intent(this, ScanActivity::class.java), REQ_SCAN)
+        }
+        headButton("Ввести ключ") { keyDialog() }
+
+        /** One row: the server, its ping and status, and the button for what can be done. */
+        fun row(addr: String, ping: Long?, code: String?, expires: Long) {
+            val tag = "srv:$addr"
+            val box = rows.findViewWithTag<LinearLayout>(tag) ?: LinearLayout(this).apply {
+                this.tag = tag; orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(6), 0, dp(6)); rows.addView(this)
+            }
+            box.removeAllViews()
+            val public = addr in State.trackerPublic
+            val mark = when { code == "ok" && prefs.keyFor(addr) == null && public -> "🌐"; code == "ok" -> "🔑"; else -> "🔒" }
+            val what = when {
+                code == null -> "проверяю доступ…"
+                code == "ok" && expires > 0 -> "доступ есть" + Ygg.keyLeft(expires)
+                code == "ok" -> if (public) "публичный" else "доступ есть"
+                code == "closed" -> "закрыт"
+                code == "pending" -> "запрос отправлен, ждёт ответа"
+                code.startsWith("error") -> "нет связи"
+                else -> Ygg.accessText(code)
+            }
+            box.addView(TextView(this).apply {
+                text = "$mark $addr\n${ping?.let { "$it мс · " } ?: ""}$what"
+                textSize = 13f; typeface = Typeface.MONOSPACE
+                setTextColor(when (code) { "ok" -> ACCENT; "denied", "bad_key", "other_device" -> Color.parseColor("#B03020"); else -> Color.DKGRAY })
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            fun action(t: String, enabled: Boolean = true, f: () -> Unit = {}) = box.addView(Button(this).apply {
+                text = t; isAllCaps = false; textSize = 13f; isEnabled = enabled
+                setOnClickListener { f() }
+            })
+            when (code) {
+                "ok" -> action("Подключиться") {
+                    d.dismiss()
+                    if (VpnService.prepare(this) != null || flow != null) { prefs.server = addr; toast("Сервер выбран — нажмите «Подключиться»") }
+                    else startFlow { switchFlow(addr) }
+                }
+                "closed", "expired" -> action(if (code == "expired") "Продлить" else "Запросить доступ") {
+                    messageDialog(addr) { c -> row(addr, ping, c, 0) }
+                }
+                "pending" -> action("Ждёт ответа", enabled = false)
+                "denied" -> action("Отклонён", enabled = false)
+                else -> {}
+            }
+        }
+
+        val known = (prefs.serverList() + State.trackerExits.map { it.first }).distinct()
+        known.forEach { row(it, null, State.requests[it].takeIf { c -> c == "pending" || c == "denied" }, 0) }
+        status.text = if (known.isEmpty()) "Загружаю список серверов от трекеров…" else "Серверов: ${known.size}. Доступ проверяется без отправки запросов."
+        Thread {
+            var all = known
+            if (State.trackerExits.isEmpty() && State.nodeRunning) {
+                val exits = LinkedHashMap<String, Long>()
+                val public = HashSet<String>()
+                for (t in prefs.trackerList()) {
+                    val v = Ygg.fetchTracker(t, "/exits") ?: continue
+                    Ygg.parseExits(v, exits, public)
+                    if (exits.isNotEmpty()) break
+                }
+                if (exits.isNotEmpty()) {
+                    State.trackerExits = exits.map { it.key to it.value }
+                    State.trackerPublic = public
+                    Ygg.writeMonitors(filesDir, prefs)
+                }
+                all = (prefs.serverList() + exits.keys).distinct()
+                ui.post {
+                    all.forEach { row(it, exits[it]?.takeIf { p -> p >= 0 }, null, 0) }
+                    status.text = if (all.isEmpty()) "Серверов не найдено: трекеры не ответили. Можно ввести ключ или отсканировать QR."
+                        else "Серверов: ${all.size}. Доступ проверяется без отправки запросов."
+                }
+            }
+            if (!State.nodeRunning) { ui.post { status.text = "Узел Yggdrasil ещё запускается — откройте этот список чуть позже." }; return@Thread }
+            val rtt = Ygg.rttByAddr(Ygg.fetchRtt())
+            val trackerPing = State.trackerExits.toMap()
+            all.take(20).map { a ->
+                Thread {
+                    val (code, exp) = Ygg.probeAccess(a, prefs.keyFor(a), ask = false)
+                    val ping = rtt[a]?.takeIf { !it.isNull("rtt_ms") }?.optLong("rtt_ms") ?: trackerPing[a]?.takeIf { it >= 0 }
+                    if (code == "pending" || code == "denied") State.requests[a] = code
+                    ui.post { if (d.isShowing) row(a, ping, code, exp) }
+                }.apply { isDaemon = true; start() }
+            }
+        }.apply { isDaemon = true; start() }
     }
 
     /** A server's key: scan its QR code, or type the address and the key. */
@@ -107,28 +218,11 @@ class SimpleActivity : Activity() {
                 @Suppress("DEPRECATION")
                 startActivityForResult(Intent(this, ScanActivity::class.java), REQ_SCAN)
             }
-            .setNegativeButton("Запросить доступ…") { _, _ -> requestDialog() }.show()
-    }
-
-    /** Pick a closed server (from the last attempt, else the trackers' list) to ask for access. */
-    private fun requestDialog() {
-        val seen = closedSeen
-        val list: List<Triple<String, Long?, String>> = seen.ifEmpty {
-            (State.trackerExits.map { it.first } + prefs.serverList()).distinct()
-                .filter { prefs.keyFor(it) == null && it !in State.trackerPublic }
-                .map { a -> Triple(a, State.trackerExits.firstOrNull { it.first == a }?.second?.takeIf { it >= 0 }, "closed") }
-        }
-        if (list.isEmpty()) { toast("Закрытых серверов пока нет: нажмите «Подключиться», чтобы получить список"); return }
-        val labels = list.map { (a, ping, code) ->
-            a + (ping?.let { "  —  $it мс" } ?: "") + if (code == "pending") "\n(запрос уже отправлен)" else ""
-        }
-        android.app.AlertDialog.Builder(this).setTitle("Запросить доступ к серверу")
-            .setItems(labels.toTypedArray()) { _, i -> messageDialog(list[i].first) }
             .setNegativeButton("Отмена", null).show()
     }
 
     /** The request itself: a message to the owner, sent through the node (no VPN needed). */
-    private fun messageDialog(server: String) {
+    private fun messageDialog(server: String, onDone: (String) -> Unit = {}) {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
         box.addView(TextView(this).apply {
             text = "Владелец сервера увидит название вашего устройства (${Ygg.deviceName()}) и сообщение. Когда он одобрит запрос, подключение заработает само."
@@ -147,10 +241,13 @@ class SimpleActivity : Activity() {
                     val (code, _) = Ygg.probeAccess(server, null, ask = true, message = msg)
                     ui.post {
                         prefs.addServer(server)
+                        State.requests[server] = code
+                        // Followed in the background: a notification when the owner answers.
+                        if (code == "pending") prefs.addPending(server)
                         Ygg.writeMonitors(filesDir, prefs)
-                        if (code == "pending") finish("отправлен — ждите одобрения владельца, затем нажмите «Подключиться»")
+                        if (code == "pending") finish("отправлен — придёт уведомление, когда владелец ответит")
                         else finish(Ygg.accessText(code), ok = code == "ok")
-                        closedSeen = closedSeen.map { if (it.first == server) Triple(it.first, it.second, code) else it }
+                        onDone(code)
                     }
                 }.apply { isDaemon = true; start() }
             }
@@ -476,8 +573,6 @@ class SimpleActivity : Activity() {
     /** No server we may use: offer an access request. */
     private class NoAccess(msg: String) : Stop(msg)
 
-    /** Closed servers seen by the last attempt: (address, ping ms, status code). */
-    @Volatile private var closedSeen: List<Triple<String, Long?, String>> = emptyList()
 
     private fun startFlow(body: () -> Unit = { connectFlow() }) {
         if (flow != null) return
@@ -495,7 +590,7 @@ class SimpleActivity : Activity() {
                 if (e is NoAccess && alive()) ui.post {
                     stepsBox.addView(Button(this).apply {
                         text = "Запросить доступ у владельца…"; isAllCaps = false
-                        setOnClickListener { requestDialog() }
+                        setOnClickListener { serversScreen() }
                     })
                 }
             } catch (e: InterruptedException) {
@@ -615,9 +710,7 @@ class SimpleActivity : Activity() {
         if (!alive()) throw InterruptedException()
         val ranked = pinged.filter { access[it.key] == "ok" }
         for ((a, code) in access) if (code != "ok" && (prefs.keyFor(a) != null || code == "pending")) say("$a: ${Ygg.accessText(code)}", Mark.INFO)
-        closedSeen = pinged.filter { access[it.key] != "ok" && access[it.key]?.startsWith("error") == false }
-            .map { Triple(it.key, it.value, access[it.key] ?: "closed") }
-        if (ranked.isEmpty()) throw NoAccess("нет серверов, к которым есть доступ. Серверы закрыты: отсканируйте ключ владельца (кнопка «Ключ» вверху) или запросите доступ")
+        if (ranked.isEmpty()) throw NoAccess("нет серверов, к которым есть доступ. Серверы закрыты: получите ключ владельца или запросите доступ («Серверы и ключи» внизу)")
         finish("доступ есть к ${ranked.size} из ${pinged.size}")
 
         // 6. Speed of the best ones by ping: connect to each briefly and measure.

@@ -18,7 +18,8 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy access new ИМЯ ДНЕЙ новый ключ (1–365 дней) — QR-код и ссылка для одного устройства
   yggproxy access qr ID        снова показать QR-код ключа
   yggproxy access approve АДРЕС ДНЕЙ [ИМЯ]   одобрить запрос устройства
-  yggproxy access deny АДРЕС   отклонить запрос
+  yggproxy access deny АДРЕС   отклонить запрос (устройство узнает; повторно просить 30 дней не сможет)
+  yggproxy access forget АДРЕС разрешить отклонённому устройству запросить снова
   yggproxy access renew ID ДНЕЙ  продлить ключ
   yggproxy access unbind ID    отвязать ключ от устройства (для переустановки)
   yggproxy access revoke ID    удалить ключ (доступ сразу закрыт)
@@ -107,6 +108,9 @@ fn status() -> Result<(), String> {
         for (a, l, avg) in tp {
             println!("  {a}  {}", api::ping_text(l, avg));
         }
+    }
+    for r in s["client"]["requests"].as_array().into_iter().flatten() {
+        println!("Запрос доступа к {}: {}", r["server"].as_str().unwrap_or("?"), r["text"].as_str().unwrap_or(""));
     }
     let sv = &s["server"];
     if sv["enabled"].as_bool() == Some(true) {
@@ -285,6 +289,7 @@ fn access(args: &[String]) -> Result<(), String> {
         Some("new") => json!({"cmd": "access", "op": "new", "name": a(2).unwrap_or(""), "days": days(a(3).or(Some("30")))?}),
         Some("approve") => json!({"cmd": "access", "op": "approve", "addr": a(2).ok_or("АДРЕС")?, "days": days(a(3))?, "name": a(4).unwrap_or("")}),
         Some("deny") => json!({"cmd": "access", "op": "deny", "addr": a(2).ok_or("АДРЕС")?}),
+        Some("forget") => json!({"cmd": "access", "op": "forget", "addr": a(2).ok_or("АДРЕС")?}),
         Some("renew") => json!({"cmd": "access", "op": "renew", "id": a(2).ok_or("ID")?, "days": days(a(3))?}),
         Some("unbind") => json!({"cmd": "access", "op": "unbind", "id": a(2).ok_or("ID")?}),
         Some("revoke") => json!({"cmd": "access", "op": "revoke", "id": a(2).ok_or("ID")?}),
@@ -355,6 +360,14 @@ fn access(args: &[String]) -> Result<(), String> {
             if let Some(m) = q["message"].as_str().filter(|m| !m.is_empty()) {
                 println!("      «{m}»");
             }
+        }
+    }
+    let den = r["denied"].as_array().cloned().unwrap_or_default();
+    if !den.is_empty() {
+        println!("Отклонённые ({}) — снова разрешить запрос: yggproxy access forget АДРЕС, или approve:", den.len());
+        for d in den {
+            println!("  {}  {}  {} назад", d["addr"].as_str().unwrap_or(""), d["name"].as_str().unwrap_or(""),
+                dur(now.saturating_sub(d["time"].as_u64().unwrap_or(0))));
         }
     }
     Ok(())

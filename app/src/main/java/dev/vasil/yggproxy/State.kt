@@ -25,6 +25,8 @@ object State {
     @Volatile var trackerPublic: Set<String> = emptySet()
     /** Client: access to the selected server — (server, `ok`/`pending`/… or `error: …`). */
     @Volatile var access: Triple<String, String, Long>? = null
+    /** Our access requests: server → status code (`pending`, then `ok` or `denied`). */
+    val requests = java.util.concurrent.ConcurrentHashMap<String, String>()
     @Volatile var trackerStatus: String = "ещё не запрашивались"
     @Volatile var trackerAt = 0L
     /** Last time public peers were taken from a tracker (hourly). */

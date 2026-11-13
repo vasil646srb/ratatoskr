@@ -656,7 +656,9 @@ class MainActivity : Activity() {
                             val msg = e.text.toString()
                             bg.execute {
                                 val (code, _) = Ygg.probeAccess(addr, null, ask = true, message = msg)
-                                ui.post { toast(if (code == "pending") "Запрос отправлен — ждите одобрения" else Ygg.accessText(code)) }
+                                State.requests[addr] = code
+                                if (code == "pending") prefs.addPending(addr)
+                                ui.post { toast(if (code == "pending") "Запрос отправлен — придёт уведомление, когда владелец ответит" else Ygg.accessText(code)) }
                             }
                         }
                         .setNegativeButton("Отмена", null).show()
@@ -825,7 +827,7 @@ class MainActivity : Activity() {
             .setMessage("${r.optString("name")}\n$addr\nпопыток: ${r.optInt("count")}" +
                 r.optString("message").takeIf { it.isNotEmpty() }?.let { "\n\n«$it»" }.orEmpty())
             .setPositiveButton("Одобрить на $days дн.") { _, _ -> accessOp("Доступ одобрен", "approve", addr, days.toString()) }
-            .setNegativeButton("Отклонить") { _, _ -> accessOp("Запрос отклонён", "deny", addr) }
+            .setNegativeButton("Отклонить") { _, _ -> accessOp("Запрос отклонён — устройство получит уведомление", "deny", addr) }
             .setNeutralButton("Отмена", null).show()
     }
 
@@ -867,6 +869,28 @@ class MainActivity : Activity() {
                 setPadding(dp(4), dp(8), dp(4), dp(8))
                 setOnClickListener { keyMenu(k) }
             })
+        }
+        val den = a.optJSONArray("denied")
+        if (den != null && den.length() > 0) {
+            accessBox.addView(h2("Отклонённые (${den.length()})"))
+            accessBox.addView(note("Повторно просить 30 дней не могут. Нажмите — одобрить или разрешить запросить снова."))
+            for (i in 0 until den.length()) {
+                val d = den.getJSONObject(i)
+                val addr = d.optString("addr")
+                accessBox.addView(mono("${d.optString("name")}\n    $addr · ${Ygg.dur(now - d.optLong("time"))} назад").apply {
+                    setTextIsSelectable(false)
+                    setTextColor(Color.GRAY)
+                    setBackgroundResource(android.R.drawable.list_selector_background)
+                    setPadding(dp(4), dp(8), dp(4), dp(8))
+                    setOnClickListener {
+                        val days = etKeyDays.text.toString().toIntOrNull()?.takeIf { it in 1..365 } ?: 30
+                        AlertDialog.Builder(this@MainActivity).setTitle(d.optString("name").ifEmpty { addr })
+                            .setPositiveButton("Одобрить на $days дн.") { _, _ -> accessOp("Доступ одобрен", "approve", addr, days.toString()) }
+                            .setNegativeButton("Разрешить запросить снова") { _, _ -> accessOp("Устройство снова может запросить доступ", "forget", addr) }
+                            .setNeutralButton("Отмена", null).show()
+                    }
+                })
+            }
         }
         val reqs = a.optJSONArray("requests")
         if (reqs != null && reqs.length() > 0) {
@@ -975,8 +999,9 @@ class MainActivity : Activity() {
             prefs.yggOnly -> if (State.vpnActive) "VPN работает: только сайты Yggdrasil и ALFIS" else "VPN запускается…"
             State.vpnActive -> "VPN работает → ${State.vpnTarget}\n↓ ${Ygg.human(State.tunRx)}  ↑ ${Ygg.human(State.tunTx)}"
             else -> "VPN запускается…" + (State.lastError?.let { "\n$it" } ?: "")
-        } + if (prefs.vpnEnabled && !prefs.yggOnly) State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
-            .let { "\nдоступ: " + Ygg.accessText(it?.second) + (it?.let { a -> Ygg.keyLeft(a.third) } ?: "") } else ""
+        } + (if (prefs.vpnEnabled && !prefs.yggOnly) State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
+            .let { "\nдоступ: " + Ygg.accessText(it?.second) + (it?.let { a -> Ygg.keyLeft(a.third) } ?: "") } else "") +
+            State.requests.entries.joinToString("") { "\nзапрос к ${it.key}: ${Ygg.accessText(it.value).let { t -> if (it.value == "pending") "ждёт ответа владельца" else t }}" }
         val addr = State.address
         val link = addr?.let { a -> qrKey()?.let { Ygg.connectLink(a, it.optString("key")) } }
         if (link != qrText) {

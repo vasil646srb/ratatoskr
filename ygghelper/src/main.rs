@@ -30,7 +30,7 @@
 //!     `ACCESS request ADDR` when a key is used or access is asked for.
 //!
 //! `ygghelper access FILE list | new NAME DAYS | approve ADDR DAYS [NAME] | renew ID [DAYS] |
-//!     unbind ID | revoke ID | deny ADDR | public on --accept-risk | public off`
+//!     unbind ID | revoke ID | deny ADDR | forget ADDR | public on --accept-risk | public off`
 //!     Manage FILE (the Android app); prints the whole file as JSON (or `ERROR ...`).
 //!
 //! Status lines on stdout, for the app: `STAT tun tx=N rx=N`,
@@ -387,7 +387,11 @@ fn access_cli(args: &[String]) -> Result<String, String> {
         }
         "deny" => {
             let ad = addr(a(2))?;
-            Access::update(&path, |x| x.deny(&ad)).map_err(|e| e.to_string()).map(|_| ())
+            Access::update(&path, |x| x.deny(&ad, t)).map_err(|e| e.to_string()).map(|_| ())
+        }
+        "forget" => {
+            let ad = addr(a(2))?;
+            Access::update(&path, |x| x.forget_denied(&ad)).map_err(|e| e.to_string()).map(|_| ())
         }
         "public" => {
             let on = match a(2) { Some("on") => true, Some("off") => false, _ => return Err("public on|off".into()) };

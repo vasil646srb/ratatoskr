@@ -25,6 +25,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const MAX_REQUESTS: usize = 50;
+/// A denied device cannot ask again for this long (the owner may approve it or let it ask).
+pub const DENY_SECS: u64 = 30 * 86400;
 pub const MAX_DAYS: u32 = 365;
 
 pub fn now() -> u64 {
@@ -61,6 +63,16 @@ pub struct Request {
     pub count: u32,
 }
 
+/// A request the owner denied: the device is told so and cannot ask again for [DENY_SECS].
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
+#[serde(default)]
+pub struct Denied {
+    pub addr: String,
+    pub name: String,
+    pub message: String,
+    pub time: u64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq)]
 #[serde(default)]
 pub struct Access {
@@ -70,6 +82,7 @@ pub struct Access {
     pub public_accepted: u64,
     pub keys: Vec<Key>,
     pub requests: Vec<Request>,
+    pub denied: Vec<Denied>,
 }
 
 /// Result of an access check, sent as the RFC 1929 status byte.
@@ -84,6 +97,8 @@ pub enum Auth {
     OtherDevice = 4,
     /// No access and nothing recorded (a check without a request).
     Closed = 5,
+    /// The owner denied this device's request.
+    Denied = 6,
 }
 
 impl Auth {
@@ -95,6 +110,7 @@ impl Auth {
             3 => Auth::Expired,
             4 => Auth::OtherDevice,
             5 => Auth::Closed,
+            6 => Auth::Denied,
             _ => return None,
         })
     }
@@ -106,6 +122,7 @@ impl Auth {
             Auth::Expired => "expired",
             Auth::OtherDevice => "other_device",
             Auth::Closed => "closed",
+            Auth::Denied => "denied",
         }
     }
 }
@@ -232,6 +249,10 @@ impl Access {
         let device = device.as_str();
         let secret = norm_secret(secret);
         if secret.is_empty() {
+            // Denied: told so, and nothing new is recorded (no flood of requests).
+            if self.denied.iter().any(|d| d.addr == addr && t < d.time + DENY_SECS) {
+                return (Auth::Denied, false);
+            }
             let had = self.keys.iter().any(|k| k.addr.as_deref() == Some(addr));
             if !record {
                 let asked = self.requests.iter().any(|r| r.addr == addr);
@@ -251,6 +272,7 @@ impl Access {
         k.bound = t;
         k.device = clean_name(device);
         self.requests.retain(|r| r.addr != addr);
+        self.denied.retain(|d| d.addr != addr);
         (Auth::Ok, true)
     }
 
@@ -290,9 +312,14 @@ impl Access {
             }
             // One key per device: an approved address replaces its old key.
             self.keys.retain(|x| x.addr.as_deref() != Some(a));
+            if let Some(d) = self.denied.iter().find(|d| d.addr == a)
+                && k.name.is_empty() {
+                    k.name = d.name.clone();
+                }
             k.addr = Some(a.to_string());
             k.bound = t;
             self.requests.retain(|r| r.addr != a);
+            self.denied.retain(|d| d.addr != a);
         }
         self.keys.push(k.clone());
         k
@@ -323,10 +350,23 @@ impl Access {
         self.keys.len() != n
     }
 
-    pub fn deny(&mut self, addr: &str) -> bool {
-        let n = self.requests.len();
-        self.requests.retain(|r| r.addr != addr);
-        self.requests.len() != n
+    /// Deny a request: the device learns it on its next check and cannot ask again for a while.
+    pub fn deny(&mut self, addr: &str, t: u64) -> bool {
+        let Some(i) = self.requests.iter().position(|r| r.addr == addr) else { return false };
+        let r = self.requests.remove(i);
+        self.denied.retain(|d| d.addr != addr && t < d.time + DENY_SECS);
+        if self.denied.len() >= MAX_REQUESTS {
+            self.denied.remove(0);
+        }
+        self.denied.push(Denied { addr: r.addr, name: r.name, message: r.message, time: t });
+        true
+    }
+
+    /// Let a denied device ask again.
+    pub fn forget_denied(&mut self, addr: &str) -> bool {
+        let n = self.denied.len();
+        self.denied.retain(|d| d.addr != addr);
+        self.denied.len() != n
     }
 
     pub fn set_public(&mut self, on: bool, accept_risk: bool, t: u64) -> Result<(), &'static str> {
@@ -385,6 +425,16 @@ mod tests {
         assert_eq!(a.requests.len(), 1);
         assert_eq!((a.requests[0].count, a.requests[0].message.as_str()), (2, "это Маша, пусти"));
         assert_eq!(a.check(A, "x", "wrongkey", true, 12), (Auth::BadKey, false));
+        // Denied: told so, no new request; approving later still works.
+        assert!(a.deny(A, 13));
+        assert_eq!(a.check(A, "laptop", "", true, 14), (Auth::Denied, false));
+        assert_eq!(a.check(A, "laptop", "", false, 14), (Auth::Denied, false));
+        assert!(a.requests.is_empty() && a.denied.len() == 1);
+        assert_eq!(a.check(A, "laptop", "", true, 14 + DENY_SECS), (Auth::Pending, true));
+        a.deny(A, 15 + DENY_SECS);
+        assert!(a.forget_denied(A));
+        assert_eq!(a.check(A, "laptop", "", true, 16 + DENY_SECS), (Auth::Pending, true));
+        a.deny(A, 17 + DENY_SECS);
         let k = a.create("", 400, Some(A), 20);
         assert_eq!((k.days, k.name.as_str()), (365, "laptop"));
         assert!(a.requests.is_empty() && a.granted(A, 21));

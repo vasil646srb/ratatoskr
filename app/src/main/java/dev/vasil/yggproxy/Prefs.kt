@@ -54,6 +54,12 @@ class Prefs(ctx: Context) {
         serverKeys = (rest + listOfNotNull(key?.takeIf { it.isNotEmpty() }?.let { "$addr $it" })).joinToString("\n")
     }
 
+    /** Our access requests the owners have not answered yet (addresses, one per line). */
+    var pendingRequests: String get() = s("pending_req", ""); set(v) = put { putString("pending_req", v) }
+    fun pendingList(): List<String> = pendingRequests.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    fun addPending(addr: String) { if (addr !in pendingList()) pendingRequests = (pendingList() + addr).joinToString("\n") }
+    fun removePending(addr: String) { pendingRequests = pendingList().filter { it != addr }.joinToString("\n") }
+
     fun serverList(): List<String> = servers.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     fun addServer(addr: String) { if (addr !in serverList()) servers = (serverList() + addr).joinToString("\n") }
     fun removeServer(addr: String) { servers = serverList().filter { it != addr }.joinToString("\n") }

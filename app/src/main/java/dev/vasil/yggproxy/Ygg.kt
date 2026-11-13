@@ -132,7 +132,7 @@ object Ygg {
     } catch (e: Exception) { "error: ${e.message ?: e.javaClass.simpleName}" to 0L }
 
     private fun codeName(c: Int) = when (c) {
-        0 -> "ok"; 1 -> "pending"; 2 -> "bad_key"; 3 -> "expired"; 4 -> "other_device"; 5 -> "closed"
+        0 -> "ok"; 1 -> "pending"; 2 -> "bad_key"; 3 -> "expired"; 4 -> "other_device"; 5 -> "closed"; 6 -> "denied"
         else -> "error: неизвестный ответ $c"
     }
 
@@ -151,6 +151,7 @@ object Ygg {
         code == "expired" -> "срок ключа истёк — попросите владельца продлить"
         code == "other_device" -> "ключ уже привязан к другому устройству"
         code == "closed" -> "сервер закрыт: нужен ключ или запрос доступа"
+        code == "denied" -> "владелец сервера отклонил запрос доступа"
         else -> "не проверен (${code.removePrefix("error: ")})"
     }
 

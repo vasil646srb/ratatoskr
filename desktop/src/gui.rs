@@ -306,6 +306,18 @@ impl App {
                 )
             });
         }
+        // Our access requests and the owners' answers.
+        if let Some(rs) = st.and_then(|s| s["client"]["requests"].as_array()).filter(|r| !r.is_empty()) {
+            ui.add_space(6.0);
+            for r in rs {
+                let text = format!("Запрос доступа к {}: {}", r["server"].as_str().unwrap_or("?"), r["text"].as_str().unwrap_or(""));
+                match r["status"].as_str() {
+                    Some("denied") => ui.colored_label(egui::Color32::from_rgb(200, 60, 40), text),
+                    Some("ok") => ui.colored_label(egui::Color32::from_rgb(40, 140, 70), text),
+                    _ => ui.label(text),
+                };
+            }
+        }
         // Access request to the selected server (no key): a message for its owner.
         let cur = self.cfg.as_ref().map(|c| c.client.server.clone()).unwrap_or_default();
         if config::parse_server(&cur).is_some() && !self.cfg.as_ref().unwrap().client.keys.contains_key(&cur) {
@@ -579,6 +591,23 @@ impl App {
                     }
                     if ui.small_button("отклонить").clicked() {
                         self.access_op(json!({"cmd": "access", "op": "deny", "addr": a}), "Запрос отклонён".into());
+                    }
+                });
+            }
+        }
+        let den = acc["denied"].as_array().cloned().unwrap_or_default();
+        if !den.is_empty() {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(format!("Отклонённые ({}) — повторно просить 30 дней не могут:", den.len())).strong());
+            for d in &den {
+                let a = d["addr"].as_str().unwrap_or("").to_string();
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(format!("{} · {} · {} назад", d["name"].as_str().unwrap_or(""), a, dur(now.saturating_sub(d["time"].as_u64().unwrap_or(0)))));
+                    if ui.small_button("одобрить").clicked() {
+                        self.access_op(json!({"cmd": "access", "op": "approve", "addr": a, "days": self.new_days}), "Доступ одобрен".into());
+                    }
+                    if ui.small_button("разрешить запросить снова").clicked() {
+                        self.access_op(json!({"cmd": "access", "op": "forget", "addr": a}), "Устройство снова может запросить доступ".into());
                     }
                 });
             }

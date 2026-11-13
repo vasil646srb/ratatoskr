@@ -37,6 +37,7 @@ class YggService : VpnService() {
         const val ACTION_REFRESH_PEERS = "dev.vasil.yggproxy.REFRESH_PEERS"
         private const val NOTIF_ID = 1
         private const val CHANNEL = "ygg"
+        private const val ACCESS_CHANNEL = "access"
         private const val PEERS_MAX_AGE = 6 * 3600 * 1000L
 
         /** The running service (same process), for calls that must not start it. */
@@ -93,7 +94,40 @@ class YggService : VpnService() {
      * Client: access to the selected server — every 20 s until granted, then every 5 min. With
      * the VPN on, a server without our key gets a request (the user chose to connect to it).
      */
+    private var requestsAt = 0L
+
+    /** Our pending access requests, every minute (a check: nothing new is recorded). */
+    private fun requestsTick() {
+        val now = System.currentTimeMillis()
+        if (now - requestsAt < 60_000 || !State.nodeRunning) return
+        requestsAt = now
+        for (srv in prefs.pendingList()) {
+            State.requests.putIfAbsent(srv, "pending")
+            val (code, _) = Ygg.probeAccess(srv, prefs.keyFor(srv), ask = false)
+            if (code == "pending" || code.startsWith("error")) continue
+            State.requests[srv] = code
+            prefs.removePending(srv)
+            val ok = code == "ok"
+            State.log("access", "$srv: " + if (ok) "владелец одобрил запрос — доступ есть" else Ygg.accessText(code))
+            notifyAccess(srv, if (ok) "Доступ одобрен" else if (code == "denied") "Запрос доступа отклонён" else "Доступ: ${Ygg.accessText(code)}",
+                if (ok) "Владелец сервера $srv разрешил подключение. Нажмите «Подключиться»." else "Сервер $srv: ${Ygg.accessText(code)}")
+        }
+    }
+
+    /** A notification the user sees even with the app closed (the owner answered a request). */
+    private fun notifyAccess(server: String, title: String, text: String) { try {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ACCESS_CHANNEL) == null) {
+            nm.createNotificationChannel(NotificationChannel(ACCESS_CHANNEL, "Доступ к серверам", NotificationManager.IMPORTANCE_DEFAULT))
+        }
+        val open = PendingIntent.getActivity(this, 2, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, ACCESS_CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
+        nm.notify(server.hashCode(), b.setSmallIcon(R.drawable.ic_notif).setContentTitle(title).setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text)).setContentIntent(open).setAutoCancel(true).build())
+    } catch (_: Exception) {} }
+
     private fun accessTick() { try {
+        requestsTick()
         val server = Ygg.serverFromText(prefs.server)
         if (!prefs.vpnEnabled || prefs.yggOnly || server == null || !State.nodeRunning) { accessLast = null; return }
         val key = prefs.keyFor(server) ?: ""
