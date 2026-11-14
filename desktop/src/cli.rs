@@ -157,6 +157,9 @@ fn status() -> Result<(), String> {
             human(c["tx"].as_u64().unwrap_or(0))
         );
         println!("  пинг до сервера: {}", c["server_rtt"].as_str().unwrap_or("измеряю…"));
+        if let Some(f) = c["failover"].as_str() {
+            println!("  сервер не отвечает — временно через {f} (выбранный проверяется в фоне)");
+        }
         match c["access"].as_str() {
             Some(code) if code.starts_with("error: ") => println!("  доступ: не проверен ({})", &code[7..]),
             Some(code) => println!("  доступ: {}{}", crate::daemon::access_text(code), api::key_left(c["access_expires"].as_u64().unwrap_or(0))),

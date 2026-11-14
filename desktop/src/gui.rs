@@ -297,7 +297,8 @@ impl App {
                     cl["server"].as_str().unwrap_or(""),
                     human(cl["rx"].as_u64().unwrap_or(0)),
                     human(cl["tx"].as_u64().unwrap_or(0)),
-                    cl["server_rtt"].as_str().unwrap_or("измеряю…"),
+                    cl["server_rtt"].as_str().unwrap_or("измеряю…").to_string() + &cl["failover"].as_str()
+                        .map(|f| format!("\nне отвечает — временно через {f}")).unwrap_or_default(),
                     match cl["access"].as_str() {
                         Some(e) if e.starts_with("error: ") => format!("не проверен ({})", &e[7..]),
                         Some(code) => format!("{}{}", crate::daemon::access_text(code), api::key_left(cl["access_expires"].as_u64().unwrap_or(0))),

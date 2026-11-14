@@ -61,6 +61,8 @@ pub struct St {
     tracker_status: Option<String>,
     /// Client: access to the selected server (server, `ok`/`pending`/… or an error, when).
     access: Option<(String, String, Instant, u64)>,
+    /// Client: the chosen server stopped answering — (that server, the one used meanwhile).
+    failover: Option<(String, String)>,
     /// Client: our access requests — server → (status code, when it changed).
     requests: HashMap<String, (String, Instant)>,
     /// A newer release on GitHub (`{version, url, page, notes}`).
@@ -881,7 +883,10 @@ impl Daemon {
         let any = client || cfg.server.enabled || cfg.network.keep_node;
 
         write_monitors(&self.st, &self.dir, cfg);
-        let line = if client && with_exit { format!("[{}]:{}", cfg.client.server.trim(), config::PORT) } else { String::new() };
+        // A fallback while the chosen server does not answer (see failover_watch).
+        let fallback = self.st.lock().unwrap().failover.clone().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1);
+        let active = fallback.unwrap_or_else(|| cfg.client.server.trim().to_string());
+        let line = if client && with_exit { format!("[{active}]:{}", config::PORT) } else { String::new() };
         if platform::write_if_changed(&self.dir.join("connect.txt"), &line)
             && client && with_exit {
                 log(&self.st, "vpn", &format!("сервер выхода: {} (узел не перезапускается)", cfg.client.server));
@@ -1192,6 +1197,112 @@ fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
 }
 
 // ------------------------------------------------------------------------------------------
+// Failover: the chosen server stops answering
+
+/// SOCKS greeting through the client tunnel (local port → node → exit) within `secs`: the
+/// exit answers and lets us in.
+fn exit_answers(secs: u64) -> bool {
+    let Ok(mut s) = TcpStream::connect_timeout(&([127, 0, 0, 1], config::CLIENT_SOCKS).into(), Duration::from_secs(2)) else { return false };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(secs)));
+    let mut b = [0u8; 2];
+    s.write_all(&[5, 1, 0]).is_ok() && s.read_exact(&mut b).is_ok() && b == [5, 0]
+}
+
+fn set_connect(dir: &Path, server: &str) {
+    platform::write_if_changed(&dir.join("connect.txt"), &format!("[{server}]:{}", config::PORT));
+}
+
+/// Another server we may use now (our key or public): the lowest ping among those answering.
+fn pick_fallback(st: &Shared, cfg: &Config, skip: &[&str]) -> Option<String> {
+    let (rtt, exits) = {
+        let s = st.lock().unwrap();
+        (s.node_rtt.clone(), s.tracker_exits.iter().map(|e| e.0.clone()).collect::<Vec<_>>())
+    };
+    let ping: HashMap<String, u64> = rtt.as_ref().and_then(|r| r["servers"].as_array().cloned()).into_iter().flatten()
+        .filter_map(|e| Some((config::parse_server(e["address"].as_str()?)?.to_string(), e["rtt_ms"].as_u64()?)))
+        .collect();
+    let mut cands: Vec<String> = cfg.client.servers.iter().chain(exits.iter())
+        .filter_map(|a| config::parse_server(a)).map(|a| a.to_string())
+        .filter(|a| !skip.contains(&a.as_str()) && ping.contains_key(a))
+        .collect();
+    cands.sort();
+    cands.dedup();
+    cands.sort_by_key(|a| ping[a]);
+    let dev = config::device_name();
+    // The best few at once (each check may wait on the network); the lowest ping that lets us in.
+    let found: Vec<(String, bool)> = std::thread::scope(|sc| {
+        let hs: Vec<_> = cands.iter().take(6).map(|a| {
+            let key = cfg.client.keys.get(a).cloned().unwrap_or_default();
+            let dev = dev.clone();
+            sc.spawn(move || (a.clone(), matches!(probe_access(a, &key, &dev, "", false), Ok((crate::access::Auth::Ok, _)))))
+        }).collect();
+        hs.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+    found.into_iter().find(|f| f.1).map(|f| f.0)
+}
+
+/// If the server in use does not answer for 10 s, switch to another one we may use; meanwhile
+/// check the chosen server in the background (its key and whether it answers) and go back to it
+/// as soon as it does.
+fn failover_watch(st: Shared, cfg: Arc<Mutex<Config>>, dir: PathBuf) {
+    let mut grace_until = Instant::now();
+    let mut last_primary_check = Instant::now();
+    let mut warned = false;
+    while !platform::stopping() {
+        std::thread::sleep(Duration::from_secs(5));
+        let c = cfg.lock().unwrap().clone();
+        let primary = c.client.server.trim().to_string();
+        let on = c.client.enabled && !c.client.ygg_only && config::parse_server(&primary).is_some();
+        let (vpn, node) = { let s = st.lock().unwrap(); (s.vpn_active, s.node_running) };
+        if !on || !node {
+            st.lock().unwrap().failover = None;
+            continue;
+        }
+        let fb = st.lock().unwrap().failover.clone().filter(|f| f.0 == primary);
+        if fb.is_none() && st.lock().unwrap().failover.is_some() {
+            st.lock().unwrap().failover = None; // the user chose another server
+        }
+        // Using a fallback: the chosen server again every 20 s (answers and still lets us in).
+        if let Some((_, alt)) = &fb
+            && last_primary_check.elapsed() >= Duration::from_secs(20) {
+                last_primary_check = Instant::now();
+                let key = c.client.keys.get(&primary).cloned().unwrap_or_default();
+                if let Ok((crate::access::Auth::Ok, _)) = probe_access(&primary, &key, &config::device_name(), "", false) {
+                    log(&st, "vpn", &format!("{primary} снова отвечает — возвращаюсь на него с {alt}"));
+                    st.lock().unwrap().failover = None;
+                    set_connect(&dir, &primary);
+                    grace_until = Instant::now() + Duration::from_secs(20);
+                    continue;
+                }
+            }
+        if !vpn || Instant::now() < grace_until {
+            continue;
+        }
+        if exit_answers(10) {
+            warned = false;
+            continue;
+        }
+        let active = fb.as_ref().map(|f| f.1.clone()).unwrap_or_else(|| primary.clone());
+        match pick_fallback(&st, &c, &[primary.as_str(), active.as_str()]) {
+            Some(alt) => {
+                error(&st, "vpn", &format!("{active} не отвечает больше 10 с — временно через {alt}; {primary} проверяется в фоне"));
+                st.lock().unwrap().failover = Some((primary.clone(), alt.clone()));
+                st.lock().unwrap().server_rtt = None;
+                set_connect(&dir, &alt);
+                grace_until = Instant::now() + Duration::from_secs(20);
+                last_primary_check = Instant::now();
+                warned = false;
+            }
+            None if !warned => {
+                error(&st, "vpn", &format!("{active} не отвечает больше 10 с, а другого сервера с доступом нет — жду"));
+                warned = true;
+            }
+            None => {}
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
 // Control socket
 
 enum Msg {
@@ -1223,6 +1334,7 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
                    "servers": cfg.client.servers, "ygg_sites": cfg.client.ygg_sites, "ygg_only": cfg.client.ygg_only,
                    "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone()),
                    "access_expires": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.3),
+                   "failover": s.failover.as_ref().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1.clone()),
                    "requests": s.requests.iter().map(|(srv, (c, _))| json!({"server": srv, "status": c, "text": access_text(c)})).collect::<Vec<_>>()},
         "rtt": s.node_rtt,
         "trackers": {"enabled": cfg.network.use_trackers, "list": cfg.network.trackers, "status": s.tracker_status,
@@ -1379,6 +1491,12 @@ pub fn main() -> Result<(), String> {
                 }
             }
         });
+    }
+
+    // Client: another server while the chosen one does not answer.
+    {
+        let (st, cfg, dir) = (st.clone(), cfg.clone(), dir.clone());
+        std::thread::spawn(move || failover_watch(st, cfg, dir));
     }
 
     // Client: access to a closed server (a key, or a request to its owner).
