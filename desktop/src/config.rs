@@ -84,6 +84,11 @@ pub struct Server {
     pub enabled: bool,
     pub allow_lan: bool,
     pub limits: Limits,
+    /// Linux: also a crypto-key routing exit (IP tunnel, Yggdrasil-ng compatible): TUN
+    /// `ygg-ckr`, forwarding and NAT. Same access as the proxy (keys or public).
+    pub ckr: bool,
+    /// The CKR exit carries IPv6 too (IPv6 forwarding on this machine).
+    pub ckr_ipv6: bool,
 }
 
 
@@ -106,11 +111,21 @@ pub struct Client {
     pub ygg_only: bool,
     /// ALFIS resolvers (Yggdrasil addresses); empty: the built-in list.
     pub alfis: Vec<String>,
+    /// VPN as a crypto-key routing tunnel (every IP packet, UDP included) instead of the proxy:
+    /// the exit must support CKR (Ratatoskr 0.1.16+ with CKR on, or Yggdrasil-ng).
+    pub ckr: bool,
+    /// Our IPv4 address in the CKR tunnel (a Yggdrasil-ng exit may expect a specific one).
+    pub ckr_address: String,
+    /// DNS servers used through the CKR tunnel.
+    pub ckr_dns: Vec<String>,
 }
+
+pub const CKR_ADDRESS: &str = "10.99.0.2";
 
 impl Default for Client {
     fn default() -> Self {
-        Self { enabled: false, server: String::new(), servers: Vec::new(), keys: Default::default(), udp: true, ipv6: true, ygg_sites: true, ygg_only: false, alfis: Vec::new() }
+        Self { enabled: false, server: String::new(), servers: Vec::new(), keys: Default::default(), udp: true, ipv6: true, ygg_sites: true, ygg_only: false, alfis: Vec::new(),
+               ckr: false, ckr_address: CKR_ADDRESS.into(), ckr_dns: vec!["1.1.1.1".into(), "9.9.9.9".into()] }
     }
 }
 

@@ -363,16 +363,23 @@ fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peer
 #[cfg(unix)]
 struct Vpn {
     tun: std::fs::File,
-    helper: Proc,
+    /// tun2proxy (the proxy VPN); none in the CKR mode, where the node reads the TUN itself.
+    helper: Option<Proc>,
     ctl: Arc<Mutex<Option<UnixStream>>>,
     ipv6: bool,
     sig: String,
     /// Yggdrasil-only: no policy routing to undo.
     only: bool,
+    /// Crypto-key routing: the TUN is handed to the node over its --ckr-ctl socket.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    ckr: bool,
+    /// Our Yggdrasil address, once put on the TUN (CKR: the IPv6 source).
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    v6: Option<String>,
 }
 
 #[cfg(unix)]
-fn open_tun(name: &str) -> std::io::Result<std::fs::File> {
+fn open_tun(name: &str, packet_info: bool) -> std::io::Result<std::fs::File> {
     const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
     #[repr(C)]
     struct IfReq {
@@ -383,7 +390,9 @@ fn open_tun(name: &str) -> std::io::Result<std::fs::File> {
     let f = std::fs::OpenOptions::new().read(true).write(true).open("/dev/net/tun")?;
     // IFF_TUN with packet information: tun2proxy on Linux reads a 4-byte PI header (on Android
     // the VpnService fd has none, and tun2proxy knows it there).
-    let mut req = IfReq { name: [0; 16], flags: 0x0001, _pad: [0; 22] };
+    // CKR: the node reads plain packets (IFF_NO_PI).
+    let flags = if packet_info { 0x0001 } else { 0x0001 | 0x1000 };
+    let mut req = IfReq { name: [0; 16], flags, _pad: [0; 22] };
     req.name[..name.len()].copy_from_slice(name.as_bytes());
     use std::os::fd::AsRawFd;
     if unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF as _, &mut req) } < 0 {
@@ -450,7 +459,10 @@ fn routes(st: &Shared, add: bool, ipv6: bool) {
 
 #[cfg(unix)]
 fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vpn, String> {
-    let tun = open_tun(config::TUN_NAME).map_err(|e| format!("TUN {}: {e}", config::TUN_NAME))?;
+    if cfg.client.ckr && !cfg.client.ygg_only {
+        return vpn_up_ckr(st, cfg);
+    }
+    let tun = open_tun(config::TUN_NAME, true).map_err(|e| format!("TUN {}: {e}", config::TUN_NAME))?;
     let dev = config::TUN_NAME;
     let (ygg, only) = (cfg.client.ygg_sites || cfg.client.ygg_only, cfg.client.ygg_only);
     run(st, &["ip", "addr", "replace", "10.111.222.2/24", "dev", dev]);
@@ -525,13 +537,41 @@ fn vpn_up(st: &Shared, dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vp
     log(st, "vpn", &if only { format!("интерфейс {dev} поднят: только сайты Yggdrasil и ALFIS") } else {
         format!("интерфейс {dev} поднят, выход через {}{}", cfg.client.server, if ygg { ", сайты Yggdrasil и ALFIS — через свой узел" } else { "" })
     });
-    Ok(Vpn { tun, helper, ctl, ipv6: cfg.client.ipv6, sig: vpn_sig(cfg), only })
+    Ok(Vpn { tun, helper: Some(helper), ctl, ipv6: cfg.client.ipv6, sig: vpn_sig(cfg), only, ckr: false, v6: None })
+}
+
+/// The CKR VPN: a TUN with our tunnel address and the VPN routes; the node reads it (handed
+/// over by [`Daemon::ckr_tick`]) and carries every packet to the exit by its key.
+#[cfg(unix)]
+fn vpn_up_ckr(st: &Shared, cfg: &Config) -> Result<Vpn, String> {
+    let c = &cfg.client;
+    let addr: std::net::Ipv4Addr = c.ckr_address.trim().parse().map_err(|_| format!("CKR: неверный адрес туннеля «{}»", c.ckr_address))?;
+    let tun = open_tun(config::TUN_NAME, false).map_err(|e| format!("TUN {}: {e}", config::TUN_NAME))?;
+    let dev = config::TUN_NAME;
+    run(st, &["ip", "addr", "replace", &format!("{addr}/32"), "dev", dev]);
+    run(st, &["ip", "link", "set", dev, "mtu", "1500", "up"]);
+    routes(st, true, c.ipv6);
+    if c.ygg_sites && !c.ipv6 {
+        run(st, &["ip", "-6", "route", "replace", "200::/7", "dev", dev, "table", &config::TABLE.to_string()]);
+    }
+    let dns: Vec<&str> = c.ckr_dns.iter().map(|d| d.trim()).filter(|d| d.parse::<std::net::IpAddr>().is_ok()).collect();
+    if have("resolvectl") && !dns.is_empty() {
+        let mut a = vec!["resolvectl", "dns", dev];
+        a.extend(dns.iter().copied());
+        run(st, &a);
+        run(st, &["resolvectl", "domain", dev, "~."]);
+        run(st, &["resolvectl", "default-route", dev, "yes"]);
+    }
+    log(st, "vpn", &format!("интерфейс {dev} поднят: туннель CKR (весь IP-трафик) через {}, адрес {addr}", c.server));
+    Ok(Vpn { tun, helper: None, ctl: Arc::new(Mutex::new(None)), ipv6: c.ipv6, sig: vpn_sig(cfg), only: false, ckr: true, v6: None })
 }
 
 #[cfg(unix)]
 fn vpn_down(st: &Shared, v: Vpn) {
     *v.ctl.lock().unwrap() = None;
-    v.helper.stop(st, "tun", "VPN выключен");
+    if let Some(h) = &v.helper {
+        h.stop(st, "tun", "VPN выключен");
+    }
     if !v.only {
         routes(st, false, v.ipv6);
     }
@@ -612,6 +652,9 @@ fn win_net_setup(st: &Shared, only: bool) {
 
 #[cfg(windows)]
 fn vpn_up(st: &Shared, _dir: &Path, helper_bin: &Path, cfg: &Config) -> Result<Vpn, String> {
+    if cfg.client.ckr {
+        log(st, "vpn", "туннель CKR на Windows пока не поддерживается — VPN через прокси");
+    }
     let mut cmd = vec![
         helper_bin.display().to_string(),
         "tun".into(),
@@ -662,7 +705,7 @@ fn vpn_down(st: &Shared, v: Vpn) {
 fn vpn_sig(cfg: &Config) -> String {
     // The server is not part of it: the node switches servers by itself (connect.txt).
     let c = &cfg.client;
-    format!("{}|{}|{}|{}|{}", c.udp, c.ipv6, c.ygg_sites, c.ygg_only, c.alfis.join(","))
+    format!("{}|{}|{}|{}|{}|{}|{}|{}", c.udp, c.ipv6, c.ygg_sites, c.ygg_only, c.alfis.join(","), c.ckr, c.ckr_address, c.ckr_dns.join(","))
 }
 
 /// ALFIS zones: on Linux and Windows only these names go to the tunnel's DNS in the
@@ -808,6 +851,8 @@ struct Daemon {
     node: Option<Proc>,
     exit: Option<Proc>,
     vpn: Option<Vpn>,
+    /// CKR exit firewall set up: (IPv6, LAN allowed).
+    ckr_fw: Option<(bool, bool)>,
 }
 
 impl Daemon {
@@ -874,7 +919,18 @@ impl Daemon {
                 "--proxy-protocol".into(),
                 p,
             ]);
+            if ckr_exit_wanted(cfg) {
+                a.extend([
+                    "--ckr-tun".into(),
+                    CKR_EXIT_TUN.into(),
+                    "--ckr-allow-file".into(),
+                    d.join("ckr-allow.txt").display().to_string(),
+                ]);
+            }
         }
+        // The CKR VPN hands its TUN over this socket whenever it comes up (no node restart).
+        #[cfg(all(unix, not(target_os = "android")))]
+        a.extend(["--ckr-ctl".into(), ckr_ctl_path().display().to_string()]);
         a.extend(n.extra_args.split_whitespace().map(String::from));
         a
     }
@@ -917,6 +973,18 @@ impl Daemon {
             s.node_running = false;
             s.node_stats = None;
             s.node_peers = None;
+        }
+
+        // CKR exit: forwarding, NAT and the guard rules (the interface itself: ckr_tick).
+        let want = ckr_exit_wanted(cfg).then_some((cfg.server.ckr_ipv6, cfg.server.allow_lan));
+        if want != self.ckr_fw {
+            if let Some((v6, _)) = self.ckr_fw.take() {
+                ckr_firewall(&self.st, &self.dir, false, v6, false);
+            }
+            if let Some((v6, lan)) = want {
+                ckr_firewall(&self.st, &self.dir, true, v6, lan);
+                self.ckr_fw = want;
+            }
         }
 
         // 2. Exit.
@@ -987,11 +1055,206 @@ impl Daemon {
         if let Some(v) = self.vpn.take() {
             vpn_down(&self.st, v);
         }
+        if let Some((v6, _)) = self.ckr_fw.take() {
+            ckr_firewall(&self.st, &self.dir, false, v6, false);
+        }
         if let Some(p) = self.exit.take() {
             p.stop(&self.st, "exit", "служба завершается");
         }
         if let Some(p) = self.node.take() {
             p.stop(&self.st, "node", "служба завершается");
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// Crypto-key routing (CKR), Linux: an IP tunnel next to the proxy, Yggdrasil-ng compatible.
+// Exit: the node's TUN `ygg-ckr` (clients get 10.77.x.y / fd77:7967:6772::x there), forwarding
+// and NAT, guard rules (no LAN, no host services), and who may use it from access.json.
+// Client: our TUN handed to the node, which carries every packet to the exit by its key.
+
+const CKR_EXIT_TUN: &str = "ygg-ckr";
+const CKR_CHAIN: &str = "RATATOSKR-CKR";
+const CKR_POOL4: &str = "10.77.0.0/16";
+const CKR_POOL6: &str = "fd77:7967:6772::/64";
+const CKR_NO_LAN4: &[&str] = &["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3"];
+const CKR_NO_LAN6: &[&str] = &["::1/128", "fc00::/7", "fe80::/10", "ff00::/8", "200::/7"];
+
+fn ckr_exit_wanted(cfg: &Config) -> bool {
+    cfg!(target_os = "linux") && cfg.server.enabled && cfg.server.ckr
+}
+
+#[cfg_attr(not(all(unix, not(target_os = "android"))), allow(dead_code))]
+fn ckr_ctl_path() -> PathBuf {
+    config::socket_path().with_file_name("yggproxy-ckr.sock")
+}
+
+/// Who may use the CKR exit: `*` when the server is public, else the addresses of devices
+/// with a valid key (the same rule as the proxy's).
+fn ckr_allow_text() -> String {
+    let a = crate::access::Access::load(&config::access_path());
+    if a.public {
+        return "*\n".into();
+    }
+    let t = crate::access::now();
+    let mut v: Vec<&str> = a.keys.iter().filter(|k| k.expires > t).filter_map(|k| k.addr.as_deref()).collect();
+    v.sort();
+    v.dedup();
+    v.iter().map(|x| format!("{x}\n")).collect()
+}
+
+/// Forwarding, NAT and guard rules of the CKR exit (`up` = false removes them). The previous
+/// forwarding setting is kept in the state directory and restored.
+fn ckr_firewall(st: &Shared, dir: &Path, up: bool, ipv6: bool, allow_lan: bool) {
+    if !cfg!(target_os = "linux") {
+        return;
+    }
+    let tun = CKR_EXIT_TUN;
+    let fams: Vec<(&str, &str, &[&str], &str)> = if ipv6 {
+        vec![("iptables", CKR_POOL4, CKR_NO_LAN4, "net.ipv4.ip_forward"), ("ip6tables", CKR_POOL6, CKR_NO_LAN6, "net.ipv6.conf.all.forwarding")]
+    } else {
+        vec![("iptables", CKR_POOL4, CKR_NO_LAN4, "net.ipv4.ip_forward")]
+    };
+    let ok = |a: &[&str]| command(a[0]).args(&a[1..]).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    for (ipt, pool, no_lan, sysctl) in fams {
+        #[cfg(unix)]
+        if !have(ipt) {
+            error(st, "ckr", &format!("нет {ipt}: выход CKR не настроен"));
+            continue;
+        }
+        let saved = dir.join(format!("ckr-{sysctl}.prev"));
+        let proc_path = format!("/proc/sys/{}", sysctl.replace('.', "/"));
+        let rules: Vec<Vec<&str>> = vec![
+            vec!["-t", "nat", "POSTROUTING", "-s", pool, "!", "-d", pool, "-j", "MASQUERADE"],
+            vec!["-t", "filter", "FORWARD", "-i", tun, "-j", CKR_CHAIN],
+            vec!["-t", "filter", "FORWARD", "-o", tun, "-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED", "-j", "ACCEPT"],
+            vec!["-t", "filter", "INPUT", "-i", tun, "-j", "DROP"],
+        ];
+        // "-t T CHAIN rest" -> [ipt, "-t", T, op, CHAIN, rest...]
+        let cmd = |op: &str, r: &[&str]| -> Vec<String> {
+            let mut v = vec![ipt.to_string(), r[0].into(), r[1].into(), op.into(), r[2].into()];
+            if op == "-I" {
+                v.push("1".into());
+            }
+            v.extend(r[3..].iter().map(|x| x.to_string()));
+            v
+        };
+        if up {
+            quiet(&[ipt, "-N", CKR_CHAIN]);
+            quiet(&[ipt, "-F", CKR_CHAIN]);
+            if !allow_lan {
+                for n in no_lan {
+                    run(st, &[ipt, "-A", CKR_CHAIN, "-d", n, "-j", "DROP"]);
+                }
+            }
+            run(st, &[ipt, "-A", CKR_CHAIN, "-j", "ACCEPT"]);
+            for r in &rules {
+                let check = cmd("-C", r);
+                let check: Vec<&str> = check.iter().map(String::as_str).collect();
+                if !ok(&check) {
+                    let add = cmd(if r[1] == "nat" { "-A" } else { "-I" }, r);
+                    let add: Vec<&str> = add.iter().map(String::as_str).collect();
+                    run(st, &add);
+                }
+            }
+            if !saved.exists() {
+                let _ = std::fs::write(&saved, std::fs::read_to_string(&proc_path).unwrap_or_else(|_| "0".into()));
+            }
+            if sysctl.starts_with("net.ipv6") {
+                // IPv6 forwarding would make Linux ignore router advertisements (and lose the
+                // IPv6 default route): keep accepting them where they were accepted.
+                if let Ok(rd) = std::fs::read_dir("/proc/sys/net/ipv6/conf") {
+                    for e in rd.flatten() {
+                        let p = e.path().join("accept_ra");
+                        if std::fs::read_to_string(&p).map(|v| v.trim() == "1").unwrap_or(false) {
+                            let _ = std::fs::write(&p, "2");
+                        }
+                    }
+                }
+            }
+            let _ = std::fs::write(&proc_path, "1");
+        } else {
+            for r in &rules {
+                let del = cmd("-D", r);
+                let del: Vec<&str> = del.iter().map(String::as_str).collect();
+                while ok(&del) {}
+            }
+            quiet(&[ipt, "-F", CKR_CHAIN]);
+            quiet(&[ipt, "-X", CKR_CHAIN]);
+            if let Ok(prev) = std::fs::read_to_string(&saved) {
+                let _ = std::fs::write(&proc_path, prev.trim());
+                let _ = std::fs::remove_file(&saved);
+            }
+        }
+    }
+    log(st, "ckr", if up { "выход CKR: пересылка и NAT включены (10.77.0.0/16)" } else { "выход CKR: пересылка и NAT убраны" });
+}
+
+impl Daemon {
+    /// Every 2 s: the CKR exit's interface and allow list; the CKR VPN's TUN handed to the
+    /// node (again after a node restart) and our Yggdrasil address put on it.
+    fn ckr_tick(&mut self, cfg: &Config) {
+        if ckr_exit_wanted(cfg) && self.node.is_some() {
+            platform::write_if_changed(&self.dir.join("ckr-allow.txt"), &ckr_allow_text());
+            let flags = std::fs::read_to_string(format!("/sys/class/net/{CKR_EXIT_TUN}/flags")).ok();
+            if let Some(f) = flags {
+                let up = u32::from_str_radix(f.trim().trim_start_matches("0x"), 16).map(|v| v & 1 == 1).unwrap_or(false);
+                if !up {
+                    run(&self.st, &["ip", "addr", "replace", "10.77.0.1/16", "dev", CKR_EXIT_TUN]);
+                    if cfg.server.ckr_ipv6 {
+                        run(&self.st, &["ip", "-6", "addr", "replace", "fd77:7967:6772::1/64", "dev", CKR_EXIT_TUN, "nodad"]);
+                    }
+                    run(&self.st, &["ip", "link", "set", CKR_EXIT_TUN, "mtu", "1500", "up"]);
+                    log(&self.st, "ckr", &format!("интерфейс {CKR_EXIT_TUN} поднят"));
+                }
+            }
+        }
+        #[cfg(all(unix, not(target_os = "android")))]
+        if let Some(v) = self.vpn.as_mut().filter(|v| v.ckr) {
+            use std::io::Read;
+            use std::os::fd::AsRawFd;
+            let mut ctl = v.ctl.lock().unwrap();
+            let gone = match ctl.as_mut() {
+                None => true,
+                Some(s) => {
+                    let mut b = [0u8; 16];
+                    match s.read(&mut b) {
+                        Ok(0) => true,
+                        Ok(_) => false,
+                        Err(e) => e.kind() != std::io::ErrorKind::WouldBlock,
+                    }
+                }
+            };
+            if gone {
+                let was = ctl.take().is_some();
+                match UnixStream::connect(ckr_ctl_path()).and_then(|s| send_fd(&s, v.tun.as_raw_fd()).and_then(|_| s.set_nonblocking(true)).map(|_| s)) {
+                    Ok(s) => {
+                        *ctl = Some(s);
+                        self.st.lock().unwrap().vpn_active = true;
+                        log(&self.st, "vpn", "туннель CKR передан узлу");
+                    }
+                    Err(e) => {
+                        self.st.lock().unwrap().vpn_active = false;
+                        if was {
+                            error(&self.st, "vpn", &format!("узел отпустил туннель CKR, передаю снова: {e}"));
+                        }
+                    }
+                }
+            }
+            drop(ctl);
+            // Traffic: what the node wrote into the TUN came from the exit (↓).
+            let stat = |n: &str| std::fs::read_to_string(format!("/sys/class/net/{}/statistics/{n}", config::TUN_NAME)).ok().and_then(|v| v.trim().parse::<u64>().ok());
+            if let (Some(rx), Some(tx)) = (stat("rx_bytes"), stat("tx_bytes")) {
+                let mut s = self.st.lock().unwrap();
+                s.tun_rx = rx;
+                s.tun_tx = tx;
+            }
+            let addr = self.st.lock().unwrap().address.clone();
+            if let Some(a) = addr.filter(|a| v.v6.as_deref() != Some(a.as_str())) {
+                if run(&self.st, &["ip", "-6", "addr", "replace", &format!("{a}/128"), "dev", config::TUN_NAME, "nodad"]) {
+                    v.v6 = Some(a);
+                }
+            }
         }
     }
 }
@@ -1213,6 +1476,15 @@ fn exit_answers(secs: u64) -> bool {
     s.write_all(&[5, 1, 0]).is_ok() && s.read_exact(&mut b).is_ok() && b == [5, 0]
 }
 
+/// CKR: the exit answers our node's pings (a Yggdrasil-ng exit has no proxy to ask).
+fn ckr_answers(st: &Shared, server: &str) -> bool {
+    let Some(want) = config::parse_server(server) else { return false };
+    let rtt = st.lock().unwrap().node_rtt.clone();
+    rtt.as_ref().and_then(|r| r["servers"].as_array().cloned()).into_iter().flatten().any(|e| {
+        e["address"].as_str().and_then(config::parse_server) == Some(want) && e["age_ms"].as_u64().is_some_and(|a| a < 12_000)
+    })
+}
+
 fn set_connect(dir: &Path, server: &str) {
     platform::write_if_changed(&dir.join("connect.txt"), &format!("[{server}]:{}", config::PORT));
 }
@@ -1258,6 +1530,8 @@ fn failover_watch(st: Shared, cfg: Arc<Mutex<Config>>, dir: PathBuf) {
         let c = cfg.lock().unwrap().clone();
         let primary = c.client.server.trim().to_string();
         let on = c.client.enabled && !c.client.ygg_only && config::parse_server(&primary).is_some();
+        // CKR: pings decide (the exit may be Yggdrasil-ng, without our proxy).
+        let ckr = c.client.ckr && cfg!(unix);
         let (vpn, node) = { let s = st.lock().unwrap(); (s.vpn_active, s.node_running) };
         if !on || !node {
             st.lock().unwrap().failover = None;
@@ -1272,7 +1546,12 @@ fn failover_watch(st: Shared, cfg: Arc<Mutex<Config>>, dir: PathBuf) {
             && last_primary_check.elapsed() >= Duration::from_secs(20) {
                 last_primary_check = Instant::now();
                 let key = c.client.keys.get(&primary).cloned().unwrap_or_default();
-                if let Ok((crate::access::Auth::Ok, _)) = probe_access(&primary, &key, &config::device_name(), "", false) {
+                let back = if ckr {
+                    ckr_answers(&st, &primary)
+                } else {
+                    matches!(probe_access(&primary, &key, &config::device_name(), "", false), Ok((crate::access::Auth::Ok, _)))
+                };
+                if back {
                     log(&st, "vpn", &format!("{primary} снова отвечает — возвращаюсь на него с {alt}"));
                     st.lock().unwrap().failover = None;
                     set_connect(&dir, &primary);
@@ -1283,11 +1562,11 @@ fn failover_watch(st: Shared, cfg: Arc<Mutex<Config>>, dir: PathBuf) {
         if !vpn || Instant::now() < grace_until {
             continue;
         }
-        if exit_answers(10) {
+        let active = fb.as_ref().map(|f| f.1.clone()).unwrap_or_else(|| primary.clone());
+        if if ckr { ckr_answers(&st, &active) } else { exit_answers(10) } {
             warned = false;
             continue;
         }
-        let active = fb.as_ref().map(|f| f.1.clone()).unwrap_or_else(|| primary.clone());
         match pick_fallback(&st, &c, &[primary.as_str(), active.as_str()]) {
             Some(alt) => {
                 error(&st, "vpn", &format!("{active} не отвечает больше 10 с — временно через {alt}; {primary} проверяется в фоне"));
@@ -1332,11 +1611,12 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
         "server": {"enabled": cfg.server.enabled, "active": s.exit_active,
                    "link": s.address.as_ref().map(|a| config::connect_link(a)),
                    "active_conns": s.srv[0], "total": s.srv[1], "denied": s.srv[2], "tx": s.srv[3], "rx": s.srv[4],
-                   "clients": clients, "limits": cfg.server.limits,
+                   "clients": clients, "limits": cfg.server.limits, "ckr": ckr_exit_wanted(cfg), "ckr_ipv6": cfg.server.ckr_ipv6,
                    "access": access_summary()},
         "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "active": s.vpn_active,
                    "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
                    "servers": cfg.client.servers, "ygg_sites": cfg.client.ygg_sites, "ygg_only": cfg.client.ygg_only,
+                   "ckr": cfg.client.ckr && cfg!(unix) && !cfg.client.ygg_only, "ckr_address": cfg.client.ckr_address,
                    "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone()),
                    "access_expires": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.3),
                    "failover": s.failover.as_ref().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1.clone()),
@@ -1510,7 +1790,8 @@ pub fn main() -> Result<(), String> {
         std::thread::spawn(move || access_watch(st, cfg));
     }
 
-    let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, exit: None, vpn: None };
+    let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, exit: None, vpn: None, ckr_fw: None };
+    let mut last_ckr = Instant::now();
     let snapshot = cfg.lock().unwrap().clone();
     d.reconcile(&snapshot);
     let mut last_peer_check = Instant::now();
@@ -1534,6 +1815,11 @@ pub fn main() -> Result<(), String> {
             }
             Ok(Msg::RefreshTrackers) => last_trackers = None,
             Err(_) => {}
+        }
+        if last_ckr.elapsed() >= Duration::from_secs(2) {
+            last_ckr = Instant::now();
+            let c = cfg.lock().unwrap().clone();
+            d.ckr_tick(&c);
         }
         // Trackers: exits and more trackers every 2 min, checked public peers hourly (fetched
         // directly through a yggdrasil-go TUN or through the node's --socks).

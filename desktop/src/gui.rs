@@ -278,7 +278,12 @@ impl App {
         ui.checkbox(&mut c.client.ygg_sites, "Сайты Yggdrasil и ALFIS (.ygg, .anon…) — через свой узел, рядом с интернетом")
             .on_hover_text("Адреса 200::/7 и имена ALFIS идут в сеть Yggdrasil напрямую, остальное — через сервер выхода. Только TCP: сайты, SSH, чаты.");
         ui.checkbox(&mut c.client.ygg_only, "Только Yggdrasil: VPN без сервера выхода (интернет как обычно)");
-        if (ys, yo) != (c.client.ygg_sites, c.client.ygg_only) {
+        let ck = c.client.ckr;
+        if cfg!(unix) {
+            ui.checkbox(&mut c.client.ckr, "Туннель CKR: весь IP-трафик (UDP, игры, звонки) — сервер должен поддерживать CKR")
+                .on_hover_text("Пакеты целиком идут к серверу выхода по его ключу Yggdrasil, как в Yggdrasil-ng. Подходит сервер Ratatoskr с включённым выходом CKR или Yggdrasil-ng с tunnel_routing.");
+        }
+        if (ys, yo, ck) != (c.client.ygg_sites, c.client.ygg_only, c.client.ckr) {
             self.apply("Сохранено");
         }
         if let Some(s) = st {
@@ -432,6 +437,18 @@ impl App {
         ui.separator();
         let Some(c) = self.cfg.as_mut() else { return };
         ui.checkbox(&mut c.server.allow_lan, "Разрешить клиентам доступ в мою LAN");
+        if cfg!(target_os = "linux") {
+            let was = (c.server.ckr, c.server.ckr_ipv6);
+            ui.checkbox(&mut c.server.ckr, "Выход CKR: IP-туннель для клиентов (совместим с Yggdrasil-ng)")
+                .on_hover_text("Клиенты получают весь IP-трафик, UDP тоже. Включает пересылку и NAT на этом компьютере; доступ — те же ключи. Ограничения скорости к нему не применяются.");
+            if c.server.ckr {
+                ui.checkbox(&mut c.server.ckr_ipv6, "  и IPv6 (включает пересылку IPv6)");
+            }
+            if was != (c.server.ckr, c.server.ckr_ipv6) {
+                self.apply("Сохранено");
+            }
+        }
+        let Some(c) = self.cfg.as_mut() else { return };
         let on = c.server.enabled;
         if ui.add_sized([220.0, 32.0], egui::Button::new(if on { "Остановить сервер" } else { "Запустить сервер" })).clicked() {
             c.server.enabled = !on;

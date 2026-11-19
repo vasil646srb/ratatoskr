@@ -37,6 +37,7 @@ apps → VPN (TUN) → tun2proxy ─SOCKS5→ tcp_node ══ Yggdrasil ══ t
 | **Access keys** | a key (1–365 days) binds to the first device that uses it; renew, unbind, delete; the client shows how long its key is still valid; access requests (with a message to the owner) from devices without a key — approve or deny |
 | **Quick connect** | QR code or a `yggproxy://c?a=ADDRESS&k=KEY` link (the system camera opens it too), or the address and key typed in |
 | **Yggdrasil and ALFIS sites** | `200::/7` addresses (and `300::/8` subnets) and ALFIS names (`.ygg`, `.anon`, `.btn`, `.conf`, `.index`, `.merch`, `.mirror`, `.mob`, `.screen`, `.srv`) go through the device's own node, next to the internet through the exit; a "Yggdrasil only" mode runs the VPN without an exit server. TCP only: sites, SSH, chats |
+| **CKR tunnel** | a VPN mode where all IP traffic (UDP, games, calls, ping) goes to the exit as packets addressed to its Yggdrasil key — crypto-key routing, compatible with [Yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng); a Linux exit serves it with NAT, access by the same keys |
 | **Updates** | the app and the service check GitHub releases and offer new versions; `sudo yggproxy update` on Linux downloads and installs one |
 | **Server list** | saved servers plus servers from trackers, ping to each and to the network root |
 | **Peer selection** | the client replaces its Yggdrasil peers while the ping to the server is above a threshold |
@@ -151,6 +152,40 @@ Tracker schedule (configurable in `/etc/yggproxy/tracker.json`):
 | an exit or tracker is hidden from the list | after 2 failed checks in a row (~10 min) or 24 h without an answer; it comes back as soon as it answers |
 | public peers: download the list and check every peer | hourly |
 
+## CKR tunnel (crypto-key routing)
+
+Besides the proxy (SOCKS on port 27080) the client can work as an IP tunnel: plain IPv4 and IPv6
+packets travel inside Yggdrasil traffic to the exit's node by its key — the same way as Revertron's
+[Yggdrasil-ng](https://github.com/Revertron/Yggdrasil-ng) (`tunnel_routing`) and yggdrasilckr do.
+Everything passes: UDP, games, calls, ping.
+
+**Server (Linux).** `sudo yggproxy set ckr_exit on` (or the "Выход CKR" box in the window). The node
+creates the `ygg-ckr` interface, the service turns on forwarding and NAT: clients get `10.77.x.y`
+(IPv6: `fd77:7967:6772::x` with `ckr_exit_ipv6 on`). It lets in the same devices as the proxy: those
+with a valid key, or everyone on a public exit. The server's LAN and the server itself are closed to
+the tunnel (unless LAN access is allowed). Speed limits do not apply to the tunnel yet.
+
+**Client (Linux, Android).** `yggproxy set ckr on` (the "Туннель CKR" box in the window or the app).
+The server is chosen as usual. Our tunnel address is `ckr_address` (default `10.99.0.2`), DNS is
+`ckr_dns` (default `1.1.1.1, 9.9.9.9`). Yggdrasil addresses still work in this mode, ALFIS names do
+not. Windows has the proxy only for now.
+
+**A Yggdrasil-ng exit for a Ratatoskr client:**
+
+```toml
+[tunnel_routing]
+enable = true
+yggdrasil_routing = true
+ip_addresses = ["10.99.0.1/24"]
+
+[tunnel_routing.remote_subnets]
+"<CLIENT_KEY>" = ["10.99.0.2/32"]
+```
+
+plus forwarding and NAT on that server (see the Yggdrasil-ng docs). Yggdrasil-ng clients use a
+Ratatoskr exit with `"<SERVER_KEY>" = ["0.0.0.0/1", "128.0.0.0/1"]`; a Ratatoskr exit accepts any
+tunnel address they pick, but access is needed as usual (a key, or a public exit).
+
 ## Ports
 
 | Port | Where | Purpose |
@@ -168,6 +203,9 @@ Tracker schedule (configurable in `/etc/yggproxy/tracker.json`):
   binds to one device; delete or unbind a lost one. A public exit is open to anyone who finds it and
   people browse the internet as you, so the app warns about the consequences first. Use speed limits. The server's LAN is closed (unless "Разрешить клиентам доступ в мою LAN"
   is checked).
+- The CKR exit turns on packet forwarding and NAT on the server (for `10.77.0.0/16` only), with
+  `iptables` rules in their own `RATATOSKR-CKR` chain; turning it off removes them and restores the
+  previous forwarding setting.
 - Traffic inside Yggdrasil is encrypted by the network; from the exit to a website it is as usual
   (HTTPS stays HTTPS).
 - The exit sees where its clients go, like any VPN provider. Client DNS queries go through the

@@ -30,6 +30,9 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
                                ограничить, Мбит/с (0 — без ограничения): весь сервер или
                                каждого клиента; применяется сразу, без обрыва соединений
   yggproxy lan on|off          пускать клиентов в локальную сеть сервера
+  yggproxy set ckr_exit on|off  Linux: ещё и выход CKR — IP-туннель, совместимый с Yggdrasil-ng
+                               (пересылка и NAT на этой машине; доступ — те же ключи)
+  yggproxy set ckr_exit_ipv6 on|off  выход CKR и для IPv6 (включает пересылку IPv6)
 
 Клиент (VPN):
   yggproxy servers             серверы выхода: сохранённые и от трекеров, с пингом
@@ -38,6 +41,10 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
                                без адреса — к серверу с наименьшим пингом
   yggproxy request АДРЕС [СООБЩЕНИЕ]  запросить доступ к закрытому серверу (с сообщением владельцу)
   yggproxy forget АДРЕС        убрать сервер из сохранённых
+  yggproxy set ckr on|off      Linux: VPN через CKR — весь IP-трафик (UDP, игры, звонки) туннелем
+                               к серверу; нужен сервер с CKR (Ratatoskr или Yggdrasil-ng)
+  yggproxy set ckr_address IP  наш IPv4 в туннеле CKR (по умолчанию 10.99.0.2)
+  yggproxy set ckr_dns A,B     DNS через туннель CKR (по умолчанию 1.1.1.1,9.9.9.9)
   yggproxy ygg                 VPN только для сайтов Yggdrasil и ALFIS (.ygg, .anon…), без сервера
   yggproxy disconnect          отключиться
   yggproxy speedtest           тест скорости до сервера (10 с приём, 10 с отдача)
@@ -123,6 +130,9 @@ fn status() -> Result<(), String> {
             human(sv["tx"].as_u64().unwrap_or(0)),
             human(sv["rx"].as_u64().unwrap_or(0))
         );
+        if sv["ckr"].as_bool() == Some(true) {
+            println!("  выход CKR: включён (IP-туннель, клиенты {}){}", "10.77.0.0/16", if sv["ckr_ipv6"].as_bool() == Some(true) { ", и IPv6" } else { ", только IPv4" });
+        }
         let a = &sv["access"];
         if a["public"].as_bool() == Some(true) {
             println!("  ПУБЛИЧНЫЙ: пользоваться может любой");
@@ -156,6 +166,9 @@ fn status() -> Result<(), String> {
             human(c["rx"].as_u64().unwrap_or(0)),
             human(c["tx"].as_u64().unwrap_or(0))
         );
+        if c["ckr"].as_bool() == Some(true) {
+            println!("  режим: туннель CKR (весь IP-трафик), адрес {}", c["ckr_address"].as_str().unwrap_or("?"));
+        }
         println!("  пинг до сервера: {}", c["server_rtt"].as_str().unwrap_or("измеряю…"));
         if let Some(f) = c["failover"].as_str() {
             println!("  сервер не отвечает — временно через {f} (выбранный проверяется в фоне)");
@@ -415,10 +428,15 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             "ipv6" => c.client.ipv6 = b.clone().unwrap_or(c.client.ipv6),
             "ygg_sites" => c.client.ygg_sites = b.clone().unwrap_or(c.client.ygg_sites),
             "alfis" => c.client.alfis = val.split(',').map(|s| s.trim().to_string()).filter(|s| config::parse_server(s).is_some()).collect(),
+            "ckr" => c.client.ckr = b.clone().unwrap_or(c.client.ckr),
+            "ckr_address" if val.trim().parse::<std::net::Ipv4Addr>().is_ok() => c.client.ckr_address = val.trim().to_string(),
+            "ckr_dns" => c.client.ckr_dns = val.split(',').map(|s| s.trim().to_string()).filter(|s| s.parse::<std::net::IpAddr>().is_ok()).collect(),
+            "ckr_exit" => c.server.ckr = b.clone().unwrap_or(c.server.ckr),
+            "ckr_exit_ipv6" => c.server.ckr_ipv6 = b.clone().unwrap_or(c.server.ckr_ipv6),
             _ => {}
         }
     })?;
-    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis"];
+    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis", "ckr", "ckr_address", "ckr_dns", "ckr_exit", "ckr_exit_ipv6"];
     if !known.contains(&key) {
         return Err(format!("неизвестная настройка {key}"));
     }

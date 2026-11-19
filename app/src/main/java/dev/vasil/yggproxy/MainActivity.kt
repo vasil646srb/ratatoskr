@@ -60,6 +60,9 @@ class MainActivity : Activity() {
     private lateinit var cbIpv6: CheckBox
     private lateinit var cbYggSites: CheckBox
     private lateinit var cbYggOnly: CheckBox
+    private lateinit var cbCkr: CheckBox
+    private lateinit var etCkrAddress: EditText
+    private lateinit var etCkrDns: EditText
     private lateinit var btnVpn: Button
     private lateinit var btnApps: Button
     private lateinit var serversBox: LinearLayout
@@ -352,6 +355,10 @@ class MainActivity : Activity() {
         cbYggSites = check("Сайты Yggdrasil и ALFIS (.ygg, .anon…) — через свой узел, рядом с интернетом", prefs.yggSites).also { addView(it) }
         cbYggOnly = check("Только Yggdrasil: VPN без сервера выхода (интернет как обычно)", prefs.yggOnly).also { addView(it) }
         addView(note("Адреса 200::/7 и имена ALFIS идут в сеть Yggdrasil напрямую через узел телефона. Только TCP: сайты, SSH, чаты; UDP и ping — нет."))
+        cbCkr = check("Туннель CKR: весь IP-трафик (UDP, игры, звонки) — сервер должен поддерживать CKR", prefs.ckr).also { addView(it) }
+        addView(note("Пакеты целиком идут к серверу выхода по его ключу Yggdrasil, как в Yggdrasil-ng. Подходит сервер Ratatoskr с включённым выходом CKR или Yggdrasil-ng с tunnel_routing. Имена ALFIS в этом режиме не работают, адреса Yggdrasil — работают."))
+        etCkrAddress = edit("адрес в туннеле CKR (10.99.0.2)", prefs.ckrAddress).also { addView(it) }
+        etCkrDns = edit("DNS через туннель CKR (1.1.1.1)", prefs.ckrDns).also { addView(it) }
         addView(h1("Узел Yggdrasil"))
         cbKeepNode = check("Работать в фоне: пинговать серверы и корень, когда приложение свёрнуто", prefs.keepNode).also { addView(it) }
         addView(note("Без VPN и сервера узел работает в фоне с уведомлением. Выключите, чтобы экономить батарею: тогда он работает только при открытом приложении."))
@@ -432,6 +439,9 @@ class MainActivity : Activity() {
         prefs.ipv6 = cbIpv6.isChecked
         prefs.yggSites = cbYggSites.isChecked
         prefs.yggOnly = cbYggOnly.isChecked
+        prefs.ckr = cbCkr.isChecked
+        etCkrAddress.text.toString().trim().let { if (Regex("^\\d{1,3}(\\.\\d{1,3}){3}$").matches(it)) prefs.ckrAddress = it }
+        etCkrDns.text.toString().trim().let { if (it.isEmpty() || Regex("^[0-9a-fA-F:.]+$").matches(it)) prefs.ckrDns = it }
         prefs.limTotalDown = kbit(etLimTotalDown)
         prefs.limTotalUp = kbit(etLimTotalUp)
         prefs.limClientDown = kbit(etLimClientDown)

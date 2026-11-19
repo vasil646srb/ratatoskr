@@ -70,6 +70,9 @@ class YggService : VpnService() {
     private val publicPeers get() = File(filesDir, "public-peers.json")
     private val peerFile get() = File(filesDir, "peers.json")
     private val ctlPath get() = File(filesDir, "tun.sock").path
+    /** The node's --ckr-ctl socket: the CKR VPN hands it the interface (again after a node restart). */
+    private val ckrCtlPath get() = File(filesDir, "ckr.sock").path
+    @Volatile private var ckrVpn = false
     private val limitsFile get() = File(filesDir, "limits.txt")
     private val monitorsFile get() = File(filesDir, "monitors.txt")
     /** The exit server for the node (`--connect-file`): re-read live, so no restart on a switch. */
@@ -333,7 +336,9 @@ class YggService : VpnService() {
         // 3. VPN.
         if (wantVpn) {
             // The server is not part of it: a switch needs no new VPN interface.
-            val sig = "${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}|${prefs.yggSites}|$only"
+            // CKR: the address is part of it (it becomes the tunnel's IPv6 source once known).
+            val ckrOn = prefs.ckr && target != null
+            val sig = "${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}|${prefs.yggSites}|$only|$ckrOn|${prefs.ckrAddress}|${prefs.ckrDns}|${if (ckrOn) State.address else ""}"
             State.vpnTarget = target?.first
             if (vpnPfd == null || sig != vpnSig) {
                 stopVpn()
@@ -367,6 +372,7 @@ class YggService : VpnService() {
         add("--connect-file"); add("${Ygg.CLIENT_SOCKS}:${connectFile.path}")
         // Peers ranked by how well they carried our traffic and by the trackers (re-read live).
         add("--prefer-file"); add(preferFile.path)
+        add("--ckr-ctl"); add(ckrCtlPath)
         // The user's own peers: never replaced by public ones in the peer search.
         prefs.customPeerList().forEach { add("--keep-peer"); add(it) }
         // Without a server, peers are picked by the ping to the trackers (not the root).
@@ -395,6 +401,10 @@ class YggService : VpnService() {
     private fun nodeLine(l: String) {
         when {
             l.startsWith("device address:") -> State.address = l.substringAfter(':').trim()
+            // A (re)started node: hand it the CKR tunnel again.
+            l.startsWith("ckr ctl:") -> if (ckrVpn) Thread { sendCkrFd() }.start()
+            l.contains("ckr:") && l.contains("tunnel attached") -> if (ckrVpn) State.vpnActive = true
+            l.contains("ckr:") && l.contains("tunnel detached") -> if (ckrVpn) State.vpnActive = false
             l.startsWith("public key:") -> State.publicKey = l.substringAfter(':').trim()
             l.startsWith("server rtt:") -> State.serverRtt = l.substringAfter(':').trim().substringAfter("] ")
             l.contains("заменён пир") || l.startsWith("замена ") ->
@@ -447,6 +457,7 @@ class YggService : VpnService() {
 
     /** [target] null: Yggdrasil only (no exit server). */
     private fun startVpn(target: Pair<String, Int>?) {
+        if (prefs.ckr && target != null) return startCkrVpn(target)
         val b = Builder()
             .setSession(if (target == null) "Yggdrasil" else "Yggdrasil → [${target.first}]")
             .setMtu(1500)
@@ -501,6 +512,61 @@ class YggService : VpnService() {
             else "интерфейс поднят, выход через [${target.first}]:${target.second}" + if (prefs.yggSites) ", сайты Yggdrasil и ALFIS — через свой узел" else "")
     }
 
+    /**
+     * CKR: the interface carries our tunnel address (and our Yggdrasil address for IPv6); the
+     * node reads it and sends every packet to the exit by its key. No helper process.
+     */
+    private fun startCkrVpn(target: Pair<String, Int>) {
+        val ygg = State.address
+        val b = Builder()
+            .setSession("Yggdrasil CKR → [${target.first}]")
+            .setMtu(1500)
+            .addAddress(prefs.ckrAddress, 32)
+            .addRoute("0.0.0.0", 0)
+        if (ygg != null) {
+            b.addAddress(ygg, 128)
+            if (prefs.ipv6) b.addRoute("::", 0) else if (prefs.yggSites) b.addRoute("200::", 7)
+        }
+        try { b.addDnsServer(prefs.ckrDns.ifEmpty { "1.1.1.1" }) } catch (e: IllegalArgumentException) { b.addDnsServer("1.1.1.1") }
+        b.addDisallowedApplication(packageName)
+        for (app in prefs.excludedAppList()) {
+            try { b.addDisallowedApplication(app) } catch (e: PackageManager.NameNotFoundException) {
+                State.log("vpn", "исключение: приложение $app не найдено")
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
+        b.setConfigureIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
+        val pfd = b.establish() ?: throw IllegalStateException("VPN не установлен (нет разрешения)")
+        vpnPfd = pfd
+        ckrVpn = true
+        State.resetTraffic()
+        State.vpnTarget = target.first
+        Thread { sendCkrFd() }.start()
+        State.log("vpn", "туннель CKR (весь IP-трафик) через [${target.first}], адрес ${prefs.ckrAddress}" +
+            if (ygg == null) " — IPv6 появится, когда узел сообщит свой адрес" else "")
+    }
+
+    /** Hand the CKR interface to the node over its --ckr-ctl socket (retried while it starts). */
+    @Synchronized private fun sendCkrFd() {
+        for (i in 0 until 30) {
+            val pfd = vpnPfd ?: return
+            if (!ckrVpn) return
+            try {
+                closeCtl()
+                val s = LocalSocket()
+                s.connect(LocalSocketAddress(ckrCtlPath, LocalSocketAddress.Namespace.FILESYSTEM))
+                s.setFileDescriptorsForSend(arrayOf(pfd.fileDescriptor))
+                s.outputStream.write(1)
+                s.outputStream.flush()
+                ctl = s // kept open: closing it detaches the tunnel from the node
+                return
+            } catch (e: Exception) {
+                if (i == 29) State.error("vpn", "не удалось передать туннель CKR узлу: ${e.message}")
+                Thread.sleep(500)
+            }
+        }
+    }
+
     /** Hand the VPN fd to the helper over its control socket (SCM_RIGHTS). */
     private fun sendTunFd() {
         val pfd = vpnPfd ?: return
@@ -523,6 +589,7 @@ class YggService : VpnService() {
     }
 
     private fun stopVpn() {
+        ckrVpn = false
         closeCtl()
         tunProc?.stop("VPN выключен"); tunProc = null
         try { vpnPfd?.close() } catch (_: Exception) {}

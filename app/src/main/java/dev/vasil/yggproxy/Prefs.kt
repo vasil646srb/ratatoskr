@@ -26,6 +26,12 @@ class Prefs(ctx: Context) {
     var yggSites: Boolean get() = b("ygg_sites", true); set(v) = put { putBoolean("ygg_sites", v) }
     /** VPN only for Yggdrasil sites, without an exit server. */
     var yggOnly: Boolean get() = b("ygg_only", false); set(v) = put { putBoolean("ygg_only", v) }
+    /** VPN as a crypto-key routing tunnel (every IP packet, UDP included), Yggdrasil-ng compatible. */
+    var ckr: Boolean get() = b("ckr", false); set(v) = put { putBoolean("ckr", v) }
+    /** Our IPv4 address in the CKR tunnel. */
+    var ckrAddress: String get() = s("ckr_address", "10.99.0.2"); set(v) = put { putString("ckr_address", v.trim()) }
+    /** DNS server used through the CKR tunnel. */
+    var ckrDns: String get() = s("ckr_dns", "1.1.1.1"); set(v) = put { putString("ckr_dns", v.trim()) }
     var excludedApps: String get() = s("excluded", ""); set(v) = put { putString("excluded", v) }
     /** Saved exit servers (Yggdrasil addresses, one per line); [server] is the selected one. */
     var servers: String get() = s("servers", server); set(v) = put { putString("servers", v) }
