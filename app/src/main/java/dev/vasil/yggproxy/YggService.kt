@@ -381,6 +381,8 @@ class YggService : VpnService() {
         // Peers ranked by how well they carried our traffic and by the trackers (re-read live).
         add("--prefer-file"); add(preferFile.path)
         add("--ckr-ctl"); add(ckrCtlPath)
+        // Peering: clients may connect to us as a Yggdrasil peer (no transit: only to us).
+        if (prefs.listenPort > 0) { add("--listen"); add(prefs.listenPort.toString()) }
         // The user's own peers: never replaced by public ones in the peer search.
         prefs.customPeerList().forEach { add("--keep-peer"); add(it) }
         // Without a server, peers are picked by the ping to the trackers (not the root).

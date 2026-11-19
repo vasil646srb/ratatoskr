@@ -163,6 +163,13 @@ impl App {
                         if !key.is_empty() {
                             c.client.keys.insert(a.to_string(), key);
                         }
+                        // The server as our peer, when its link offers one.
+                        for p in config::link_peers(&self.add_text) {
+                            if !c.network.peers.contains(&p) {
+                                c.network.peers.push(p);
+                            }
+                        }
+                        self.peers_text = c.network.peers.join("\n");
                         self.key_text.clear();
                         if config::parse_server(&c.client.server).is_none() {
                             c.client.server = a.to_string();
@@ -462,6 +469,34 @@ impl App {
             if was != (c.server.ckr, c.server.ckr_ipv6) {
                 self.apply("Сохранено");
             }
+        }
+        // Peering: clients connect to this node directly (their links and QR codes carry it).
+        let Some(c) = self.cfg.as_mut() else { return };
+        let mut save = false;
+        let mut on = c.network.listen > 0;
+        if ui.checkbox(&mut on, "Принимать пиров: клиенты подключаются к серверу напрямую (TCP)")
+            .on_hover_text("Адрес пира попадает в ссылки и QR-коды сервера: клиент добавит его в свои пиры и пойдёт к серверу коротким путём. Транзита нет: через этот узел ходят только к нему самому.")
+            .changed() {
+            c.network.listen = if on { config::PEER_PORT } else { 0 };
+            save = true;
+        }
+        if on {
+            ui.horizontal(|ui| {
+                ui.label("порт");
+                let r = ui.add(egui::DragValue::new(&mut c.network.listen).range(1..=65535));
+                save |= r.drag_stopped() || r.lost_focus();
+                ui.label("внешний адрес");
+                let r = ui.add(egui::TextEdit::singleline(&mut c.network.peer_host).desired_width(200.0).hint_text("пусто — адреса этого ПК"));
+                save |= r.lost_focus();
+            });
+            if let Some(s) = st {
+                let u: Vec<&str> = s["server"]["peer_uris"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+                ui.monospace(if u.is_empty() { "адрес не найден: укажите внешний адрес".to_string() } else { u.join("\n") });
+            }
+            ui.label(format!("Брандмауэр: откройте порт ({}/tcp); за роутером — пробросьте его и укажите внешний IP.", c.network.listen));
+        }
+        if save {
+            self.apply("Сохранено");
         }
         let Some(c) = self.cfg.as_mut() else { return };
         let on = c.server.enabled;

@@ -30,6 +30,10 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
                                ограничить, Мбит/с (0 — без ограничения): весь сервер или
                                каждого клиента; применяется сразу, без обрыва соединений
   yggproxy lan on|off          пускать клиентов в локальную сеть сервера
+  yggproxy peer on [ПОРТ]      принимать пиров Yggdrasil (TCP, по умолчанию порт 27088): клиенты
+                               подключаются к серверу напрямую; ссылки и QR-коды несут его адрес
+  yggproxy peer host АДРЕС[,…]|auto  адрес для клиентов: внешний IP или имя (auto — адреса машины)
+  yggproxy peer off            не принимать пиров
   yggproxy set ckr_exit on|off  Linux: ещё и выход CKR — IP-туннель, совместимый с Yggdrasil-ng
                                (пересылка и NAT на этой машине; доступ — те же ключи)
   yggproxy set ckr_exit_ipv6 on|off  выход CKR и для IPv6 (включает пересылку IPv6)
@@ -134,6 +138,10 @@ fn status() -> Result<(), String> {
         );
         if sv["ckr"].as_bool() == Some(true) {
             println!("  выход CKR: включён (IP-туннель, клиенты {}){}", "10.77.0.0/16", if sv["ckr_ipv6"].as_bool() == Some(true) { ", и IPv6" } else { ", только IPv4" });
+        }
+        if let Some(p) = sv["listen"].as_u64().filter(|p| *p > 0) {
+            let u: Vec<&str> = sv["peer_uris"].as_array().into_iter().flatten().filter_map(|v| v.as_str()).collect();
+            println!("  пир для клиентов: порт {p} — {}", if u.is_empty() { "адрес не найден (yggproxy peer host АДРЕС)".to_string() } else { u.join(", ") });
         }
         let a = &sv["access"];
         if a["public"].as_bool() == Some(true) {
@@ -462,11 +470,13 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             "ckr_address" if val.trim().parse::<std::net::Ipv4Addr>().is_ok() => c.client.ckr_address = val.trim().to_string(),
             "ckr_dns" => c.client.ckr_dns = val.split(',').map(|s| s.trim().to_string()).filter(|s| s.parse::<std::net::IpAddr>().is_ok()).collect(),
             "ckr_exit" => c.server.ckr = b.clone().unwrap_or(c.server.ckr),
+            "listen" => c.network.listen = if val.trim() == "off" { 0 } else { val.trim().parse().unwrap_or(c.network.listen) },
+            "peer_host" => c.network.peer_host = if val.trim() == "auto" { String::new() } else { val.trim().to_string() },
             "ckr_exit_ipv6" => c.server.ckr_ipv6 = b.clone().unwrap_or(c.server.ckr_ipv6),
             _ => {}
         }
     })?;
-    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis", "ckr", "ckr_address", "ckr_dns", "ckr_exit", "ckr_exit_ipv6"];
+    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis", "ckr", "ckr_address", "ckr_dns", "ckr_exit", "ckr_exit_ipv6", "listen", "peer_host"];
     if !known.contains(&key) {
         return Err(format!("неизвестная настройка {key}"));
     }
@@ -500,6 +510,45 @@ pub fn run(args: &[String]) -> Result<(), String> {
             println!("доступ клиентов в LAN {}", if on { "разрешён" } else { "закрыт" });
             Ok(())
         }
+        "peer" => {
+            match a(1).map(|s| s.as_str()) {
+                Some("on") => {
+                    let port = match a(2) {
+                        Some(p) => p.parse::<u16>().ok().filter(|p| *p > 0).ok_or("порт: 1–65535")?,
+                        None => config::PEER_PORT,
+                    };
+                    api::update(|c| c.network.listen = port)?;
+                    println!("принимаю пиров на TCP-порту {port} (IPv4 и IPv6)");
+                    println!("если включён брандмауэр, откройте порт, например: sudo ufw allow {port}/tcp");
+                    println!("за роутером — пробросьте порт и задайте внешний адрес: yggproxy peer host ВАШ_IP");
+                }
+                Some("off") => {
+                    api::update(|c| c.network.listen = 0)?;
+                    println!("пиров не принимаю");
+                    return Ok(());
+                }
+                Some("host") => {
+                    let h = a(2).ok_or("yggproxy peer host АДРЕС[,…]|auto")?;
+                    let h = if h == "auto" { String::new() } else { h.to_string() };
+                    api::update(|c| c.network.peer_host = h.clone())?;
+                }
+                Some(_) => return Err("yggproxy peer on [ПОРТ] | off | host АДРЕС".into()),
+                None => {}
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let s = api::status()?;
+            match s["server"]["listen"].as_u64().filter(|p| *p > 0) {
+                Some(p) => {
+                    println!("пир для клиентов: TCP-порт {p}");
+                    for u in s["server"]["peer_uris"].as_array().into_iter().flatten().filter_map(|v| v.as_str()) {
+                        println!("  {u}");
+                    }
+                    println!("эти адреса уже в ссылках и QR-кодах сервера (yggproxy qr, yggproxy access qr ID)");
+                }
+                None => println!("пиров не принимаю (yggproxy peer on [ПОРТ])"),
+            }
+            Ok(())
+        }
         "qr" => {
             let s = api::status()?;
             let Some(addr) = s["node"]["address"].as_str() else {
@@ -508,8 +557,9 @@ pub fn run(args: &[String]) -> Result<(), String> {
             if s["server"]["enabled"].as_bool() != Some(true) {
                 println!("(сервер выхода выключен: yggproxy server on)");
             }
-            print_qr(&config::connect_link(addr));
-            println!("Адрес сервера: {addr}\nСсылка: {}", config::connect_link(addr));
+            let link = s["server"]["link"].as_str().map(String::from).unwrap_or_else(|| config::connect_link(addr));
+            print_qr(&link);
+            println!("Адрес сервера: {addr}\nСсылка: {link}");
             println!("Сервер закрыт: по этой ссылке клиент только отправит запрос доступа.\nКлюч для устройства: yggproxy access new ИМЯ ДНЕЙ");
             Ok(())
         }
@@ -572,6 +622,12 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 }
                 if let Some(k) = key.clone().filter(|k| !k.is_empty()) {
                     c.client.keys.insert(addr.to_string(), k);
+                }
+                // The server as our peer (from its link): a direct path to it.
+                for p in a(1).map(|l| config::link_peers(l)).unwrap_or_default() {
+                    if !c.network.peers.contains(&p) {
+                        c.network.peers.push(p);
+                    }
                 }
             })?;
             println!("подключаюсь к {addr} (порт {}) — состояние: yggproxy status", config::PORT);

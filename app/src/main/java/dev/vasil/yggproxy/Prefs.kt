@@ -92,6 +92,17 @@ class Prefs(ctx: Context) {
     // Yggdrasil network
     var usePublicPeers: Boolean get() = b("public", true); set(v) = put { putBoolean("public", v) }
     var customPeers: String get() = s("peers", ""); set(v) = put { putString("peers", v) }
+    /** Accept Yggdrasil peers on this TCP port (0: off): clients can peer with us directly. */
+    var listenPort: Int get() = p.getInt("listen_port", 0); set(v) = put { putInt("listen_port", v) }
+    /** Our address(es) for clients (public IP or name), comma separated; empty: the device's own. */
+    var peerHost: String get() = s("peer_host", ""); set(v) = put { putString("peer_host", v.trim()) }
+    /** Add a server's peers (from its link) to our own; true if any was new. */
+    fun addCustomPeers(peers: List<String>): Boolean {
+        val have = customPeerList()
+        val add = peers.filter { it !in have }
+        if (add.isNotEmpty()) customPeers = (have + add).joinToString("\n")
+        return add.isNotEmpty()
+    }
     var target: Int get() = i("target", 3); set(v) = put { putInt("target", v.coerceIn(1, 32)) }
     /** tcp_node --lan-upstream: find yggdrasil-go peers on the LAN by their beacons, dial over TLS. */
     var lanDiscovery: Boolean get() = b("lan", true); set(v) = put { putBoolean("lan", v) }

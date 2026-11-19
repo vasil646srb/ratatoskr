@@ -442,8 +442,12 @@ fn routes(st: &Shared, add: bool, ipv6: bool) {
         if add {
             // Main table without its default route (LAN, links) first; the node's marked peer
             // links use the main table fully; everything else takes the VPN default route.
+            // The node's marked peer links: the main table, and never the tunnel — a peer the
+            // main table cannot reach (say IPv6 without native IPv6) fails instead of looping
+            // through the VPN that runs over it.
+            run(st, &["ip", fam, "rule", "add", "fwmark", &mark, "lookup", "main", "priority", "8998"]);
             run(st, &["ip", fam, "rule", "add", "lookup", "main", "suppress_prefixlength", "0", "priority", "8999"]);
-            run(st, &["ip", fam, "rule", "add", "fwmark", &mark, "lookup", "main", "priority", "9000"]);
+            run(st, &["ip", fam, "rule", "add", "fwmark", &mark, "unreachable", "priority", "9000"]);
             run(st, &["ip", fam, "rule", "add", "lookup", &t, "priority", "9001"]);
             if fam == "-4" || ipv6 {
                 run(st, &["ip", fam, "route", "replace", "default", "dev", tun, "table", &t]);
@@ -452,7 +456,7 @@ fn routes(st: &Shared, add: bool, ipv6: bool) {
                 run(st, &["ip", fam, "route", "replace", "unreachable", "default", "table", &t]);
             }
         } else {
-            for p in ["8999", "9000", "9001"] {
+            for p in ["8998", "8999", "9000", "9001"] {
                 quiet(&["ip", fam, "rule", "del", "priority", p]);
             }
             quiet(&["ip", fam, "route", "flush", "table", &t]);
@@ -884,6 +888,10 @@ impl Daemon {
             "--monitor-file".into(),
             d.join("monitors.txt").display().to_string(),
         ];
+        // Peering: clients (and anyone) may connect to us as a Yggdrasil peer on this port.
+        if n.listen > 0 {
+            a.extend(["--listen".into(), n.listen.to_string()]);
+        }
         // The user's own peers: never replaced by public ones in the peer search.
         for u in n.peers.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with('#')) {
             a.extend(["--keep-peer".into(), u.to_string()]);
@@ -1109,6 +1117,68 @@ const CKR_POOL6: &str = "fd77:7967:6772::/64";
 const CKR_NO_LAN4: &[&str] = &["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/3"];
 const CKR_NO_LAN6: &[&str] = &["::1/128", "fc00::/7", "fe80::/10", "ff00::/8", "200::/7"];
 
+// ------------------------------------------------------------------------------------------
+// Peering: our node as a peer for clients (tcp_node --listen)
+
+/// Where clients can reach our peer port: the addresses set by the owner, else this machine's
+/// own (LAN IPv4 and global IPv6; virtual interfaces left out).
+fn peer_uris(cfg: &Config) -> Vec<String> {
+    let port = cfg.network.listen;
+    if port == 0 {
+        return Vec::new();
+    }
+    let fmt = |h: &str| if h.contains(':') && !h.starts_with('[') { format!("tcp://[{h}]:{port}") } else { format!("tcp://{h}:{port}") };
+    let set: Vec<String> = cfg.network.peer_host.split(',').map(str::trim).filter(|h| !h.is_empty()).map(fmt).collect();
+    if !set.is_empty() {
+        return set;
+    }
+    local_addrs().iter().map(|a| fmt(&a.to_string())).collect()
+}
+
+#[cfg(unix)]
+fn local_addrs() -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let mut out = Vec::new();
+    unsafe {
+        let mut ifs: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifs) != 0 {
+            return out;
+        }
+        let mut p = ifs;
+        while !p.is_null() {
+            let i = &*p;
+            p = i.ifa_next;
+            if i.ifa_addr.is_null() || i.ifa_flags & libc::IFF_UP as u32 == 0 || i.ifa_flags & libc::IFF_LOOPBACK as u32 != 0 {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(i.ifa_name).to_string_lossy();
+            if ["yggproxy", "ygg", "tun", "docker", "veth", "br-", "virbr", "wg", "lo"].iter().any(|x| name.starts_with(x)) {
+                continue;
+            }
+            let ip = match (*i.ifa_addr).sa_family as i32 {
+                libc::AF_INET => IpAddr::from((*(i.ifa_addr as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes()),
+                libc::AF_INET6 => IpAddr::from((*(i.ifa_addr as *const libc::sockaddr_in6)).sin6_addr.s6_addr),
+                _ => continue,
+            };
+            let keep = match ip {
+                IpAddr::V4(v) => !v.is_link_local() && !v.is_unspecified(),
+                // Global unicast only (2000::/3): not Yggdrasil's 200::/7, not link-local or ULA.
+                IpAddr::V6(v) => v.octets()[0] & 0xe0 == 0x20,
+            };
+            if keep && !out.contains(&ip) {
+                out.push(ip);
+            }
+        }
+        libc::freeifaddrs(ifs);
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn local_addrs() -> Vec<std::net::IpAddr> {
+    Vec::new() // Windows: the owner sets peer_host
+}
+
 fn ckr_exit_wanted(cfg: &Config) -> bool {
     cfg!(target_os = "linux") && cfg.server.enabled && cfg.server.ckr
 }
@@ -1314,7 +1384,7 @@ fn access_summary() -> Value {
 }
 
 /// `{"cmd":"access","op":…}`: list (default), new, approve, renew, unbind, revoke, deny, public.
-fn access_cmd(req: &Value, st: &Shared) -> Value {
+fn access_cmd(req: &Value, st: &Shared, cfg: &Config) -> Value {
     use crate::access::{self, Access};
     let path = config::access_path();
     let t = access::now();
@@ -1372,7 +1442,7 @@ fn access_cmd(req: &Value, st: &Shared) -> Value {
     let keys: Vec<Value> = a.keys.iter().map(|k| {
         let mut v = serde_json::to_value(k).unwrap();
         if let Some(srv) = &server {
-            v["link"] = json!(access::link(srv, &k.key));
+            v["link"] = json!(config::with_peers(&access::link(srv, &k.key), &peer_uris(cfg)));
         }
         v["active"] = json!(k.expires > t);
         v
@@ -1662,7 +1732,8 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
         "node": {"running": s.node_running, "address": s.address, "public_key": s.public_key,
                  "lan": s.lan_status, "stats": s.node_stats, "peers": s.node_peers},
         "server": {"enabled": cfg.server.enabled, "active": s.exit_active,
-                   "link": s.address.as_ref().map(|a| config::connect_link(a)),
+                   "link": s.address.as_ref().map(|a| config::with_peers(&config::connect_link(a), &peer_uris(cfg))),
+                   "listen": cfg.network.listen, "peer_uris": peer_uris(cfg),
                    "active_conns": s.srv[0], "total": s.srv[1], "denied": s.srv[2], "tx": s.srv[3], "rx": s.srv[4],
                    "clients": clients, "limits": cfg.server.limits, "ckr": ckr_exit_wanted(cfg), "ckr_ipv6": cfg.server.ckr_ipv6,
                    "access": access_summary()},
@@ -1723,7 +1794,7 @@ fn handle_conn(conn: platform::Stream, st: Shared, cfg: Arc<Mutex<Config>>, tx: 
                 st.lock().unwrap().logs.clear();
                 json!({"ok": true})
             }
-            "access" => access_cmd(&req, &st),
+            "access" => access_cmd(&req, &st, &cfg.lock().unwrap().clone()),
             // Client: an access request with a message to a server's owner.
             "request_access" => {
                 let server = req["server"].as_str().unwrap_or("").to_string();

@@ -76,7 +76,44 @@ object Ygg {
     const val PORT = 27080
 
     /** Quick-connect link shown as a QR code: yggproxy://c?a=ADDR&k=KEY (the port is always [PORT]). */
-    fun connectLink(addr: String, key: String? = null) = "yggproxy://c?a=$addr" + (key?.let { "&k=$it" } ?: "")
+    fun connectLink(addr: String, key: String? = null, peers: List<String> = emptyList()) =
+        "yggproxy://c?a=$addr" + (key?.let { "&k=$it" } ?: "") + peers.joinToString("") { "&peer=$it" }
+
+    const val PEER_PORT = 27088
+
+    /** The server's peers in a link (`&peer=tcp://HOST:PORT`): the client adds them to its own. */
+    fun peersFromText(text: String): List<String> = try {
+        val t = text.trim()
+        if (!t.startsWith("yggproxy://")) emptyList()
+        else android.net.Uri.parse(t).getQueryParameters("peer")
+            .filter { (it.startsWith("tcp://") || it.startsWith("tls://")) && it.length < 200 && it.none(Char::isWhitespace) }
+    } catch (_: Exception) { emptyList() }
+
+    /** Where clients reach our peer port: [Prefs.peerHost], else this device's own addresses. */
+    fun peerUris(prefs: Prefs): List<String> {
+        val port = prefs.listenPort
+        if (port <= 0) return emptyList()
+        fun fmt(h: String) = if (h.contains(':') && !h.startsWith("[")) "tcp://[$h]:$port" else "tcp://$h:$port"
+        val set = prefs.peerHost.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+        if (set.isNotEmpty()) return set.map(::fmt)
+        val out = ArrayList<String>()
+        try {
+            for (ni in java.net.NetworkInterface.getNetworkInterfaces()) {
+                if (!ni.isUp || ni.isLoopback || ni.isVirtual || ni.name.startsWith("tun")) continue
+                for (a in ni.inetAddresses) {
+                    val h = a.hostAddress?.substringBefore('%') ?: continue
+                    val b = a.address
+                    val keep = when (a) {
+                        is java.net.Inet4Address -> !a.isLinkLocalAddress && !(b[0].toInt() == 100 && (b[1].toInt() and 0xc0) == 64) // not CGNAT
+                        is Inet6Address -> (b[0].toInt() and 0xe0) == 0x20 // global unicast, not 200::/7
+                        else -> false
+                    }
+                    if (keep && fmt(h) !in out) out += fmt(h)
+                }
+            }
+        } catch (_: Exception) {}
+        return out
+    }
 
     /** Keys are typed by hand: case, spaces and dashes don't matter. */
     fun normKey(s: String) = s.filter { it.isLetterOrDigit() && it.code < 128 }.lowercase()

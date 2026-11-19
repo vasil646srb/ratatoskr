@@ -150,7 +150,15 @@ pub struct Network {
     /// Ask these trackers for exit servers, more trackers and checked public peers.
     pub use_trackers: bool,
     pub trackers: Vec<String>,
+    /// Accept Yggdrasil peers on this TCP port (0: off): clients can peer with us directly.
+    pub listen: u16,
+    /// Our address(es) for clients (a public IP or a name), comma separated; empty: this
+    /// machine's own addresses (good in the LAN).
+    pub peer_host: String,
 }
+
+/// The port offered for peering when it is turned on without one.
+pub const PEER_PORT: u16 = 27088;
 
 impl Default for Network {
     fn default() -> Self {
@@ -167,6 +175,8 @@ impl Default for Network {
             keep_node: true,
             use_trackers: true,
             trackers: crate::tracker_client::DEFAULT_TRACKERS.iter().map(|s| s.to_string()).collect(),
+            listen: 0,
+            peer_host: String::new(),
         }
     }
 }
@@ -215,6 +225,22 @@ pub fn connect_link(addr: &str) -> String {
     format!("yggproxy://c?a={addr}")
 }
 
+/// A link with our peer addresses added (`&peer=tcp://…`): a client adds them to its own peers
+/// and talks to this server directly.
+pub fn with_peers(link: &str, peers: &[String]) -> String {
+    peers.iter().fold(link.to_string(), |l, p| format!("{l}&peer={p}"))
+}
+
+/// The peers in a link (`&peer=tcp://HOST:PORT`, also `tls://`).
+pub fn link_peers(input: &str) -> Vec<String> {
+    let Some(q) = input.trim().strip_prefix("yggproxy://").and_then(|r| r.split_once('?')).map(|x| x.1) else { return Vec::new() };
+    q.split('&')
+        .filter_map(|kv| kv.strip_prefix("peer="))
+        .map(|p| p.replace("%3A", ":").replace("%3a", ":").replace("%2F", "/").replace("%2f", "/").replace("%5B", "[").replace("%5D", "]"))
+        .filter(|p| (p.starts_with("tcp://") || p.starts_with("tls://")) && p.len() < 200 && !p.contains(char::is_whitespace))
+        .collect()
+}
+
 /// The access key in a `yggproxy://c?a=…&k=KEY` link, if any.
 pub fn link_key(input: &str) -> Option<String> {
     let q = input.trim().strip_prefix("yggproxy://")?.split_once('?')?.1;
@@ -257,6 +283,11 @@ mod tests {
         assert_eq!(parse_server("yggproxy://c?a=200:99b:4003:b216:f139:24e7:df8f:5d3a&k=AbCd-123"), Some(a));
         assert_eq!(link_key("yggproxy://c?a=200::1&k=AbCd-123").as_deref(), Some("abcd123"));
         assert_eq!(link_key("yggproxy://c?a=200::1"), None);
+        let l = with_peers("yggproxy://c?a=200::1&k=abc", &["tcp://1.2.3.4:27088".into(), "tcp://[2001:db8::1]:27088".into()]);
+        assert_eq!(parse_server(&l), "200::1".parse().ok());
+        assert_eq!(link_key(&l).as_deref(), Some("abc"));
+        assert_eq!(link_peers(&l), vec!["tcp://1.2.3.4:27088".to_string(), "tcp://[2001:db8::1]:27088".to_string()]);
+        assert!(link_peers("yggproxy://c?a=200::1&peer=http://x").is_empty());
     }
 
     #[test]

@@ -80,6 +80,18 @@ class MainActivity : Activity() {
     private lateinit var tvClients: TextView
     private val clientPrev = HashMap<String, LongArray>() // addr -> (tx, rx, at ms)
     private lateinit var cbLan: CheckBox
+    private lateinit var cbPeer: CheckBox
+    private lateinit var etPeerPort: EditText
+    private lateinit var etPeerHost: EditText
+    private lateinit var tvPeer: TextView
+
+    /** Where clients reach our peer port (it goes into the server's links and QR codes). */
+    private fun peerNote(): String = if (prefs.listenPort <= 0)
+        "Адрес пира попадает в ссылки и QR-коды сервера: клиент добавит его в свои пиры и пойдёт к серверу коротким путём. Транзита нет."
+    else Ygg.peerUris(prefs).let { u ->
+        (if (u.isEmpty()) "Адрес не найден: укажите внешний адрес." else "Пир для клиентов:\n" + u.joinToString("\n")) +
+            "\nВ мобильной сети входящие подключения обычно закрыты оператором — надёжнее Wi-Fi с пробросом порта."
+    }
     private lateinit var cbAutostart: CheckBox
     private lateinit var btnExit: Button
     private lateinit var tvIdentity: TextView
@@ -306,6 +318,10 @@ class MainActivity : Activity() {
         addView(h2("Клиенты"))
         tvClients = mono("—").also { addView(it) }
         cbLan = check("Разрешить клиентам доступ в мою LAN", prefs.allowLan).also { addView(it) }
+        cbPeer = check("Принимать пиров: клиенты подключаются к серверу напрямую (TCP)", prefs.listenPort > 0).also { addView(it) }
+        etPeerPort = edit("порт (${Ygg.PEER_PORT})", if (prefs.listenPort > 0) prefs.listenPort.toString() else "", number = true).also { addView(it) }
+        etPeerHost = edit("внешний адрес (пусто — адреса телефона)", prefs.peerHost).also { addView(it) }
+        tvPeer = note(peerNote()).also { addView(it) }
         cbAutostart = check("Автозапуск после перезагрузки", prefs.autostart).also { addView(it) }
         btnExit = bigButton("") { toggleExit() }.also { addView(it) }
         addView(smallButton("Не ограничивать в фоне (батарея)") { askBattery() })
@@ -450,6 +466,9 @@ class MainActivity : Activity() {
         prefs.limClientDown = kbit(etLimClientDown)
         prefs.limClientUp = kbit(etLimClientUp)
         prefs.allowLan = cbLan.isChecked
+        prefs.listenPort = if (cbPeer.isChecked) etPeerPort.text.toString().toIntOrNull()?.takeIf { it in 1..65535 } ?: Ygg.PEER_PORT else 0
+        prefs.peerHost = etPeerHost.text.toString()
+        tvPeer.text = peerNote()
         prefs.autostart = cbAutostart.isChecked
         prefs.usePublicPeers = cbPublic.isChecked
         prefs.customPeers = etPeers.text.toString()
@@ -499,6 +518,7 @@ class MainActivity : Activity() {
             val server = Ygg.serverFromText(text)
             if (server == null) toast("Это не адрес сервера Ratatoskr") else {
                 Ygg.keyFromText(text)?.let { prefs.setKey(server, it) }
+                prefs.addCustomPeers(Ygg.peersFromText(text))
                 connectTo(server)
             }
         }
@@ -564,7 +584,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Подключиться к серверу?")
             .setMessage("Весь трафик пойдёт через сервер выхода\n$server" + if (key != null) "\n(с ключом доступа)" else "")
-            .setPositiveButton("Подключить") { _, _ -> key?.let { prefs.setKey(server, it) }; connectTo(server) }
+            .setPositiveButton("Подключить") { _, _ -> key?.let { prefs.setKey(server, it) }; prefs.addCustomPeers(Ygg.peersFromText(data.toString())); connectTo(server) }
             .setNegativeButton("Отмена", null)
             .show()
     }
@@ -579,6 +599,7 @@ class MainActivity : Activity() {
         if (s == null) { toast("Адрес сервера: IPv6 из 200::/7, например 200:…"); return }
         val key = Ygg.keyFromText(etServer.text.toString()) ?: Ygg.normKey(etKey.text.toString()).takeIf { it.isNotEmpty() }
         if (key != null) prefs.setKey(s, key)
+        if (prefs.addCustomPeers(Ygg.peersFromText(etServer.text.toString())) && ::etPeers.isInitialized) etPeers.setText(prefs.customPeers)
         etKey.setText("")
         prefs.addServer(s)
         if (Ygg.parseServer(prefs.server) == null) prefs.server = s
@@ -786,7 +807,7 @@ class MainActivity : Activity() {
     private fun shareKey(k: JSONObject) {
         val addr = State.address ?: run { toast("Адрес появится после запуска узла"); return }
         val text = "Сервер Ratatoskr (ключ для одного устройства, ${k.optInt("days")} дн.)\n" +
-            "${Ygg.connectLink(addr, k.optString("key"))}\nАдрес: $addr\nКлюч: ${k.optString("key")}"
+            "${Ygg.connectLink(addr, k.optString("key"), Ygg.peerUris(prefs))}\nАдрес: $addr\nКлюч: ${k.optString("key")}"
         startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text), "Ключ доступа"))
     }
 
@@ -1016,7 +1037,7 @@ class MainActivity : Activity() {
             .let { "\nдоступ: " + Ygg.accessText(it?.second) + (it?.let { a -> Ygg.keyLeft(a.third) } ?: "") } else "") +
             State.requests.entries.joinToString("") { "\nзапрос к ${it.key}: ${Ygg.accessText(it.value).let { t -> if (it.value == "pending") "ждёт ответа владельца" else t }}" }
         val addr = State.address
-        val link = addr?.let { a -> qrKey()?.let { Ygg.connectLink(a, it.optString("key")) } }
+        val link = addr?.let { a -> qrKey()?.let { Ygg.connectLink(a, it.optString("key"), Ygg.peerUris(prefs)) } }
         if (link != qrText) {
             qrText = link
             ivQr.setImageBitmap(link?.let { Qr.bitmap(it, dp(240)) })
