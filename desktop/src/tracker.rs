@@ -222,7 +222,28 @@ const CRAWL_TIMEOUT: Duration = Duration::from_secs(6);
 /// A Ratatoskr exit: SOCKS5 on 27080. A public one lets us CONNECT to its speed-test port; a
 /// closed one asks for a key (method 2) — we stop there, so no access request is recorded.
 /// Connect time (ms) and whether it is public.
-fn probe_exit(addr: Ipv6Addr, timeout: Duration) -> Option<(u64, bool)> {
+/// Does the exit offer CKR? Our own access check (method 0x80, nothing recorded): a 0.1.17+
+/// exit adds a byte with bit 0 set when a crypto-key routing exit runs on the same node.
+fn probe_ckr(addr: Ipv6Addr, timeout: Duration) -> bool {
+    let Ok(mut s) = net().connect(addr, config::PORT, timeout) else { return false };
+    s.set_read_timeout(Some(Duration::from_secs(10)));
+    let mut b = [0u8; 11];
+    if s.write_all(&[5, 1, 0x80]).is_err() || s.read_exact(&mut b[..2]).is_err() || b[..2] != [5, 0x80] {
+        return false;
+    }
+    let name = b"tracker";
+    let mut m = vec![1, 0, name.len() as u8];
+    m.extend_from_slice(name);
+    m.push(0);
+    s.write_all(&m).is_ok() && s.read_exact(&mut b).is_ok() && b[10] & 1 == 1
+}
+
+fn probe_exit(addr: Ipv6Addr, timeout: Duration) -> Option<(u64, bool, bool)> {
+    let (rtt, public) = probe_exit_socks(addr, timeout)?;
+    Some((rtt, public, probe_ckr(addr, timeout)))
+}
+
+fn probe_exit_socks(addr: Ipv6Addr, timeout: Duration) -> Option<(u64, bool)> {
     let t0 = Instant::now();
     let mut s = net().connect(addr, config::PORT, timeout).ok()?;
     let rtt = t0.elapsed().as_millis() as u64;
@@ -301,6 +322,8 @@ pub struct Entry {
     pub rtt_ms: Option<u64>,
     /// Exits: anyone may use it (else a key from its owner is needed).
     pub public: bool,
+    /// Exits: a crypto-key routing exit (IP tunnel) on the same node.
+    pub ckr: bool,
     /// "crawl", "sync:<tracker>" or "default".
     pub source: String,
 }
@@ -356,15 +379,16 @@ fn listed(e: &Entry, cfg: &TrackerConfig) -> bool {
 }
 
 /// Record exit probe results: `ok` answered (with the connect time), the rest of `source` did not.
-fn record_exits(db: &Mutex<Db>, cfg: &TrackerConfig, source: &HashMap<Ipv6Addr, String>, ok: &HashMap<Ipv6Addr, (u64, bool)>) -> usize {
+fn record_exits(db: &Mutex<Db>, cfg: &TrackerConfig, source: &HashMap<Ipv6Addr, String>, ok: &HashMap<Ipv6Addr, (u64, bool, bool)>) -> usize {
     let mut d = db.lock().unwrap();
     for (a, src) in source {
         let s = a.to_string();
         match ok.get(a) {
-            Some((rtt, public)) => {
+            Some((rtt, public, ckr)) => {
                 Db::mark(&mut d.exits, &s, Some(*rtt), src);
                 if let Some(e) = d.exits.get_mut(&s) {
                     e.public = *public;
+                    e.ckr = *ckr;
                 }
             }
             // A crawl candidate that never answered is not worth remembering.
@@ -395,7 +419,7 @@ fn record_trackers(db: &Mutex<Db>, source: &HashMap<Ipv6Addr, String>, ok: &Hash
 /// Probe these exit candidates and record the results.
 fn check_exits(db: &Mutex<Db>, cfg: &TrackerConfig, cands: Vec<(Ipv6Addr, String)>) -> usize {
     let source: HashMap<Ipv6Addr, String> = cands.into_iter().collect();
-    let ok: HashMap<Ipv6Addr, (u64, bool)> = parallel(source.keys().copied().collect(), cfg.probe_workers, |a| probe_exit(a, KNOWN_TIMEOUT)).into_iter().collect();
+    let ok: HashMap<Ipv6Addr, (u64, bool, bool)> = parallel(source.keys().copied().collect(), cfg.probe_workers, |a| probe_exit(a, KNOWN_TIMEOUT)).into_iter().collect();
     record_exits(db, cfg, &source, &ok)
 }
 
@@ -419,7 +443,7 @@ fn check_crawled(db: &Mutex<Db>, cfg: &TrackerConfig, addrs: &[Ipv6Addr], me: Ip
             (exit.is_some() || tracker).then_some((exit, tracker))
         })
     });
-    let exits: HashMap<Ipv6Addr, (u64, bool)> = found.iter().filter_map(|(a, (e, _))| e.map(|x| (*a, x))).collect();
+    let exits: HashMap<Ipv6Addr, (u64, bool, bool)> = found.iter().filter_map(|(a, (e, _))| e.map(|x| (*a, x))).collect();
     let trackers: HashSet<Ipv6Addr> = found.iter().filter(|(_, (_, t))| *t).map(|x| x.0).collect();
     record_trackers(db, &source, &trackers);
     record_exits(db, cfg, &source, &exits)
@@ -544,6 +568,7 @@ fn list_json(map: &HashMap<String, Entry>, cfg: &TrackerConfig, key: &str) -> Va
             let mut v = json!({"address": a, "first_seen": e.first_seen, "last_seen": e.last_ok, "rtt_ms": e.rtt_ms});
             if key == "exits" {
                 v["public"] = json!(e.public);
+                v["ckr"] = json!(e.ckr);
             }
             v
         })

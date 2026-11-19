@@ -97,11 +97,13 @@ struct Opts {
     mtu: u16,
     ipv6: bool,
     allow_lan: bool,
+    /// `--ckr`: this node is also a crypto-key routing exit (told to Ratatoskr clients).
+    ckr: bool,
     verbosity: String,
 }
 
 fn parse(args: &[String]) -> Opts {
-    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, ygg_socks: None, alfis: Vec::new(), no_exit: false, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, verbosity: "info".into() };
+    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, ygg_socks: None, alfis: Vec::new(), no_exit: false, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, ckr: false, verbosity: "info".into() };
     let mut it = args.iter();
     let addr = |v: Option<&String>, f: &str| -> SocketAddr {
         v.and_then(|s| s.parse().ok()).unwrap_or_else(|| die(&format!("{f}: want IP:PORT")))
@@ -132,6 +134,7 @@ fn parse(args: &[String]) -> Opts {
             "--mtu" => o.mtu = it.next().and_then(|s| s.parse().ok()).filter(|m| *m >= 576).unwrap_or_else(|| die("--mtu: want >= 576")),
             "--ipv6" => o.ipv6 = true,
             "--allow-lan" => o.allow_lan = true,
+            "--ckr" => o.ckr = true,
             "-v" | "--verbosity" => o.verbosity = it.next().cloned().unwrap_or_else(|| die("-v: want level")),
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -247,7 +250,7 @@ async fn server_main(o: Opts) -> Result<(), String> {
         tokio::spawn(g.clone().watch());
         g
     });
-    let policy = Arc::new(Policy { allow_lan: o.allow_lan, local_ok: [o.udpgw, o.speedtest].into_iter().flatten().collect(), fwmark: o.fwmark, gate });
+    let policy = Arc::new(Policy { allow_lan: o.allow_lan, local_ok: [o.udpgw, o.speedtest].into_iter().flatten().collect(), fwmark: o.fwmark, gate, ckr: o.ckr });
     let limit = Arc::new(tokio::sync::Semaphore::new(1024));
     loop {
         let (conn, _) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
@@ -276,6 +279,8 @@ struct Policy {
     fwmark: u32,
     /// `--access`: closed exit.
     gate: Option<Arc<Gate>>,
+    /// `--ckr`: a crypto-key routing exit runs on the same node.
+    ckr: bool,
 }
 
 /// The access file, re-read when it changes; the exit writes it on a bind or a request.
@@ -551,6 +556,9 @@ async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, l
             };
             let mut r = vec![1, res as u8];
             r.extend_from_slice(&exp.to_be_bytes());
+            // Then what this exit offers (older clients read only the first 10 bytes):
+            // bit 0 = a crypto-key routing exit (IP tunnel) on the same node.
+            r.push(policy.ckr as u8);
             c.write_all(&r).await?;
             return Err(std::io::Error::other(format!("access check: {}", res.name())));
         } else if open && m.contains(&0) {

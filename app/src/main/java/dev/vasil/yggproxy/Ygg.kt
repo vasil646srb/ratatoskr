@@ -119,6 +119,10 @@ object Ygg {
                     o.write(byteArrayOf(1, if (ask) 1 else 0, user.size.toByte()) + user + byteArrayOf(k.size.toByte()) + k)
                     val r = readN(i, 10)
                     val exp = java.nio.ByteBuffer.wrap(r, 2, 8).long
+                    // 0.1.17+: one more byte, what the exit offers (bit 0: CKR); older ones close.
+                    s.soTimeout = 3000
+                    val f = try { i.read() } catch (_: Exception) { -1 }
+                    serverFromText(server)?.let { if (f >= 0 && f and 1 == 1) State.ckrServers.add(it) else State.ckrServers.remove(it) }
                     codeName(r[1].toInt()) to exp
                 }
                 2 -> {
@@ -250,6 +254,7 @@ object Ygg {
             serverFromText(o.optString("address"))?.let {
                 into.putIfAbsent(it, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms"))
                 if (o.optBoolean("public")) public?.add(it)
+                if (o.has("ckr")) { if (o.optBoolean("ckr")) State.ckrServers.add(it) else State.ckrServers.remove(it) }
             }
         }
     }

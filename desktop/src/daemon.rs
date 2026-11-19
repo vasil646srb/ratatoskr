@@ -315,6 +315,9 @@ fn refresh_trackers(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>, with_peer
         for e in v["exits"].as_array().into_iter().flatten() {
             if let Some(a) = e["address"].as_str().and_then(config::parse_server).map(|a| a.to_string())
                 && !exits.iter().any(|x| x.0 == a) {
+                    if let Some(c) = e["ckr"].as_bool() {
+                        ckr_known(&a, c);
+                    }
                     exits.push((a, e["rtt_ms"].as_u64(), e["public"].as_bool() == Some(true)));
                 }
         }
@@ -1012,6 +1015,10 @@ impl Daemon {
             if cfg.server.allow_lan {
                 cmd.push("--allow-lan".into());
             }
+            if ckr_exit_wanted(cfg) {
+                // Clients learn from the access check that this exit has CKR too.
+                cmd.push("--ckr".into());
+            }
             if client {
                 // Exit traffic must not loop into our own VPN.
                 cmd.extend(["--fwmark".into(), format!("0x{:x}", config::FWMARK)]);
@@ -1035,7 +1042,8 @@ impl Daemon {
             s.clients.clear();
         }
 
-        // 3. VPN.
+        // 3. VPN (CKR or the proxy: by the setting and what the server in use offers).
+        let cfg = &self.vpn_cfg(cfg);
         if client {
             if self.vpn.as_ref().map(|v| v.sig.as_str()) != Some(vpn_sig(cfg).as_str()) {
                 if let Some(v) = self.vpn.take() {
@@ -1074,6 +1082,27 @@ impl Daemon {
 // Client: our TUN handed to the node, which carries every packet to the exit by its key.
 
 const CKR_EXIT_TUN: &str = "ygg-ckr";
+
+/// Exits known to offer CKR (from our access checks and the trackers' lists): address → yes/no.
+static CKR_SERVERS: std::sync::LazyLock<Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+
+fn ckr_known(server: &str, ckr: bool) {
+    if let Some(a) = config::parse_server(server) {
+        CKR_SERVERS.lock().unwrap().insert(a.to_string(), ckr);
+    }
+}
+
+/// Does this exit offer CKR? None: not known yet.
+fn ckr_offered(server: &str) -> Option<bool> {
+    config::parse_server(server).and_then(|a| CKR_SERVERS.lock().unwrap().get(&a.to_string()).copied())
+}
+
+/// The VPN goes through CKR: forced on, or automatic and the exit offers it (Linux only; the
+/// Yggdrasil-only mode has no exit).
+fn ckr_effective(cfg: &Config, server: &str) -> bool {
+    let c = &cfg.client;
+    cfg!(all(unix, not(target_os = "android"))) && !c.ygg_only && (c.ckr || (c.ckr_auto && ckr_offered(server) == Some(true)))
+}
 const CKR_CHAIN: &str = "RATATOSKR-CKR";
 const CKR_POOL4: &str = "10.77.0.0/16";
 const CKR_POOL6: &str = "fd77:7967:6772::/64";
@@ -1191,6 +1220,21 @@ fn ckr_firewall(st: &Shared, dir: &Path, up: bool, ipv6: bool, allow_lan: bool) 
 }
 
 impl Daemon {
+    /// The config the VPN is built from: `client.ckr` = whether it goes through CKR now (forced,
+    /// or automatic with an exit that offers it — the fallback one while failover is on).
+    fn vpn_cfg(&self, cfg: &Config) -> Config {
+        let active = self.st.lock().unwrap().failover.clone().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1)
+            .unwrap_or_else(|| cfg.client.server.trim().to_string());
+        let mut c = cfg.clone();
+        c.client.ckr = ckr_effective(cfg, &active);
+        c
+    }
+
+    /// The server in use changed its CKR offer (or we learned it): rebuild the VPN.
+    fn vpn_mode_changed(&self, cfg: &Config) -> bool {
+        self.vpn.as_ref().is_some_and(|v| v.sig != vpn_sig(&self.vpn_cfg(cfg)))
+    }
+
     /// Every 2 s: the CKR exit's interface and allow list; the CKR VPN's TUN handed to the
     /// node (again after a node restart) and our Yggdrasil address put on it.
     fn ckr_tick(&mut self, cfg: &Config) {
@@ -1372,6 +1416,11 @@ pub fn probe_access(server: &str, key: &str, device: &str, message: &str, record
             let mut r = [0u8; 10];
             s.read_exact(&mut r).map_err(|_| "сервер не ответил".to_string())?;
             let a = crate::access::Auth::from_code(r[1]).ok_or_else(|| format!("неизвестный ответ {}", r[1]))?;
+            // 0.1.17+: one more byte, what the exit offers (bit 0: CKR); older ones close here.
+            let mut f = [0u8; 1];
+            s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+            let ckr = matches!(s.read(&mut f), Ok(1)) && f[0] & 1 == 1;
+            ckr_known(&ip.to_string(), ckr);
             Ok((a, u64::from_be_bytes(r[2..10].try_into().unwrap())))
         }
         2 => {
@@ -1441,7 +1490,8 @@ fn access_watch(st: Shared, cfg: Arc<Mutex<Config>>) {
         let sig = format!("{server} {key}");
         let wait = match &last {
             Some((s, code, t)) if *s == sig => {
-                if code == "ok" { Duration::from_secs(300) } else { Duration::from_secs(20) }
+                // Automatic CKR: every minute, so a server that drops CKR is noticed soon.
+                if code == "ok" { Duration::from_secs(if c.ckr_auto && !c.ckr { 60 } else { 300 }) } else { Duration::from_secs(20) }
                     .saturating_sub(t.elapsed())
             }
             _ => Duration::ZERO,
@@ -1504,7 +1554,9 @@ fn pick_fallback(st: &Shared, cfg: &Config, skip: &[&str]) -> Option<String> {
         .collect();
     cands.sort();
     cands.dedup();
-    cands.sort_by_key(|a| ping[a]);
+    // Exits with CKR first when CKR is wanted, then by ping.
+    let want_ckr = cfg.client.ckr || cfg.client.ckr_auto;
+    cands.sort_by_key(|a| (want_ckr && ckr_offered(a) != Some(true), ping[a]));
     let dev = config::device_name();
     // The best few at once (each check may wait on the network); the lowest ping that lets us in.
     let found: Vec<(String, bool)> = std::thread::scope(|sc| {
@@ -1531,7 +1583,8 @@ fn failover_watch(st: Shared, cfg: Arc<Mutex<Config>>, dir: PathBuf) {
         let primary = c.client.server.trim().to_string();
         let on = c.client.enabled && !c.client.ygg_only && config::parse_server(&primary).is_some();
         // CKR: pings decide (the exit may be Yggdrasil-ng, without our proxy).
-        let ckr = c.client.ckr && cfg!(unix);
+        let active_now = st.lock().unwrap().failover.clone().filter(|f| f.0 == primary).map(|f| f.1).unwrap_or_else(|| primary.clone());
+        let ckr = ckr_effective(&c, &active_now);
         let (vpn, node) = { let s = st.lock().unwrap(); (s.vpn_active, s.node_running) };
         if !on || !node {
             st.lock().unwrap().failover = None;
@@ -1616,7 +1669,10 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
         "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "active": s.vpn_active,
                    "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
                    "servers": cfg.client.servers, "ygg_sites": cfg.client.ygg_sites, "ygg_only": cfg.client.ygg_only,
-                   "ckr": cfg.client.ckr && cfg!(unix) && !cfg.client.ygg_only, "ckr_address": cfg.client.ckr_address,
+                   "ckr": ckr_effective(cfg, &s.failover.as_ref().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1.clone()).unwrap_or_else(|| cfg.client.server.trim().to_string())),
+                   "ckr_mode": if cfg.client.ckr { "on" } else if cfg.client.ckr_auto { "auto" } else { "off" },
+                   "ckr_address": cfg.client.ckr_address,
+                   "ckr_servers": CKR_SERVERS.lock().unwrap().iter().filter(|(_, v)| **v).map(|(k, _)| k.clone()).collect::<Vec<_>>(),
                    "access": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.1.clone()),
                    "access_expires": s.access.as_ref().filter(|a| a.0 == cfg.client.server.trim()).map(|a| a.3),
                    "failover": s.failover.as_ref().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1.clone()),
@@ -1820,6 +1876,10 @@ pub fn main() -> Result<(), String> {
             last_ckr = Instant::now();
             let c = cfg.lock().unwrap().clone();
             d.ckr_tick(&c);
+            if d.vpn_mode_changed(&c) {
+                log(&st, "vpn", "сервер предлагает другой режим (CKR или прокси) — перестраиваю VPN");
+                d.reconcile(&c);
+            }
         }
         // Trackers: exits and more trackers every 2 min, checked public peers hourly (fetched
         // directly through a yggdrasil-go TUN or through the node's --socks).

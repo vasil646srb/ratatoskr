@@ -137,8 +137,16 @@ class YggService : VpnService() {
         val sig = "$server $key"
         val last = accessLast
         val now = System.currentTimeMillis()
-        if (last != null && last.first == sig && now - last.third < if (last.second == "ok") 300_000 else 20_000) return
+        // Automatic CKR: every minute when ok, so a server that drops CKR is noticed soon.
+        val okEvery = if (prefs.ckrAuto && !prefs.ckr) 60_000 else 300_000
+        if (last != null && last.first == sig && now - last.third < if (last.second == "ok") okEvery else 20_000) return
+        val ckrBefore = prefs.ckrFor(server)
         val (code, exp) = Ygg.probeAccess(server, key, ask = true)
+        // The exit offers CKR now (or no longer): the VPN changes its mode.
+        if (prefs.ckrFor(server) != ckrBefore) {
+            State.log("vpn", if (prefs.ckrFor(server)) "$server предлагает CKR — VPN переходит на туннель CKR" else "$server без CKR — VPN через прокси")
+            requestReconcile()
+        }
         if (last == null || last.first != sig || last.second != code) {
             val text = Ygg.accessText(code)
             if (code == "ok") State.log("access", "$server: $text") else State.error("access", "$server: $text")
@@ -337,7 +345,7 @@ class YggService : VpnService() {
         if (wantVpn) {
             // The server is not part of it: a switch needs no new VPN interface.
             // CKR: the address is part of it (it becomes the tunnel's IPv6 source once known).
-            val ckrOn = prefs.ckr && target != null
+            val ckrOn = target != null && prefs.ckrFor(Ygg.serverFromText(target.first))
             val sig = "${prefs.udp}|${prefs.ipv6}|${prefs.excludedApps}|${prefs.yggSites}|$only|$ckrOn|${prefs.ckrAddress}|${prefs.ckrDns}|${if (ckrOn) State.address else ""}"
             State.vpnTarget = target?.first
             if (vpnPfd == null || sig != vpnSig) {
@@ -457,7 +465,7 @@ class YggService : VpnService() {
 
     /** [target] null: Yggdrasil only (no exit server). */
     private fun startVpn(target: Pair<String, Int>?) {
-        if (prefs.ckr && target != null) return startCkrVpn(target)
+        if (target != null && prefs.ckrFor(Ygg.serverFromText(target.first))) return startCkrVpn(target)
         val b = Builder()
             .setSession(if (target == null) "Yggdrasil" else "Yggdrasil → [${target.first}]")
             .setMtu(1500)

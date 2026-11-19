@@ -61,6 +61,7 @@ class MainActivity : Activity() {
     private lateinit var cbYggSites: CheckBox
     private lateinit var cbYggOnly: CheckBox
     private lateinit var cbCkr: CheckBox
+    private lateinit var cbCkrAuto: CheckBox
     private lateinit var etCkrAddress: EditText
     private lateinit var etCkrDns: EditText
     private lateinit var btnVpn: Button
@@ -355,8 +356,9 @@ class MainActivity : Activity() {
         cbYggSites = check("Сайты Yggdrasil и ALFIS (.ygg, .anon…) — через свой узел, рядом с интернетом", prefs.yggSites).also { addView(it) }
         cbYggOnly = check("Только Yggdrasil: VPN без сервера выхода (интернет как обычно)", prefs.yggOnly).also { addView(it) }
         addView(note("Адреса 200::/7 и имена ALFIS идут в сеть Yggdrasil напрямую через узел телефона. Только TCP: сайты, SSH, чаты; UDP и ping — нет."))
-        cbCkr = check("Туннель CKR: весь IP-трафик (UDP, игры, звонки) — сервер должен поддерживать CKR", prefs.ckr).also { addView(it) }
-        addView(note("Пакеты целиком идут к серверу выхода по его ключу Yggdrasil, как в Yggdrasil-ng. Подходит сервер Ratatoskr с включённым выходом CKR или Yggdrasil-ng с tunnel_routing. Имена ALFIS в этом режиме не работают, адреса Yggdrasil — работают."))
+        cbCkrAuto = check("Туннель CKR сам, если сервер его предлагает; такие серверы — первыми", prefs.ckrAuto).also { addView(it) }
+        cbCkr = check("Туннель CKR всегда (нужно для серверов Yggdrasil-ng)", prefs.ckr).also { addView(it) }
+        addView(note("CKR: весь IP-трафик (UDP, игры, звонки, ping) идёт к серверу выхода пакетами по его ключу Yggdrasil, как в Yggdrasil-ng. Без CKR — прокси. Имена ALFIS в режиме CKR не работают, адреса Yggdrasil — работают."))
         etCkrAddress = edit("адрес в туннеле CKR (10.99.0.2)", prefs.ckrAddress).also { addView(it) }
         etCkrDns = edit("DNS через туннель CKR (1.1.1.1)", prefs.ckrDns).also { addView(it) }
         addView(h1("Узел Yggdrasil"))
@@ -440,6 +442,7 @@ class MainActivity : Activity() {
         prefs.yggSites = cbYggSites.isChecked
         prefs.yggOnly = cbYggOnly.isChecked
         prefs.ckr = cbCkr.isChecked
+        prefs.ckrAuto = cbCkrAuto.isChecked
         etCkrAddress.text.toString().trim().let { if (Regex("^\\d{1,3}(\\.\\d{1,3}){3}$").matches(it)) prefs.ckrAddress = it }
         etCkrDns.text.toString().trim().let { if (it.isEmpty() || Regex("^[0-9a-fA-F:.]+$").matches(it)) prefs.ckrDns = it }
         prefs.limTotalDown = kbit(etLimTotalDown)
@@ -704,7 +707,7 @@ class MainActivity : Activity() {
                 }
                 val sel = a == prefs.server
                 val mark = when { sel && prefs.vpnEnabled && State.vpnActive -> "● подключено"; sel && prefs.vpnEnabled -> "◐ подключается"; sel -> "○ выбран"; else -> "" }
-                val kind = if (prefs.keyFor(a) != null) "🔑 " else if (a in State.trackerPublic) "🌐 " else ""
+                val kind = (if (prefs.keyFor(a) != null) "🔑 " else if (a in State.trackerPublic) "🌐 " else "") + (if (a in State.ckrServers) "CKR " else "")
                 serversBox.addView(mono("$kind$a\n    пинг: $ping  $mark").apply {
                     setTextIsSelectable(false)
                     if (sel) setTypeface(Typeface.MONOSPACE, Typeface.BOLD)

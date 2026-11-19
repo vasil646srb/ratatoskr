@@ -28,6 +28,12 @@ class Prefs(ctx: Context) {
     var yggOnly: Boolean get() = b("ygg_only", false); set(v) = put { putBoolean("ygg_only", v) }
     /** VPN as a crypto-key routing tunnel (every IP packet, UDP included), Yggdrasil-ng compatible. */
     var ckr: Boolean get() = b("ckr", false); set(v) = put { putBoolean("ckr", v) }
+    /** CKR by itself whenever the exit offers it (else the proxy); such exits are picked first. */
+    var ckrAuto: Boolean get() = b("ckr_auto", true); set(v) = put { putBoolean("ckr_auto", v) }
+    /** The VPN through [server] goes through CKR. */
+    fun ckrFor(server: String?): Boolean = server != null && (ckr || (ckrAuto && server in State.ckrServers))
+    /** Prefer exits with CKR when picking one. */
+    val ckrWanted: Boolean get() = ckr || ckrAuto
     /** Our IPv4 address in the CKR tunnel. */
     var ckrAddress: String get() = s("ckr_address", "10.99.0.2"); set(v) = put { putString("ckr_address", v.trim()) }
     /** DNS server used through the CKR tunnel. */

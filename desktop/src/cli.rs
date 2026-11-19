@@ -41,8 +41,10 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
                                без адреса — к серверу с наименьшим пингом
   yggproxy request АДРЕС [СООБЩЕНИЕ]  запросить доступ к закрытому серверу (с сообщением владельцу)
   yggproxy forget АДРЕС        убрать сервер из сохранённых
-  yggproxy set ckr on|off      Linux: VPN через CKR — весь IP-трафик (UDP, игры, звонки) туннелем
-                               к серверу; нужен сервер с CKR (Ratatoskr или Yggdrasil-ng)
+  yggproxy set ckr auto|on|off  Linux: VPN через CKR — весь IP-трафик (UDP, игры, звонки) туннелем
+                               к серверу. auto (по умолчанию) — когда сервер его предлагает, иначе
+                               прокси, и серверы с CKR выбираются первыми; on — всегда (так нужно
+                               для Yggdrasil-ng); off — только прокси
   yggproxy set ckr_address IP  наш IPv4 в туннеле CKR (по умолчанию 10.99.0.2)
   yggproxy set ckr_dns A,B     DNS через туннель CKR (по умолчанию 1.1.1.1,9.9.9.9)
   yggproxy ygg                 VPN только для сайтов Yggdrasil и ALFIS (.ygg, .anon…), без сервера
@@ -168,6 +170,8 @@ fn status() -> Result<(), String> {
         );
         if c["ckr"].as_bool() == Some(true) {
             println!("  режим: туннель CKR (весь IP-трафик), адрес {}", c["ckr_address"].as_str().unwrap_or("?"));
+        } else if c["ckr_mode"].as_str() == Some("auto") {
+            println!("  режим: прокси (CKR — сам, если сервер его предложит)");
         }
         println!("  пинг до сервера: {}", c["server_rtt"].as_str().unwrap_or("измеряю…"));
         if let Some(f) = c["failover"].as_str() {
@@ -242,6 +246,18 @@ fn server_rows(s: &Value) -> Vec<(String, bool, Option<u64>)> {
     rows
 }
 
+/// Exits known to offer CKR (from the service's access checks and the trackers).
+fn ckr_set(s: &Value) -> std::collections::HashSet<String> {
+    s["client"]["ckr_servers"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect()
+}
+
+/// The one to pick: with CKR first (unless CKR is off), then the lowest ping.
+fn best_row<'a>(s: &Value, rows: &'a [(String, bool, Option<u64>)]) -> Option<&'a (String, bool, Option<u64>)> {
+    let ckr = ckr_set(s);
+    let want = s["client"]["ckr_mode"].as_str() != Some("off");
+    rows.iter().filter(|r| r.2.is_some()).min_by_key(|r| (want && !ckr.contains(&r.0), r.2)).or(rows.first())
+}
+
 fn servers() -> Result<(), String> {
     let s = api::status()?;
     let cur = s["client"]["server"].as_str().unwrap_or("");
@@ -249,9 +265,11 @@ fn servers() -> Result<(), String> {
     if rows.is_empty() {
         println!("серверов нет: yggproxy connect АДРЕС, или дождитесь списка от трекеров");
     }
+    let ckr = ckr_set(&s);
     for (a, saved, ping) in &rows {
         let mark = if a == cur && s["client"]["enabled"].as_bool() == Some(true) { "●" } else if a == cur { "○" } else { " " };
-        println!("{mark} {a}  {}  {}", ping.map(|p| format!("{p} мс")).unwrap_or("нет ответа".into()), if *saved { "сохранён" } else { "от трекера" });
+        println!("{mark} {a}  {}  {}{}", ping.map(|p| format!("{p} мс")).unwrap_or("нет ответа".into()), if *saved { "сохранён" } else { "от трекера" },
+            if ckr.contains(a) { "  CKR" } else { "" });
     }
     if let Some(r) = s["rtt"]["root"]["rtt_ms"].as_u64() {
         println!("корень сети: {r} мс");
@@ -428,7 +446,19 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             "ipv6" => c.client.ipv6 = b.clone().unwrap_or(c.client.ipv6),
             "ygg_sites" => c.client.ygg_sites = b.clone().unwrap_or(c.client.ygg_sites),
             "alfis" => c.client.alfis = val.split(',').map(|s| s.trim().to_string()).filter(|s| config::parse_server(s).is_some()).collect(),
-            "ckr" => c.client.ckr = b.clone().unwrap_or(c.client.ckr),
+            // on: always; auto: when the server offers it (default); off: never.
+            "ckr" => match (val.trim(), b.clone()) {
+                ("auto", _) => {
+                    c.client.ckr = false;
+                    c.client.ckr_auto = true;
+                }
+                (_, Ok(true)) => c.client.ckr = true,
+                (_, Ok(false)) => {
+                    c.client.ckr = false;
+                    c.client.ckr_auto = false;
+                }
+                _ => {}
+            },
             "ckr_address" if val.trim().parse::<std::net::Ipv4Addr>().is_ok() => c.client.ckr_address = val.trim().to_string(),
             "ckr_dns" => c.client.ckr_dns = val.split(',').map(|s| s.trim().to_string()).filter(|s| s.parse::<std::net::IpAddr>().is_ok()).collect(),
             "ckr_exit" => c.server.ckr = b.clone().unwrap_or(c.server.ckr),
@@ -527,7 +557,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
                     // The lowest ping among saved and tracker servers; else the tracker's first.
                     let s = api::status()?;
                     let rows = server_rows(&s);
-                    let best = rows.iter().filter(|r| r.2.is_some()).min_by_key(|r| r.2).or(rows.first())
+                    let best = best_row(&s, &rows)
                         .ok_or("серверов пока нет: укажите адрес или дождитесь списка от трекеров (yggproxy servers)")?;
                     println!("лучший сервер: {}{}", best.0, best.2.map(|p| format!(" ({p} мс)")).unwrap_or_default());
                     best.0.parse().map_err(|_| "неверный адрес".to_string())?

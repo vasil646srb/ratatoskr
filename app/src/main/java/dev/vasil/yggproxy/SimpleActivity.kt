@@ -407,10 +407,11 @@ class SimpleActivity : Activity() {
         val ping = HashMap<String, Long>()
         for ((addr, o) in dRttMap) if (!o.isNull("avg_ms")) ping[addr] = o.optLong("avg_ms")
         val all = (State.trackerExits.map { it.first } + prefs.serverList()).mapNotNull { Ygg.serverFromText(it) }.distinct()
-        val others = all.filter { it != cur }.sortedBy { ping[it] ?: Long.MAX_VALUE }
+        val others = all.filter { it != cur }.sortedWith(compareBy({ prefs.ckrWanted && it !in State.ckrServers }, { ping[it] ?: Long.MAX_VALUE }))
         if (others.isEmpty()) { toast("Других серверов пока нет"); return }
         val labels = listOf("Автоматически: лучший по пингу") + others.map { s ->
-            (if (prefs.keyFor(s) != null) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + s + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа")
+            (if (prefs.keyFor(s) != null) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + s + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") +
+                (if (s in State.ckrServers) "  · CKR" else "")
         }
         android.app.AlertDialog.Builder(this)
             .setTitle("Сменить сервер")
@@ -694,7 +695,8 @@ class SimpleActivity : Activity() {
             if (ping.size == exits.size) break
             pause(2000)
         }
-        val pinged = ping.entries.sortedBy { it.value }
+        // Exits with CKR first (the whole IP traffic through them), then by ping.
+        val pinged = ping.entries.sortedWith(compareBy({ prefs.ckrWanted && it.key !in State.ckrServers }, { it.value }))
         if (pinged.isEmpty()) throw Stop("ни один сервер не ответил на пинг")
         finish("ответили ${pinged.size} из ${exits.size}")
         for ((a, ms) in pinged) say("$a — $ms мс", Mark.INFO)
@@ -715,7 +717,8 @@ class SimpleActivity : Activity() {
 
         // 6. Speed of the best ones by ping: connect to each briefly and measure.
         say("Ищу лучший сервер для выхода (пинг и скорость)")
-        val candidates = ranked.take(3).map { it.key }
+        val withCkr = ranked.filter { prefs.ckrWanted && it.key in State.ckrServers }
+        val candidates = (withCkr.ifEmpty { ranked }).take(3).map { it.key }
         val speed = HashMap<String, Double>()
         for (a in candidates) {
             headline("Проверяю сервер $a")

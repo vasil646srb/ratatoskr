@@ -185,9 +185,15 @@ impl App {
             .unwrap_or_default();
         let ping = st.map(api::ping_map).unwrap_or_default();
         let saved = self.cfg.as_ref().unwrap().client.servers.clone();
-        let tracker: Vec<String> = st
+        let ckr_srv: std::collections::HashSet<String> = st
+            .map(|s| s["client"]["ckr_servers"].as_array().into_iter().flatten().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        // Tracker servers: those with CKR first (CKR not off), then by ping.
+        let want_ckr = { let c = &self.cfg.as_ref().unwrap().client; c.ckr || c.ckr_auto };
+        let mut tracker: Vec<String> = st
             .map(|s| s["trackers"]["exits"].as_array().into_iter().flatten().filter_map(|e| e["address"].as_str().map(String::from)).filter(|a| !saved.contains(a)).collect())
             .unwrap_or_default();
+        tracker.sort_by_key(|a| (want_ckr && !ckr_srv.contains(a), ping.get(a).copied().unwrap_or(u64::MAX)));
         let (cur, on, active) = {
             let c = self.cfg.as_ref().unwrap();
             (c.client.server.clone(), c.client.enabled, st.map(|s| s["client"]["active"].as_bool() == Some(true)).unwrap_or(false))
@@ -198,8 +204,9 @@ impl App {
             let p = ping.get(a).map(|r| format!("{r} мс")).unwrap_or("нет ответа".into());
             let mark = if *a == cur && on && active { "● " } else if *a == cur && on { "◐ " } else if *a == cur { "○ " } else { "  " };
             let kind = if keys.contains_key(a) { "🔑" } else if public.contains(a) { "🌐" } else { "  " };
+            let tag = if ckr_srv.contains(a) { "  CKR" } else { "" };
             ui.horizontal(|ui| {
-                let txt = egui::RichText::new(format!("{mark}{kind} {a}   {p}")).monospace();
+                let txt = egui::RichText::new(format!("{mark}{kind} {a}   {p}{tag}")).monospace();
                 if ui.add(egui::Button::new(if *a == cur { txt.strong() } else { txt }).frame(false)).clicked() {
                     connect = Some(a.clone());
                 }
@@ -256,7 +263,8 @@ impl App {
             } else {
                 // The selected server, else the best by ping, else the first in the list.
                 let pick = config::parse_server(&c.client.server).map(|a| a.to_string())
-                    .or_else(|| saved.iter().chain(tracker.iter()).filter(|a| ping.contains_key(*a)).min_by_key(|a| ping[*a]).cloned())
+                    .or_else(|| saved.iter().chain(tracker.iter()).filter(|a| ping.contains_key(*a))
+                        .min_by_key(|a| (want_ckr && !ckr_srv.contains(*a), ping[*a])).cloned())
                     .or_else(|| saved.first().or(tracker.first()).cloned());
                 match pick {
                     Some(a) => {
@@ -278,12 +286,19 @@ impl App {
         ui.checkbox(&mut c.client.ygg_sites, "Сайты Yggdrasil и ALFIS (.ygg, .anon…) — через свой узел, рядом с интернетом")
             .on_hover_text("Адреса 200::/7 и имена ALFIS идут в сеть Yggdrasil напрямую, остальное — через сервер выхода. Только TCP: сайты, SSH, чаты.");
         ui.checkbox(&mut c.client.ygg_only, "Только Yggdrasil: VPN без сервера выхода (интернет как обычно)");
-        let ck = c.client.ckr;
+        let ck = (c.client.ckr, c.client.ckr_auto);
         if cfg!(unix) {
-            ui.checkbox(&mut c.client.ckr, "Туннель CKR: весь IP-трафик (UDP, игры, звонки) — сервер должен поддерживать CKR")
-                .on_hover_text("Пакеты целиком идут к серверу выхода по его ключу Yggdrasil, как в Yggdrasil-ng. Подходит сервер Ratatoskr с включённым выходом CKR или Yggdrasil-ng с tunnel_routing.");
+            ui.horizontal(|ui| {
+                ui.label("Туннель CKR (весь IP-трафик: UDP, игры, звонки):")
+                    .on_hover_text("Пакеты целиком идут к серверу выхода по его ключу Yggdrasil, как в Yggdrasil-ng. «Сам» — когда сервер его предлагает (иначе прокси), и серверы с CKR выбираются первыми. «Всегда» — нужно для серверов Yggdrasil-ng.");
+                let mut mode = if c.client.ckr { 2 } else if c.client.ckr_auto { 1 } else { 0 };
+                ui.radio_value(&mut mode, 1, "сам");
+                ui.radio_value(&mut mode, 2, "всегда");
+                ui.radio_value(&mut mode, 0, "выкл");
+                (c.client.ckr, c.client.ckr_auto) = (mode == 2, mode == 1);
+            });
         }
-        if (ys, yo, ck) != (c.client.ygg_sites, c.client.ygg_only, c.client.ckr) {
+        if (ys, yo, ck) != (c.client.ygg_sites, c.client.ygg_only, (c.client.ckr, c.client.ckr_auto)) {
             self.apply("Сохранено");
         }
         if let Some(s) = st {
