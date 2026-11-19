@@ -766,7 +766,8 @@ fn peer_journal(st: Shared, dir: PathBuf, cfg: Arc<Mutex<Config>>) {
         }
         if ticks.is_multiple_of(6) {
             let tracker_peers: Option<Value> = std::fs::read_to_string(dir.join("tracker-peers.json")).ok().and_then(|t| serde_json::from_str(&t).ok());
-            let list = prefer_list(&j, tracker_peers.as_ref(), 12).join("\n");
+            let own = cfg.lock().unwrap().network.peers.clone();
+            let list = prefer_list(&own, &j, tracker_peers.as_ref(), 12).join("\n");
             if list != last_prefer {
                 let _ = std::fs::write(dir.join("prefer.txt"), &list);
                 let n = list.lines().count();
@@ -835,6 +836,10 @@ impl Daemon {
             "--monitor-file".into(),
             d.join("monitors.txt").display().to_string(),
         ];
+        // The user's own peers: never replaced by public ones in the peer search.
+        for u in n.peers.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with('#')) {
+            a.extend(["--keep-peer".into(), u.to_string()]);
+        }
         if n.lan_discovery {
             a.push("--lan-upstream".into());
             if n.lan_target > 0 {

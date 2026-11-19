@@ -174,7 +174,7 @@ impl Journal {
 }
 
 /// The priority list for the node: our own best peers first, then the trackers' ranking.
-pub fn prefer_list(journal: &Journal, tracker_peers: Option<&Value>, max: usize) -> Vec<String> {
+pub fn prefer_list(own: &[String], journal: &Journal, tracker_peers: Option<&Value>, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut ids: Vec<String> = Vec::new();
     let mut push = |uri: &str, out: &mut Vec<String>| {
@@ -184,6 +184,10 @@ pub fn prefer_list(journal: &Journal, tracker_peers: Option<&Value>, max: usize)
             out.push(uri.to_string());
         }
     };
+    // The user's own peers first: dialed first and never replaced by a public one.
+    for u in own.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with('#')) {
+        push(u, &mut out);
+    }
     for (u, _) in journal.ranked().iter().take(max) {
         push(u, &mut out);
     }

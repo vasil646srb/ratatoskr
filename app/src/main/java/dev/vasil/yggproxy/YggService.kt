@@ -175,7 +175,7 @@ class YggService : VpnService() {
                 if (journalTicks % 6 == 0L) {
                     writeSearchFile() // trackers learned meanwhile
                     val tp = try { org.json.JSONObject(File(filesDir, "tracker-peers.json").readText()) } catch (_: Exception) { null }
-                    val list = journal.preferList(if (prefs.useTrackers) tp else null).joinToString("\n")
+                    val list = journal.preferList(prefs.customPeerList(), if (prefs.useTrackers) tp else null).joinToString("\n")
                     if (Ygg.writeIfChanged(preferFile, list)) {
                         if (journalTicks == 6L) State.log("peers", "приоритет пиров: ${list.lines().count { it.isNotBlank() }} (свои лучшие и рейтинг трекеров)")
                     }
@@ -367,6 +367,8 @@ class YggService : VpnService() {
         add("--connect-file"); add("${Ygg.CLIENT_SOCKS}:${connectFile.path}")
         // Peers ranked by how well they carried our traffic and by the trackers (re-read live).
         add("--prefer-file"); add(preferFile.path)
+        // The user's own peers: never replaced by public ones in the peer search.
+        prefs.customPeerList().forEach { add("--keep-peer"); add(it) }
         // Without a server, peers are picked by the ping to the trackers (not the root).
         writeSearchFile()
         add("--search-file"); add(searchFile.path)

@@ -120,10 +120,12 @@ class PeerJournal(private val file: File) {
     }
 
     /** Priority list for the node: our own best first, then the trackers' ranking. */
-    fun preferList(trackerPeers: JSONObject?, max: Int = 12): List<String> {
+    fun preferList(own: List<String>, trackerPeers: JSONObject?, max: Int = 12): List<String> {
         val out = ArrayList<String>()
         val ids = HashSet<String>()
         fun push(u: String) { if (u.isNotEmpty() && ids.add(peerId(u))) out += u }
+        // The user's own peers first: dialed first and never replaced by a public one.
+        own.forEach { push(it) }
         ranked().take(max).forEach { push(it.first) }
         val a = trackerPeers?.optJSONArray("peers")
         if (a != null) for (i in 0 until minOf(a.length(), max)) {
