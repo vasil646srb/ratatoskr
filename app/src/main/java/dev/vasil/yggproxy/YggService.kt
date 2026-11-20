@@ -68,6 +68,8 @@ class YggService : VpnService() {
     private val bin: String get() = applicationInfo.nativeLibraryDir
     private val keyFile get() = File(filesDir, "ygg.key")
     private val publicPeers get() = File(filesDir, "public-peers.json")
+    /** Peer settings the running node was started with (public list on, own peers). */
+    private var nodePeers: Pair<Boolean, List<String>>? = null
     private val peerFile get() = File(filesDir, "peers.json")
     private val ctlPath get() = File(filesDir, "tun.sock").path
     /** The node's --ckr-ctl socket: the CKR VPN hands it the interface (again after a node restart). */
@@ -305,7 +307,10 @@ class YggService : VpnService() {
             if (target != null && wantVpn) State.log("vpn", "сервер выхода: ${target.first} (узел не перезапускается)")
         }
         val nodeCmd = nodeArgs(wantExit)
-        if (node?.cmd != nodeCmd) {
+        // The node reads its peer file only at start: a changed peer choice needs a restart.
+        val peers = prefs.usePublicPeers to prefs.customPeerList()
+        if (node?.cmd != nodeCmd || (node != null && peers != nodePeers)) {
+            nodePeers = peers
             node?.stop("новые параметры узла")
             node = ManagedProcess("node", nodeCmd, filesDir,
                 onStart = { State.nodeRunning = true; State.nodeStartedAt = System.currentTimeMillis() },
@@ -457,7 +462,8 @@ class YggService : VpnService() {
         }
         val custom = prefs.customPeerList()
         val pub = if (prefs.usePublicPeers) publicPeers else null
-        val fromTrackers = File(filesDir, "tracker-peers.json").takeIf { prefs.useTrackers && it.isFile }
+        // Tracker peers are public peers too: with the public list off, only while no own peer is set.
+        val fromTrackers = File(filesDir, "tracker-peers.json").takeIf { prefs.useTrackers && it.isFile && (prefs.usePublicPeers || custom.isEmpty()) }
         Ygg.writePeerFile(peerFile, custom, pub, fromTrackers)
         if (custom.isEmpty() && (pub == null || !pub.isFile) && fromTrackers == null) State.error("peers", "нет ни одного пира: добавьте свои или включите публичный список")
     }

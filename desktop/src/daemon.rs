@@ -270,14 +270,17 @@ fn write_peer_file(dir: &Path, cfg: &Config) {
     for u in cfg.network.peers.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with('#')) {
         custom.insert(u.to_string(), json!({"up": true}));
     }
+    let no_custom = custom.is_empty();
     let mut out = format!("{{\"custom\":{}", Value::Object(custom));
     if cfg.network.public_peers
         && let Ok(p) = std::fs::read_to_string(dir.join("public-peers.json")) {
             out.push_str(",\"public\":");
             out.push_str(&p);
         }
-    // Peers checked by the trackers (works where the public list's site is blocked).
-    if let Ok(p) = std::fs::read_to_string(dir.join("tracker-peers.json")) {
+    // Peers checked by the trackers (works where the public list's site is blocked). They are
+    // public peers too: with the public list off they are used only while no own peer is set.
+    if (cfg.network.public_peers || no_custom)
+        && let Ok(p) = std::fs::read_to_string(dir.join("tracker-peers.json")) {
         out.push_str(",\"tracker\":");
         out.push_str(&p);
     }
@@ -856,6 +859,8 @@ struct Daemon {
     node_bin: PathBuf,
     helper_bin: PathBuf,
     node: Option<Proc>,
+    /// Peer settings the running node was started with (public list on, own peers).
+    peer_choice: (bool, Vec<String>),
     exit: Option<Proc>,
     vpn: Option<Vpn>,
     /// CKR exit firewall set up: (IPv6, LAN allowed).
@@ -970,7 +975,10 @@ impl Daemon {
             refresh_public(&self.st, &self.dir, false);
             write_peer_file(&self.dir, cfg);
             let cmd = self.node_args(cfg, client);
-            if self.node.as_ref().map(|p| &p.cmd) != Some(&cmd) {
+            // The node reads its peer file only at start: a changed peer choice needs a restart.
+            let peers = (cfg.network.public_peers, cfg.network.peers.clone());
+            if self.node.as_ref().map(|p| &p.cmd) != Some(&cmd) || (self.node.is_some() && self.peer_choice != peers) {
+                self.peer_choice = peers;
                 if let Some(p) = self.node.take() {
                     p.stop(&self.st, "node", "новые параметры узла");
                 }
@@ -1917,7 +1925,7 @@ pub fn main() -> Result<(), String> {
         std::thread::spawn(move || access_watch(st, cfg));
     }
 
-    let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, exit: None, vpn: None, ckr_fw: None };
+    let mut d = Daemon { st: st.clone(), dir: dir.clone(), node_bin, helper_bin, node: None, peer_choice: (true, Vec::new()), exit: None, vpn: None, ckr_fw: None };
     let mut last_ckr = Instant::now();
     let snapshot = cfg.lock().unwrap().clone();
     d.reconcile(&snapshot);
@@ -1980,4 +1988,35 @@ pub fn main() -> Result<(), String> {
     d.stop_all();
     platform::unlisten();
     Ok(())
+}
+
+#[cfg(test)]
+mod peer_file_tests {
+    use super::*;
+
+    fn written(public: bool, own: &[&str]) -> Value {
+        let dir = std::env::temp_dir().join(format!("ygg-peers-{}-{public}-{}", std::process::id(), own.len()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("public-peers.json"), r#"{"x":{"tls://p:1":{"up":true}}}"#).unwrap();
+        std::fs::write(dir.join("tracker-peers.json"), r#"{"tcp://t:1":{"up":true}}"#).unwrap();
+        let mut cfg = Config::default();
+        cfg.network.public_peers = public;
+        cfg.network.peers = own.iter().map(|s| s.to_string()).collect();
+        write_peer_file(&dir, &cfg);
+        let v = serde_json::from_str(&std::fs::read_to_string(dir.join("peers.json")).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        v
+    }
+
+    #[test]
+    fn own_peers_only_without_public_list() {
+        let v = written(false, &["tcp://mine:1"]);
+        assert!(v["custom"]["tcp://mine:1"].is_object());
+        assert!(v.get("public").is_none() && v.get("tracker").is_none());
+        // No own peer: the trackers' peers keep the node connected.
+        let v = written(false, &[]);
+        assert!(v.get("public").is_none() && v["tracker"].is_object());
+        let v = written(true, &["tcp://mine:1"]);
+        assert!(v["public"].is_object() && v["tracker"].is_object());
+    }
 }
