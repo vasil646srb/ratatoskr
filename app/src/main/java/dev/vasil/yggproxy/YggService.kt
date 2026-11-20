@@ -384,7 +384,8 @@ class YggService : VpnService() {
         add("--key"); add(keyFile.path)
         add("--peers"); add(peerFile.path)
         add("--no-public")
-        add("--target"); add(prefs.target.toString())
+        // An exit keeps at least 3 peers: one closing must not cut its clients off.
+        add("--target"); add((if (exit) maxOf(prefs.target, 3) else prefs.target).toString())
         add("--swap-interval"); add(prefs.swapInterval.toString())
         add("--swap-settle"); add(prefs.swapSettle.toString())
         add("--api"); add("127.0.0.1:${Ygg.API}")
@@ -409,7 +410,8 @@ class YggService : VpnService() {
         prefs.customPeerList().forEach { add("--keep-peer"); add(it) }
         // Without a server, peers are picked by the ping to the trackers (not the root).
         writeSearchFile()
-        add("--search-file"); add(searchFile.path)
+        // Not on an exit: the trackers' ping says nothing about its clients' paths.
+        if (!exit) { add("--search-file"); add(searchFile.path) }
         // Peer search keeps replacing peers while the ping to the server is above this.
         add("--rtt-limit"); add(prefs.rttLimit.toString())
         if (exit) {
@@ -431,6 +433,8 @@ class YggService : VpnService() {
     }
 
     private fun nodeLine(l: String) {
+        // CKR tunnel byte counters, once a second: not for the log.
+        if (l.startsWith("STAT ")) { State.parseStat(l); return }
         when {
             l.startsWith("device address:") -> State.address = l.substringAfter(':').trim()
             // A (re)started node: hand it the CKR tunnel again.

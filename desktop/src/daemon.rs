@@ -769,6 +769,10 @@ fn helper_line(st: &Shared, tag: &str, l: &str) {
 }
 
 fn node_line(st: &Shared, l: &str) {
+    // CKR tunnel byte counters, once a second (same line as ygghelper's): not for the log.
+    if l.starts_with("STAT tun") {
+        return helper_line(st, "node", l);
+    }
     {
         let mut s = st.lock().unwrap();
         let val = || l.split_once(':').map(|x| x.1.trim().to_string());
@@ -867,6 +871,14 @@ struct Daemon {
     ckr_fw: Option<(bool, bool)>,
 }
 
+/// Outbound peers for the node: an exit keeps at least [`EXIT_MIN_TARGET`], so one peer
+/// closing does not cut it (and every client reaching it through the network) off.
+fn exit_target(cfg: &Config) -> u32 {
+    let t = cfg.network.target.clamp(1, 32);
+    if cfg.server.enabled { t.max(EXIT_MIN_TARGET) } else { t }
+}
+const EXIT_MIN_TARGET: u32 = 3;
+
 impl Daemon {
     fn node_args(&self, cfg: &Config, client: bool) -> Vec<String> {
         let n = &cfg.network;
@@ -879,7 +891,7 @@ impl Daemon {
             d.join("peers.json").display().to_string(),
             "--no-public".into(),
             "--target".into(),
-            n.target.clamp(1, 32).to_string(),
+            exit_target(cfg).to_string(),
             "--swap-interval".into(),
             n.swap_interval.clamp(5, 3600).to_string(),
             "--swap-settle".into(),
@@ -919,14 +931,17 @@ impl Daemon {
             // Peers ranked by how well they carried our traffic (and by the trackers' reports).
             "--prefer-file".into(),
             d.join("prefer.txt").display().to_string(),
-            // Without a server, peers are picked by the ping to the trackers (not the root).
-            "--search-file".into(),
-            d.join("search.txt").display().to_string(),
             "--rtt-limit".into(),
             n.rtt_limit.clamp(10, 5000).to_string(),
             "--fwmark".into(),
             format!("0x{:x}", config::FWMARK),
         ]);
+        // Without a server, peers are picked by the ping to the trackers (not the root). Not on an
+        // exit: the trackers' ping says nothing about its clients' paths, and a busy tracker link
+        // would make it drop the peers its clients reach it through.
+        if !cfg.server.enabled {
+            a.extend(["--search-file".into(), d.join("search.txt").display().to_string()]);
+        }
         if cfg.server.enabled {
             let p = config::PORT.to_string();
             a.extend([
