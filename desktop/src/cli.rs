@@ -180,6 +180,8 @@ fn status() -> Result<(), String> {
             println!("  режим: туннель CKR (весь IP-трафик), адрес {}", c["ckr_address"].as_str().unwrap_or("?"));
         } else if c["ckr_mode"].as_str() == Some("auto") {
             println!("  режим: прокси (CKR — сам, если сервер его предложит)");
+        } else {
+            println!("  режим: прокси");
         }
         println!("  пинг до сервера: {}", c["server_rtt"].as_str().unwrap_or("измеряю…"));
         if let Some(f) = c["failover"].as_str() {

@@ -49,6 +49,8 @@ object State {
 
     @Volatile var vpnActive = false
     @Volatile var vpnTarget: String? = null
+    /** The VPN is the CKR tunnel (whole IP packets to the exit), else the proxy (TCP/UDP through SOCKS). */
+    @Volatile var vpnCkr = false
     @Volatile var tunTx = 0L
     @Volatile var tunRx = 0L
 

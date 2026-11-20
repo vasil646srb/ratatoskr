@@ -23,7 +23,8 @@ import java.io.File
  * Simple mode: one button. Connecting walks through every stage on its own and says what it is
  * doing: the Yggdrasil network, the best peer, the trackers' server list, ping to every server,
  * a short speed test of the best ones, the VPN, the best peer towards the chosen server, and a
- * final internet check. Everything else is in the full app («Расширенный режим»).
+ * final internet check. With a key for a server the search is skipped: that server and its own
+ * peer. Everything else is in the full app («Расширенный режим»).
  */
 class SimpleActivity : Activity() {
 
@@ -308,6 +309,8 @@ class SimpleActivity : Activity() {
     private lateinit var tvNow: TextView
     private lateinit var tvAvg: TextView
     private lateinit var tvTotal: TextView
+    private lateinit var tvSpeed: TextView
+    @Volatile private var speedRunning = false
 
     /** Fresh node data for the panel, polled off the UI thread once a second. */
     @Volatile private var dPeers = -1
@@ -334,10 +337,17 @@ class SimpleActivity : Activity() {
         tvNow = line(17f).also { dash.addView(it) }
         tvAvg = line(15f).also { dash.addView(it) }
         tvTotal = line(13.5f).also { it.setTextColor(Color.DKGRAY); dash.addView(it) }
-        dash.addView(Button(this).apply {
+        tvSpeed = line(15f).also { dash.addView(it) }
+        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        buttons.addView(Button(this).apply {
             text = "Сменить сервер"; isAllCaps = false; textSize = 16f
             setOnClickListener { chooseServer() }
-        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(18) })
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        buttons.addView(Button(this).apply {
+            text = "Тест скорости"; isAllCaps = false; textSize = 16f
+            setOnClickListener { speedTest() }
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        dash.addView(buttons, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(18) })
         return dash
     }
 
@@ -393,13 +403,30 @@ class SimpleActivity : Activity() {
             dExitAt == 0L -> "проверяю…"
             dExitMs != null -> "на связи ✔ (ответ ${dExitMs} мс)"
             else -> "не отвечает ✖"
-        } + (acc?.let { Ygg.keyLeft(it.third) } ?: "")
+        } + (acc?.let { Ygg.keyLeft(it.third) } ?: "") + "\n" + Ygg.modeText().replaceFirstChar { it.uppercase() }
         tvPing.text = "Пинг: " + (dRtt?.let { "$it мс" } ?: "—") + (dAvg?.let { "  (средний $it мс)" } ?: "")
         val n = rate(1)
         tvNow.text = "Сейчас: " + (n?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
         val m = rate(60)
         tvAvg.text = "В среднем за минуту: " + (m?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
         tvTotal.text = "Передано: ↓ ${Ygg.human(State.tunRx)}   ↑ ${Ygg.human(State.tunTx)}"
+    }
+
+    /** Speed to the exit server: 8 s download, then 8 s upload, shown as it goes. */
+    private fun speedTest() {
+        if (speedRunning) return
+        speedRunning = true
+        Thread {
+            val done = mutableListOf<String>()
+            fun show(extra: String?) = ui.post { tvSpeed.text = "Скорость до сервера:\n" + (done + listOfNotNull(extra)).joinToString("\n") }
+            for (download in listOf(true, false)) {
+                val dir = if (download) "↓ приём" else "↑ отдача"
+                show("$dir: …")
+                done += Ygg.speedTest(download, 8) { show("$dir: %.1f Мбит/с …".format(it)) }
+                show(null)
+            }
+            speedRunning = false
+        }.apply { isDaemon = true; start() }
     }
 
     /** «Сменить сервер»: automatic (best ping) or one from the list, with the node's ping. */
@@ -651,6 +678,9 @@ class SimpleActivity : Activity() {
         } ?: throw Stop("нет связи с сетью: ни один пир не отвечает (проверьте интернет)")
         finish("пиров на связи: $joined")
 
+        // A server we hold a key for: that one (and its own peer), no search among the others.
+        if (keyedFlow()) return
+
         // 3. Peers.
         say("Ищу лучший пир для подключения")
         pause(3000) // the node measures fresh peers first
@@ -762,6 +792,54 @@ class SimpleActivity : Activity() {
         if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
         finish("работает")
         connectedNow()
+    }
+
+    /**
+     * Servers we hold a key for (the chosen one first): the first with access becomes the exit
+     * at once, without the trackers, the ping round and the speed comparison; its own peer (if
+     * it has one) becomes the node's peer. False: none of them lets us in — the usual search.
+     */
+    private fun keyedFlow(): Boolean {
+        val cur = Ygg.serverFromText(prefs.server)
+        val keyed = (listOfNotNull(cur) + prefs.serverList().mapNotNull { Ygg.serverFromText(it) }).distinct().filter { prefs.keyFor(it) != null }
+        if (keyed.isEmpty()) return false
+        say("Есть сервер с ключом — другие не ищу")
+        var server: String? = null
+        for (a in keyed) {
+            val code = Ygg.probeAccess(a, prefs.keyFor(a), ask = false).first
+            if (!alive()) throw InterruptedException()
+            if (code == "ok") { server = a; break }
+            say("$a: ${Ygg.accessText(code)}", Mark.INFO)
+        }
+        if (server == null) {
+            finish("ни один не пускает — ищу другие серверы", ok = false)
+            return false
+        }
+        // The peer the server announced in its answer: saved now, so the node gets it at once.
+        State.serverPeers[server]?.let { if (it != prefs.serverPeers(server)) prefs.setServerPeers(server, it) }
+        val own = prefs.serverPeers(server)
+        finish(server + if (own.isNotEmpty()) " · свой пир" else "")
+
+        say("Подключаю VPN через $server")
+        headline("Подключаю VPN…")
+        if (!useServer(server)) throw Stop("VPN не поднялся (см. логи в расширенном режиме)")
+        waitFor(45) { Ygg.probeExit() } ?: throw Stop("сервер $server не отвечает через туннель")
+        finish("туннель работает · ${Ygg.modeText()}")
+
+        if (own.isNotEmpty()) {
+            say("Подключаюсь к пиру сервера")
+            val hosts = own.map { it.substringAfter("://").substringBefore('?') }
+            val p = waitFor(40) { peersList().firstOrNull { host(it) in hosts } }
+            if (p != null) finish("${host(p)}" + (if (!p.isNull("rtt_ms")) " (${p.optLong("rtt_ms")} мс)" else ""))
+            else finish("пир сервера не отвечает — работаю через обычные пиры", ok = false)
+        }
+
+        say("Проверяю выход в интернет")
+        val net = Ygg.checkInternet()
+        if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
+        finish("работает")
+        connectedNow()
+        return true
     }
 
     /**

@@ -1031,7 +1031,7 @@ class MainActivity : Activity() {
         tvClientState.text = when {
             !prefs.vpnEnabled -> "VPN выключен"
             prefs.yggOnly -> if (State.vpnActive) "VPN работает: только сайты Yggdrasil и ALFIS" else "VPN запускается…"
-            State.vpnActive -> "VPN работает → ${State.vpnTarget}\n↓ ${Ygg.human(State.tunRx)}  ↑ ${Ygg.human(State.tunTx)}"
+            State.vpnActive -> "VPN работает → ${State.vpnTarget} · ${Ygg.modeText()}\n↓ ${Ygg.human(State.tunRx)}  ↑ ${Ygg.human(State.tunTx)}"
             else -> "VPN запускается…" + (State.lastError?.let { "\n$it" } ?: "")
         } + (if (prefs.vpnEnabled && !prefs.yggOnly) State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
             .let { "\nдоступ: " + Ygg.accessText(it?.second) + (it?.let { a -> Ygg.keyLeft(a.third) } ?: "") } else "") +
@@ -1120,7 +1120,7 @@ class MainActivity : Activity() {
         }
         sb.append('\n')
         if (prefs.vpnEnabled) {
-            sb.append("VPN: ").append(if (State.vpnActive) "работает" else "запускается").append(" → ").append(State.vpnTarget ?: "?").append('\n')
+            sb.append("VPN: ").append(if (State.vpnActive) "работает" else "запускается").append(" → ").append(State.vpnTarget ?: "?").append(" · ").append(Ygg.modeText()).append('\n')
             sb.append("Пинг до сервера: ").append(State.serverRtt ?: "измеряю…").append('\n')
             State.lastSwap?.let { sb.append("Замена пира: ").append(it).append('\n') }
             sb.append("Связь с сервером выхода: ").append(

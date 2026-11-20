@@ -318,9 +318,10 @@ impl App {
                     human(cl["rx"].as_u64().unwrap_or(0)), human(cl["tx"].as_u64().unwrap_or(0)))
             } else {
                 format!(
-                    "VPN {} → {}\n↓ {}  ↑ {}\nпинг до сервера: {}\nдоступ: {}",
+                    "VPN {} → {}\n{}\n↓ {}  ↑ {}\nпинг до сервера: {}\nдоступ: {}",
                     if cl["active"].as_bool() == Some(true) { "работает" } else { "запускается…" },
                     cl["server"].as_str().unwrap_or(""),
+                    if cl["ckr"].as_bool() == Some(true) { "режим: CKR (весь IP-трафик)" } else { "режим: прокси" },
                     human(cl["rx"].as_u64().unwrap_or(0)),
                     human(cl["tx"].as_u64().unwrap_or(0)),
                     cl["server_rtt"].as_str().unwrap_or("измеряю…").to_string() + &cl["failover"].as_str()

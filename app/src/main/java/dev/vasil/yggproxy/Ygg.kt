@@ -16,6 +16,9 @@ object Ygg {
     const val EXIT_SOCKS = 10800       // ygghelper server, exposed as --forward PORT:10800
     const val UDPGW = 7300             // udpgw on the exit node (as seen by its SOCKS server)
     const val SPEEDTEST = 7301         // speed test on the exit node (ygghelper server --speedtest)
+
+    /** How the VPN carries traffic now (for the screens). */
+    fun modeText(): String = if (State.vpnCkr) "режим CKR (весь IP-трафик)" else "режим прокси"
     const val NODE_SOCKS = 10810       // tcp_node --socks: SOCKS5 into Yggdrasil (tracker requests)
     const val TRACKER_PORT = 27081     // tracker API on the overlay
     /** Built-in tracker (the project's server); more are learned from its /trackers. */

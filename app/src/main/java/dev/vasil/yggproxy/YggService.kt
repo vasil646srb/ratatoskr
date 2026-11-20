@@ -491,6 +491,7 @@ class YggService : VpnService() {
     /** [target] null: Yggdrasil only (no exit server). */
     private fun startVpn(target: Pair<String, Int>?) {
         if (target != null && prefs.ckrFor(Ygg.serverFromText(target.first))) return startCkrVpn(target)
+        State.vpnCkr = false
         val b = Builder()
             .setSession(if (target == null) "Yggdrasil" else "Yggdrasil → [${target.first}]")
             .setMtu(1500)
@@ -572,6 +573,7 @@ class YggService : VpnService() {
         val pfd = b.establish() ?: throw IllegalStateException("VPN не установлен (нет разрешения)")
         vpnPfd = pfd
         ckrVpn = true
+        State.vpnCkr = true
         State.resetTraffic()
         State.vpnTarget = target.first
         Thread { sendCkrFd() }.start()
@@ -630,6 +632,7 @@ class YggService : VpnService() {
         vpnSig = null
         State.vpnActive = false
         State.vpnTarget = null
+        State.vpnCkr = false
     }
 
     private fun stopAll(why: String) {
