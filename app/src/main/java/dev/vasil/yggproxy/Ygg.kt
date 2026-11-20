@@ -156,10 +156,19 @@ object Ygg {
                     o.write(byteArrayOf(1, if (ask) 1 else 0, user.size.toByte()) + user + byteArrayOf(k.size.toByte()) + k)
                     val r = readN(i, 10)
                     val exp = java.nio.ByteBuffer.wrap(r, 2, 8).long
-                    // 0.1.17+: one more byte, what the exit offers (bit 0: CKR); older ones close.
+                    // 0.1.17+: one more byte, what the exit offers (bit 0: CKR, bit 1: its peers
+                    // follow as [n, (len, URI) * n]); older ones close.
                     s.soTimeout = 3000
                     val f = try { i.read() } catch (_: Exception) { -1 }
                     serverFromText(server)?.let { if (f >= 0 && f and 1 == 1) State.ckrServers.add(it) else State.ckrServers.remove(it) }
+                    if (f >= 0 && f and 2 == 2) try {
+                        val peers = ArrayList<String>()
+                        repeat(minOf(i.read(), 8)) {
+                            val u = String(readN(i, i.read()))
+                            if (u.startsWith("tcp://") || u.startsWith("tls://")) peers += u
+                        }
+                        serverFromText(server)?.let { if (peers.isNotEmpty()) State.serverPeers[it] = peers }
+                    } catch (_: Exception) {}
                     codeName(r[1].toInt()) to exp
                 }
                 2 -> {

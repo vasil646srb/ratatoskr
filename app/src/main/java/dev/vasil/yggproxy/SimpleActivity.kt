@@ -260,7 +260,7 @@ class SimpleActivity : Activity() {
         if (key == null) { toast("Нет ключа: попросите у владельца QR-код или ключ"); return }
         prefs.setKey(server, key)
         prefs.addServer(server)
-        prefs.addCustomPeers(Ygg.peersFromText(text))
+        prefs.setServerPeers(server, Ygg.peersFromText(text))
         Ygg.writeMonitors(filesDir, prefs)
         say("Ключ для $server сохранён — нажмите «Подключиться»", Mark.DONE)
         if (prefs.vpnEnabled && flow == null) startFlow { switchFlow(server) }

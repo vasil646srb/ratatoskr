@@ -96,12 +96,17 @@ class Prefs(ctx: Context) {
     var listenPort: Int get() = p.getInt("listen_port", 0); set(v) = put { putInt("listen_port", v) }
     /** Our address(es) for clients (public IP or name), comma separated; empty: the device's own. */
     var peerHost: String get() = s("peer_host", ""); set(v) = put { putString("peer_host", v.trim()) }
-    /** Add a server's peers (from its link) to our own; true if any was new. */
-    fun addCustomPeers(peers: List<String>): Boolean {
-        val have = customPeerList()
-        val add = peers.filter { it !in have }
-        if (add.isNotEmpty()) customPeers = (have + add).joinToString("\n")
-        return add.isNotEmpty()
+    /**
+     * The exits' own Yggdrasil peers (from their links or their access answer), one
+     * `address uri uri…` per line. While the chosen exit's peer is reachable it is our only peer.
+     */
+    private var serverPeerText: String get() = s("server_peers", ""); set(v) = put { putString("server_peers", v) }
+    fun serverPeers(addr: String): List<String> =
+        serverPeerText.lines().map { it.trim().split(' ') }.firstOrNull { it.size >= 2 && it[0] == addr }?.drop(1) ?: emptyList()
+    fun setServerPeers(addr: String, peers: List<String>) {
+        if (peers.isEmpty()) return
+        val rest = serverPeerText.lines().filter { it.isNotBlank() && it.trim().split(' ')[0] != addr }
+        serverPeerText = (rest + "$addr ${peers.joinToString(" ")}").joinToString("\n")
     }
     var target: Int get() = i("target", 3); set(v) = put { putInt("target", v.coerceIn(1, 32)) }
     /** tcp_node --lan-upstream: find yggdrasil-go peers on the LAN by their beacons, dial over TLS. */

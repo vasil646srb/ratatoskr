@@ -79,6 +79,11 @@ class YggService : VpnService() {
     private val monitorsFile get() = File(filesDir, "monitors.txt")
     /** The exit server for the node (`--connect-file`): re-read live, so no restart on a switch. */
     private val connectFile get() = File(filesDir, "connect.txt")
+    /** The exit's own peers for the node (re-read live): its only peer while reachable. */
+    private val serverPeersFile get() = File(filesDir, "server-peers.txt")
+    private fun writeServerPeers(server: String?) {
+        Ygg.writeIfChanged(serverPeersFile, server?.let { prefs.serverPeers(it).joinToString("\n") } ?: "")
+    }
     private var lastTarget: String? = null
 
     override fun onCreate() {
@@ -144,6 +149,14 @@ class YggService : VpnService() {
         if (last != null && last.first == sig && now - last.third < if (last.second == "ok") okEvery else 20_000) return
         val ckrBefore = prefs.ckrFor(server)
         val (code, exp) = Ygg.probeAccess(server, key, ask = true)
+        // The exit told us where it takes peers: from now on it is our peer while reachable.
+        State.serverPeers[server]?.let { p ->
+            if (p != prefs.serverPeers(server)) {
+                prefs.setServerPeers(server, p)
+                State.log("peers", "пир сервера $server: ${p.joinToString(", ")}")
+            }
+            if (lastTarget?.isNotEmpty() == true) writeServerPeers(server)
+        }
         // The exit offers CKR now (or no longer): the VPN changes its mode.
         if (prefs.ckrFor(server) != ckrBefore) {
             State.log("vpn", if (prefs.ckrFor(server)) "$server предлагает CKR — VPN переходит на туннель CKR" else "$server без CKR — VPN через прокси")
@@ -300,6 +313,7 @@ class YggService : VpnService() {
         // The server goes to the node through a file: switching servers or turning the VPN on and
         // off keeps the node, its peers and its paths.
         val connectLine = if (wantVpn && target != null) "[${target.first}]:${target.second}" else ""
+        writeServerPeers(if (wantVpn) target?.first else null)
         if (connectLine != lastTarget) {
             Ygg.writeIfChanged(connectFile, connectLine)
             if (lastTarget != null) State.serverRtt = null
@@ -332,6 +346,8 @@ class YggService : VpnService() {
                 // Closed by default: only devices with a key (or everyone, when made public).
                 add("--access"); add(File(filesDir, "access.json").path)
                 if (prefs.allowLan) add("--allow-lan")
+                // Clients learn where we take peers and then peer with us directly.
+                Ygg.peerUris(prefs).forEach { add("--peer"); add(it) }
                 add("-v"); add("warn")
             }
             if (exitProc?.cmd != cmd) {
@@ -383,6 +399,7 @@ class YggService : VpnService() {
         }
         // Client SOCKS -> the server in connect.txt (empty: no VPN, connections refused).
         add("--connect-file"); add("${Ygg.CLIENT_SOCKS}:${connectFile.path}")
+        add("--server-peers-file"); add(serverPeersFile.path)
         // Peers ranked by how well they carried our traffic and by the trackers (re-read live).
         add("--prefer-file"); add(preferFile.path)
         add("--ckr-ctl"); add(ckrCtlPath)

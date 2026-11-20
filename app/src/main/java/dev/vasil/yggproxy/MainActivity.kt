@@ -518,7 +518,7 @@ class MainActivity : Activity() {
             val server = Ygg.serverFromText(text)
             if (server == null) toast("Это не адрес сервера Ratatoskr") else {
                 Ygg.keyFromText(text)?.let { prefs.setKey(server, it) }
-                prefs.addCustomPeers(Ygg.peersFromText(text))
+                prefs.setServerPeers(server, Ygg.peersFromText(text))
                 connectTo(server)
             }
         }
@@ -584,7 +584,7 @@ class MainActivity : Activity() {
         AlertDialog.Builder(this)
             .setTitle("Подключиться к серверу?")
             .setMessage("Весь трафик пойдёт через сервер выхода\n$server" + if (key != null) "\n(с ключом доступа)" else "")
-            .setPositiveButton("Подключить") { _, _ -> key?.let { prefs.setKey(server, it) }; prefs.addCustomPeers(Ygg.peersFromText(data.toString())); connectTo(server) }
+            .setPositiveButton("Подключить") { _, _ -> key?.let { prefs.setKey(server, it) }; prefs.setServerPeers(server, Ygg.peersFromText(data.toString())); connectTo(server) }
             .setNegativeButton("Отмена", null)
             .show()
     }
@@ -599,7 +599,7 @@ class MainActivity : Activity() {
         if (s == null) { toast("Адрес сервера: IPv6 из 200::/7, например 200:…"); return }
         val key = Ygg.keyFromText(etServer.text.toString()) ?: Ygg.normKey(etKey.text.toString()).takeIf { it.isNotEmpty() }
         if (key != null) prefs.setKey(s, key)
-        if (prefs.addCustomPeers(Ygg.peersFromText(etServer.text.toString())) && ::etPeers.isInitialized) etPeers.setText(prefs.customPeers)
+        prefs.setServerPeers(s, Ygg.peersFromText(etServer.text.toString()))
         etKey.setText("")
         prefs.addServer(s)
         if (Ygg.parseServer(prefs.server) == null) prefs.server = s

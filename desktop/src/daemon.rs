@@ -897,6 +897,8 @@ impl Daemon {
         if n.listen > 0 {
             a.extend(["--listen".into(), n.listen.to_string()]);
         }
+        // The exit's own peer: our only peer while it is reachable (written by write_server_peers).
+        a.extend(["--server-peers-file".into(), d.join("server-peers.txt").display().to_string()]);
         // The user's own peers: never replaced by public ones in the peer search.
         for u in n.peers.iter().map(|s| s.trim()).filter(|s| !s.is_empty() && !s.starts_with('#')) {
             a.extend(["--keep-peer".into(), u.to_string()]);
@@ -951,6 +953,18 @@ impl Daemon {
         a
     }
 
+    /// The node's server-peers.txt: the exit's own peers while the VPN uses that exit.
+    fn write_server_peers(&self, cfg: &Config) {
+        let with_exit = config::parse_server(&cfg.client.server).is_some() && !cfg.client.ygg_only;
+        let peers = if cfg.client.enabled && with_exit {
+            let fallback = self.st.lock().unwrap().failover.clone().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1);
+            server_peers(cfg, &fallback.unwrap_or_else(|| cfg.client.server.trim().to_string()))
+        } else {
+            Vec::new()
+        };
+        platform::write_if_changed(&self.dir.join("server-peers.txt"), &peers.join("\n"));
+    }
+
     fn reconcile(&mut self, cfg: &Config) {
         let with_exit = config::parse_server(&cfg.client.server).is_some() && !cfg.client.ygg_only;
         let client = cfg.client.enabled && (with_exit || cfg.client.ygg_only);
@@ -969,6 +983,7 @@ impl Daemon {
                 log(&self.st, "vpn", &format!("сервер выхода: {} (узел не перезапускается)", cfg.client.server));
                 self.st.lock().unwrap().server_rtt = None;
             }
+        self.write_server_peers(cfg);
 
         // 1. Node.
         if any {
@@ -1034,6 +1049,10 @@ impl Daemon {
             if ckr_exit_wanted(cfg) {
                 // Clients learn from the access check that this exit has CKR too.
                 cmd.push("--ckr".into());
+            }
+            // ... and where it takes peers: they then peer with it directly.
+            for u in peer_uris(cfg) {
+                cmd.extend(["--peer".into(), u]);
             }
             if client {
                 // Exit traffic must not loop into our own VPN.
@@ -1101,6 +1120,33 @@ const CKR_EXIT_TUN: &str = "ygg-ckr";
 
 /// Exits known to offer CKR (from our access checks and the trackers' lists): address → yes/no.
 static CKR_SERVERS: std::sync::LazyLock<Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
+
+/// The exits' own peers, as they told us in the access check (kept across restarts).
+static SERVER_PEERS: std::sync::LazyLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::LazyLock::new(|| {
+    Mutex::new(std::fs::read_to_string(server_peers_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
+});
+
+fn server_peers_path() -> PathBuf {
+    config::state_dir().join("server-peers.json")
+}
+
+fn server_peers_known(server: &str, peers: Vec<String>) {
+    let Some(a) = config::parse_server(server) else { return };
+    let mut m = SERVER_PEERS.lock().unwrap();
+    let changed = if peers.is_empty() { m.remove(&a.to_string()).is_some() } else { m.insert(a.to_string(), peers.clone()).as_ref() != Some(&peers) };
+    if changed {
+        let _ = std::fs::write(server_peers_path(), serde_json::to_string(&*m).unwrap_or_default());
+    }
+}
+
+/// The exit's own peers: what it told us, else what its link said.
+fn server_peers(cfg: &Config, server: &str) -> Vec<String> {
+    let Some(a) = config::parse_server(server).map(|a| a.to_string()) else { return Vec::new() };
+    if let Some(p) = SERVER_PEERS.lock().unwrap().get(&a) {
+        return p.clone();
+    }
+    cfg.client.server_peers.iter().find(|(k, _)| config::parse_server(k).map(|x| x.to_string()) == Some(a.clone())).map(|(_, v)| v.clone()).unwrap_or_default()
+}
 
 fn ckr_known(server: &str, ckr: bool) {
     if let Some(a) = config::parse_server(server) {
@@ -1494,11 +1540,27 @@ pub fn probe_access(server: &str, key: &str, device: &str, message: &str, record
             let mut r = [0u8; 10];
             s.read_exact(&mut r).map_err(|_| "сервер не ответил".to_string())?;
             let a = crate::access::Auth::from_code(r[1]).ok_or_else(|| format!("неизвестный ответ {}", r[1]))?;
-            // 0.1.17+: one more byte, what the exit offers (bit 0: CKR); older ones close here.
+            // 0.1.17+: one more byte, what the exit offers (bit 0: CKR, bit 1: its peers follow
+            // as [n, (len, URI) * n]); older ones close here.
             let mut f = [0u8; 1];
             s.set_read_timeout(Some(Duration::from_secs(3))).ok();
-            let ckr = matches!(s.read(&mut f), Ok(1)) && f[0] & 1 == 1;
-            ckr_known(&ip.to_string(), ckr);
+            let flags = if matches!(s.read(&mut f), Ok(1)) { f[0] } else { 0 };
+            ckr_known(&ip.to_string(), flags & 1 == 1);
+            let mut peers = Vec::new();
+            if flags & 2 == 2 && s.read_exact(&mut f).is_ok() {
+                for _ in 0..f[0].min(8) {
+                    let mut l = [0u8; 1];
+                    if s.read_exact(&mut l).is_err() {
+                        break;
+                    }
+                    let mut u = vec![0u8; l[0] as usize];
+                    if s.read_exact(&mut u).is_err() {
+                        break;
+                    }
+                    peers.extend(String::from_utf8(u).ok().filter(|u| u.starts_with("tcp://") || u.starts_with("tls://")));
+                }
+            }
+            server_peers_known(&ip.to_string(), peers);
             Ok((a, u64::from_be_bytes(r[2..10].try_into().unwrap())))
         }
         2 => {
@@ -1955,6 +2017,7 @@ pub fn main() -> Result<(), String> {
             last_ckr = Instant::now();
             let c = cfg.lock().unwrap().clone();
             d.ckr_tick(&c);
+            d.write_server_peers(&c);
             if d.vpn_mode_changed(&c) {
                 log(&st, "vpn", "сервер предлагает другой режим (CKR или прокси) — перестраиваю VPN");
                 d.reconcile(&c);

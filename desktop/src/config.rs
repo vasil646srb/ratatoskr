@@ -121,6 +121,9 @@ pub struct Client {
     pub ckr_address: String,
     /// DNS servers used through the CKR tunnel.
     pub ckr_dns: Vec<String>,
+    /// The exits' own Yggdrasil peers, from their links: address → peer URIs. While the
+    /// chosen exit's peer is reachable it is our only peer (a direct path to the exit).
+    pub server_peers: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 pub const CKR_ADDRESS: &str = "10.99.0.2";
@@ -128,7 +131,7 @@ pub const CKR_ADDRESS: &str = "10.99.0.2";
 impl Default for Client {
     fn default() -> Self {
         Self { enabled: false, server: String::new(), servers: Vec::new(), keys: Default::default(), udp: true, ipv6: true, ygg_sites: true, ygg_only: false, alfis: Vec::new(),
-               ckr: false, ckr_auto: true, ckr_address: CKR_ADDRESS.into(), ckr_dns: vec!["1.1.1.1".into(), "9.9.9.9".into()] }
+               ckr: false, ckr_auto: true, ckr_address: CKR_ADDRESS.into(), ckr_dns: vec!["1.1.1.1".into(), "9.9.9.9".into()], server_peers: Default::default() }
     }
 }
 

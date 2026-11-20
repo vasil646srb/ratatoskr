@@ -163,13 +163,12 @@ impl App {
                         if !key.is_empty() {
                             c.client.keys.insert(a.to_string(), key);
                         }
-                        // The server as our peer, when its link offers one.
-                        for p in config::link_peers(&self.add_text) {
-                            if !c.network.peers.contains(&p) {
-                                c.network.peers.push(p);
-                            }
+                        // The server's own peer, when its link offers one: our only peer while
+                        // it is reachable (a direct path to the server).
+                        let peers = config::link_peers(&self.add_text);
+                        if !peers.is_empty() {
+                            c.client.server_peers.insert(a.to_string(), peers);
                         }
-                        self.peers_text = c.network.peers.join("\n");
                         self.key_text.clear();
                         if config::parse_server(&c.client.server).is_none() {
                             c.client.server = a.to_string();

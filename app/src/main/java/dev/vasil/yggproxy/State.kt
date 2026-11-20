@@ -25,6 +25,8 @@ object State {
     @Volatile var trackerPublic: Set<String> = emptySet()
     /** Exits known to offer CKR (from access checks and the trackers' lists). */
     val ckrServers: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    /** Peers the exits named in their access answer (address → URIs). */
+    val serverPeers: MutableMap<String, List<String>> = java.util.concurrent.ConcurrentHashMap()
     /** Client: access to the selected server — (server, `ok`/`pending`/… or `error: …`). */
     @Volatile var access: Triple<String, String, Long>? = null
     /** Our access requests: server → status code (`pending`, then `ok` or `denied`). */

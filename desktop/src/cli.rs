@@ -623,11 +623,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
                 if let Some(k) = key.clone().filter(|k| !k.is_empty()) {
                     c.client.keys.insert(addr.to_string(), k);
                 }
-                // The server as our peer (from its link): a direct path to it.
-                for p in a(1).map(|l| config::link_peers(l)).unwrap_or_default() {
-                    if !c.network.peers.contains(&p) {
-                        c.network.peers.push(p);
-                    }
+                // The server's own peer (from its link): our only peer while it is reachable.
+                let peers = a(1).map(|l| config::link_peers(l)).unwrap_or_default();
+                if !peers.is_empty() {
+                    c.client.server_peers.insert(addr.to_string(), peers);
                 }
             })?;
             println!("подключаюсь к {addr} (порт {}) — состояние: yggproxy status", config::PORT);

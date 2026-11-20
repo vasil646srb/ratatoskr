@@ -14,7 +14,8 @@
 //! A client offering only method 0 without access gets 0xff — nothing is recorded.
 //!
 //! Method 0x80 (private, Ratatoskr clients): `[1, mode, ulen, user, plen, key]` →
-//! `[1, status, expires: u64 BE]` (0: public or no key), then the server closes. `mode` 1 records
+//! `[1, status, expires: u64 BE]` (0: public or no key), then a flags byte (bit 0: CKR exit, bit 1:
+//! peer URIs follow as `[n, (len, URI) * n]`), then the server closes. `mode` 1 records
 //! a request when there is no access, 0 only checks ([Auth::Closed]). In both methods the user
 //! field is `device name` or `device name \x1f message to the owner`.
 
