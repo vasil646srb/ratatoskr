@@ -936,12 +936,9 @@ impl Daemon {
             "--fwmark".into(),
             format!("0x{:x}", config::FWMARK),
         ]);
-        // Without a server, peers are picked by the ping to the trackers (not the root). Not on an
-        // exit: the trackers' ping says nothing about its clients' paths, and a busy tracker link
-        // would make it drop the peers its clients reach it through.
-        if !cfg.server.enabled {
-            a.extend(["--search-file".into(), d.join("search.txt").display().to_string()]);
-        }
+        // Without a server, peers are picked by the ping to the trackers (not the root); the node
+        // skips that when it takes peers (--listen), see tcp_node.
+        a.extend(["--search-file".into(), d.join("search.txt").display().to_string()]);
         if cfg.server.enabled {
             let p = config::PORT.to_string();
             a.extend([

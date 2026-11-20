@@ -410,8 +410,7 @@ class YggService : VpnService() {
         prefs.customPeerList().forEach { add("--keep-peer"); add(it) }
         // Without a server, peers are picked by the ping to the trackers (not the root).
         writeSearchFile()
-        // Not on an exit: the trackers' ping says nothing about its clients' paths.
-        if (!exit) { add("--search-file"); add(searchFile.path) }
+        add("--search-file"); add(searchFile.path)
         // Peer search keeps replacing peers while the ping to the server is above this.
         add("--rtt-limit"); add(prefs.rttLimit.toString())
         if (exit) {
