@@ -113,6 +113,9 @@ class Prefs(ctx: Context) {
     private fun chatServerList() = chatServersText.lines().map { it.trim() }.filter { it.isNotEmpty() }
     fun isChatServer(addr: String) = addr in chatServerList()
 
+    /** App language: "system" (default), "ru" or "en" (see [I18n]). */
+    var language: String get() = s("language", "system"); set(v) = put { putString("language", v) }
+
     /** Exit mode: what clients see instead of our address. */
     var serverName: String get() = s("server_name", ""); set(v) = put { putString("server_name", v.trim().take(40)) }
 

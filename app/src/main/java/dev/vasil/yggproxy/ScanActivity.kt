@@ -50,6 +50,7 @@ class ScanActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        I18n.init(this)
         val d = resources.displayMetrics.density
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.BLACK) }
         texture = TextureView(this)
@@ -57,12 +58,12 @@ class ScanActivity : Activity() {
         frame.addView(texture, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         root.addView(frame, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         root.addView(TextView(this).apply {
-            text = "Наведите камеру на QR-код сервера Ratatoskr"
+            text = tr("Наведите камеру на QR-код сервера Ratatoskr")
             setTextColor(Color.WHITE); textSize = 15f; gravity = Gravity.CENTER
             setPadding((16 * d).toInt(), (12 * d).toInt(), (16 * d).toInt(), 0)
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = "Отмена"; isAllCaps = false; setTextColor(Color.WHITE); textSize = 16f
+            text = tr("Отмена"); isAllCaps = false; setTextColor(Color.WHITE); textSize = 16f
             setOnClickListener { finish() }
         }, LinearLayout.LayoutParams(MATCH_PARENT, (56 * d).toInt()))
         setContentView(root)
@@ -103,7 +104,7 @@ class ScanActivity : Activity() {
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         if (requestCode != REQ_CAMERA) return
         if (grantResults.firstOrNull() != PackageManager.PERMISSION_GRANTED) {
-            Toast.makeText(this, "Нужен доступ к камере для сканирования QR", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, tr("Нужен доступ к камере для сканирования QR"), Toast.LENGTH_LONG).show()
             finish()
         }
         // Granted: onResume runs again and starts the camera.
@@ -151,8 +152,8 @@ class ScanActivity : Activity() {
         val id = try {
             cm.cameraIdList.firstOrNull { cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK }
                 ?: cm.cameraIdList.firstOrNull()
-        } catch (e: Exception) { null } ?: return fail("Камера недоступна")
-        val map = cm.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return fail("Камера недоступна")
+        } catch (e: Exception) { null } ?: return fail(tr("Камера недоступна"))
+        val map = cm.getCameraCharacteristics(id).get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return fail(tr("Камера недоступна"))
         val previewSize = pick(map.getOutputSizes(SurfaceTexture::class.java), 1280)
         val scanSize = pick(map.getOutputSizes(ImageFormat.YUV_420_888), 1280)
 
@@ -199,14 +200,14 @@ class ScanActivity : Activity() {
                             }.build()
                             try { s.setRepeatingRequest(req, null, handler) } catch (_: Exception) {}
                         }
-                        override fun onConfigureFailed(s: CameraCaptureSession) = fail("Не удалось запустить камеру")
+                        override fun onConfigureFailed(s: CameraCaptureSession) = fail(tr("Не удалось запустить камеру"))
                     }, handler)
                 }
                 override fun onDisconnected(cam: CameraDevice) { cam.close(); camera = null }
-                override fun onError(cam: CameraDevice, error: Int) { cam.close(); camera = null; fail("Ошибка камеры ($error)") }
+                override fun onError(cam: CameraDevice, error: Int) { cam.close(); camera = null; fail(tr("Ошибка камеры (%1\$s)", error)) }
             }, handler)
         } catch (e: Exception) {
-            fail("Камера: ${e.message}")
+            fail(tr("Камера: %1\$s", e.message))
         }
     }
 }

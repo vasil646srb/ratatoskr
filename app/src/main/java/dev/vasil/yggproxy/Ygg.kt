@@ -18,7 +18,7 @@ object Ygg {
     const val SPEEDTEST = 7301         // speed test on the exit node (ygghelper server --speedtest)
 
     /** How the VPN carries traffic now (for the screens). */
-    fun modeText(): String = if (State.vpnCkr) "режим CKR (весь IP-трафик)" else "режим прокси"
+    fun modeText(): String = if (State.vpnCkr) tr("режим CKR (весь IP-трафик)") else tr("режим прокси")
     const val NODE_SOCKS = 10810       // tcp_node --socks: SOCKS5 into Yggdrasil (tracker requests)
     const val TRACKER_PORT = 27081     // tracker API on the overlay
     /** Built-in tracker (the project's server); more are learned from its /trackers. */
@@ -147,7 +147,7 @@ object Ygg {
             val i = s.getInputStream()
             o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
             o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((PORT shr 8).toByte(), (PORT and 0xff).toByte()))
-            if (readN(i, 22)[1].toInt() != 0) return "error: сервер недоступен" to 0L
+            if (readN(i, 22)[1].toInt() != 0) return tr("error: сервер недоступен") to 0L
             val user = (if (message.isBlank()) deviceName() else deviceName() + "\u001f" + message.trim().replace('\n', ' '))
                 .toByteArray().let { it.copyOf(minOf(it.size, 255)) }
             val k = (key ?: "").toByteArray()
@@ -194,26 +194,26 @@ object Ygg {
 
     private fun codeName(c: Int) = when (c) {
         0 -> "ok"; 1 -> "pending"; 2 -> "bad_key"; 3 -> "expired"; 4 -> "other_device"; 5 -> "closed"; 6 -> "denied"
-        else -> "error: неизвестный ответ $c"
+        else -> tr("error: неизвестный ответ %1\$s", c)
     }
 
     /** " · ключ ещё 12д 3ч" for an access that ends (0: no end date). */
     fun keyLeft(expires: Long): String {
         if (expires <= 0) return ""
         val left = expires - System.currentTimeMillis() / 1000
-        return if (left > 0) " · ключ ещё ${dur(left)}" else " · ключ истёк"
+        return if (left > 0) tr(" · ключ ещё %1\$s", dur(left)) else tr(" · ключ истёк")
     }
 
     fun accessText(code: String?): String = when {
-        code == null -> "проверяю…"
-        code == "ok" -> "доступ есть"
-        code == "pending" -> "нет доступа — запрос отправлен владельцу сервера, ждите одобрения"
-        code == "bad_key" -> "неверный ключ доступа"
-        code == "expired" -> "срок ключа истёк — попросите владельца продлить"
-        code == "other_device" -> "ключ уже привязан к другому устройству"
-        code == "closed" -> "сервер закрыт: нужен ключ или запрос доступа"
-        code == "denied" -> "владелец сервера отклонил запрос доступа"
-        else -> "не проверен (${code.removePrefix("error: ")})"
+        code == null -> tr("проверяю…")
+        code == "ok" -> tr("доступ есть")
+        code == "pending" -> tr("нет доступа — запрос отправлен владельцу сервера, ждите одобрения")
+        code == "bad_key" -> tr("неверный ключ доступа")
+        code == "expired" -> tr("срок ключа истёк — попросите владельца продлить")
+        code == "other_device" -> tr("ключ уже привязан к другому устройству")
+        code == "closed" -> tr("сервер закрыт: нужен ключ или запрос доступа")
+        code == "denied" -> tr("владелец сервера отклонил запрос доступа")
+        else -> tr("не проверен (%1\$s)", code.removePrefix("error: "))
     }
 
     /**
@@ -230,12 +230,12 @@ object Ygg {
     } catch (e: Exception) { Result.failure(e) }
 
     /** Shown before the owner makes the exit public (same text as the desktop). */
-    const val PUBLIC_RISK = "Публичный сервер может использовать любой, кто найдёт его через трекер.\n" +
-        "• Весь их трафик выходит в интернет с вашего IP-адреса: за нарушения закона, спам, взломы, пиратство и блокировки отвечать придётся вам — жалобы и запросы придут вашему провайдеру.\n" +
-        "• Чужие люди займут ваш канал и могут исчерпать лимит трафика.\n" +
-        "• Сайты и сервисы могут заблокировать ваш IP или показывать капчу.\n" +
-        "• Вы не узнаете, кто именно пользуется сервером.\n" +
-        "Включайте, только если понимаете и принимаете эти последствия."
+    val PUBLIC_RISK get() = tr("Публичный сервер может использовать любой, кто найдёт его через трекер.\n") +
+        tr("• Весь их трафик выходит в интернет с вашего IP-адреса: за нарушения закона, спам, взломы, пиратство и блокировки отвечать придётся вам — жалобы и запросы придут вашему провайдеру.\n") +
+        tr("• Чужие люди займут ваш канал и могут исчерпать лимит трафика.\n") +
+        tr("• Сайты и сервисы могут заблокировать ваш IP или показывать капчу.\n") +
+        tr("• Вы не узнаете, кто именно пользуется сервером.\n") +
+        tr("Включайте, только если понимаете и принимаете эти последствия.")
 
     /** Server from a scanned QR / opened link: the yggproxy:// link, `[addr]:port`, `addr` or a key. */
     fun serverFromText(text: String): String? {
@@ -258,10 +258,10 @@ object Ygg {
     }
 
     fun dur(s: Long): String = when {
-        s < 60 -> "${s}с"
-        s < 3600 -> "${s / 60}м ${s % 60}с"
-        s < 86400 -> "${s / 3600}ч ${s % 3600 / 60}м"
-        else -> "${s / 86400}д ${s % 86400 / 3600}ч"
+        s < 60 -> tr("%1\$sс", s)
+        s < 3600 -> tr("%1\$sм %2\$sс", s / 60, s % 60)
+        s < 86400 -> tr("%1\$sч %2\$sм", s / 3600, s % 3600 / 60)
+        else -> tr("%1\$sд %2\$sч", s / 86400, s % 86400 / 3600)
     }
 
     /** GET /api/stats from tcp_node (raw HTTP: no cleartext policy involved). */
@@ -340,9 +340,9 @@ object Ygg {
     fun fetchPeers(): JSONObject? = fetchJson("/api/peers")
 
     fun mbit(bytesPerSec: Long): String = when {
-        bytesPerSec < 125 -> "${bytesPerSec * 8} бит/с"
-        bytesPerSec < 125_000 -> "%.1f кбит/с".format(bytesPerSec * 8 / 1000.0)
-        else -> "%.1f Мбит/с".format(bytesPerSec * 8 / 1_000_000.0)
+        bytesPerSec < 125 -> tr("%1\$s бит/с", bytesPerSec * 8)
+        bytesPerSec < 125_000 -> tr("%.1f кбит/с").format(bytesPerSec * 8 / 1000.0)
+        else -> tr("%.1f Мбит/с").format(bytesPerSec * 8 / 1_000_000.0)
     }
 
     private fun fetchJson(path: String): JSONObject? = try {
@@ -388,19 +388,19 @@ object Ygg {
             val t0 = System.nanoTime()
             o.write(byteArrayOf(5, 1, 0))
             val g = readN(i, 2)
-            if (g[1].toInt() != 0) return "сервер отверг приветствие SOCKS"
+            if (g[1].toInt() != 0) return tr("сервер отверг приветствие SOCKS")
             val tGreet = (System.nanoTime() - t0) / 1_000_000
             val h = host.toByteArray()
             o.write(byteArrayOf(5, 1, 0, 3, h.size.toByte()) + h + byteArrayOf(0, 80))
             val rep = readN(i, 4)
-            if (rep[1].toInt() != 0) return "сервер: CONNECT отклонён (код ${rep[1]})"
+            if (rep[1].toInt() != 0) return tr("сервер: CONNECT отклонён (код %1\$s)", rep[1])
             when (rep[3].toInt()) { 1 -> readN(i, 6); 4 -> readN(i, 18); 3 -> readN(i, (i.read() and 0xff) + 2) }
             o.write("GET /generate_204 HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n".toByteArray())
-            val status = i.bufferedReader().readLine() ?: return "нет ответа HTTP"
+            val status = i.bufferedReader().readLine() ?: return tr("нет ответа HTTP")
             val tAll = (System.nanoTime() - t0) / 1_000_000
-            "OK: $status · рукопожатие $tGreet мс · всего $tAll мс"
+            tr("OK: %1\$s · рукопожатие %2\$s мс · всего %3\$s мс", status, tGreet, tAll)
         }
-    } catch (e: Exception) { "нет связи: ${e.javaClass.simpleName} ${e.message ?: ""}" }
+    } catch (e: Exception) { tr("нет связи: %1\$s %2\$s", e.javaClass.simpleName, e.message ?: "") }
 
     fun mbps(bytes: Long, ms: Long) = if (ms <= 0) 0.0 else bytes * 8.0 / ms / 1000.0
 
@@ -410,7 +410,7 @@ object Ygg {
      * [progress] gets intermediate Mbit/s every ~0.5 s. Returns a one-line result.
      */
     fun speedTest(download: Boolean, secs: Int, progress: (Double) -> Unit): String {
-        val dir = if (download) "↓ приём" else "↑ отдача"
+        val dir = if (download) tr("↓ приём") else tr("↑ отдача")
         return try {
             Socket().use { s ->
                 s.tcpNoDelay = true
@@ -419,15 +419,15 @@ object Ygg {
                 val o = s.getOutputStream()
                 val i = s.getInputStream()
                 o.write(byteArrayOf(5, 1, 0))
-                if (readN(i, 2)[1].toInt() != 0) return "$dir: сервер отверг SOCKS"
+                if (readN(i, 2)[1].toInt() != 0) return tr("%1\$s: сервер отверг SOCKS", dir)
                 o.write(byteArrayOf(5, 1, 0, 1, 127, 0, 0, 1, (SPEEDTEST shr 8).toByte(), (SPEEDTEST and 0xff).toByte()))
                 val rep = readN(i, 10)
-                if (rep[1].toInt() != 0) return "$dir: сервер не поддерживает тест (код ${rep[1]}) — обновите приложение на сервере"
+                if (rep[1].toInt() != 0) return tr("%1\$s: сервер не поддерживает тест (код %2\$s) — обновите приложение на сервере", dir, rep[1])
                 o.write(byteArrayOf((if (download) 'D' else 'U').code.toByte(), secs.toByte()))
                 o.flush()
                 if (download) download(i, secs, progress) else upload(s, secs, progress)
             }.let { "$dir: $it" }
-        } catch (e: Exception) { "$dir: ошибка: ${e.javaClass.simpleName} ${e.message ?: ""}" }
+        } catch (e: Exception) { tr("%1\$s: ошибка: %2\$s %3\$s", dir, e.javaClass.simpleName, e.message ?: "") }
     }
 
     private fun download(i: InputStream, secs: Int, progress: (Double) -> Unit): String {
@@ -447,9 +447,9 @@ object Ygg {
                 lastTick = now; lastBytes = total
             }
         }
-        if (total == 0L) return "нет данных"
+        if (total == 0L) return tr("нет данных")
         val ms = (System.nanoTime() - t0) / 1_000_000
-        return "%.1f Мбит/с · %s за %.1f с".format(mbps(total, ms), human(total), ms / 1000.0)
+        return tr("%.1f Мбит/с · %s за %.1f с").format(mbps(total, ms), human(total), ms / 1000.0)
     }
 
     private fun upload(s: Socket, secs: Int, progress: (Double) -> Unit): String {
@@ -483,11 +483,11 @@ object Ygg {
             // The server closing after its report can break our last write.
         }
         reader.join(5000)
-        val r = report.get() ?: return "нет отчёта сервера" + (failure.get()?.let { ": ${it.message}" } ?: "")
+        val r = report.get() ?: return tr("нет отчёта сервера") + (failure.get()?.let { ": ${it.message}" } ?: "")
         val bb = java.nio.ByteBuffer.wrap(r)
         val bytes = bb.long
         val ms = bb.long
-        return "%.1f Мбит/с · %s за %.1f с".format(mbps(bytes, ms), human(bytes), ms / 1000.0)
+        return tr("%.1f Мбит/с · %s за %.1f с").format(mbps(bytes, ms), human(bytes), ms / 1000.0)
     }
 
     /** Download the public peer list into `dst` (atomic). */
@@ -500,7 +500,7 @@ object Ygg {
             val body = c.inputStream.readBytes()
             val text = String(body, Charsets.UTF_8)
             if (!text.trimStart().startsWith("{") || !(text.contains("tls://") || text.contains("tcp://")))
-                throw IllegalStateException("неожиданный формат списка")
+                throw IllegalStateException(tr("неожиданный формат списка"))
             val tmp = File(dst.path + ".tmp")
             tmp.writeBytes(body)
             if (!tmp.renameTo(dst)) throw IllegalStateException("rename")

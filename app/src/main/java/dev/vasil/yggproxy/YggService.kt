@@ -93,6 +93,7 @@ class YggService : VpnService() {
     override fun onCreate() {
         super.onCreate()
         prefs = Prefs(this)
+        I18n.init(this)
         State.serviceRunning = true
         instance = this
         journalTimer.scheduleWithFixedDelay({ journalTick() }, 10, 10, java.util.concurrent.TimeUnit.SECONDS)
@@ -123,20 +124,20 @@ class YggService : VpnService() {
             State.requests[srv] = code
             prefs.removePending(srv)
             val ok = code == "ok"
-            State.log("access", "$srv: " + if (ok) "владелец одобрил запрос — доступ есть" else Ygg.accessText(code))
-            notifyAccess(srv, if (ok) "Доступ одобрен" else if (code == "denied") "Запрос доступа отклонён" else "Доступ: ${Ygg.accessText(code)}",
-                if (ok) "Владелец сервера $srv разрешил подключение. Нажмите «Подключиться»." else "Сервер $srv: ${Ygg.accessText(code)}")
+            State.log("access", "$srv: " + if (ok) tr("владелец одобрил запрос — доступ есть") else Ygg.accessText(code))
+            notifyAccess(srv, if (ok) tr("Доступ одобрен") else if (code == "denied") tr("Запрос доступа отклонён") else tr("Доступ: %1\$s", Ygg.accessText(code)),
+                if (ok) tr("Владелец сервера %1\$s разрешил подключение. Нажмите «Подключиться».", srv) else tr("Сервер %1\$s: %2\$s", srv, Ygg.accessText(code)))
         }
     }
 
     /** Exit mode: a client wrote to us — a notification that opens the chat. */
     private fun ownerChatMessage(addr: String) {
-        State.log("chat", "сообщение от $addr")
+        State.log("chat", tr("сообщение от %1\$s", addr))
         Thread {
             val text = try { Chat.ownerHistory(this, addr, prefs.ownerChatSeen).lastOrNull { !it.owner }?.text } catch (_: Exception) { null }
             val open = PendingIntent.getActivity(this, 3, Intent(this, MainActivity::class.java).putExtra(EXTRA_OWNER_CHAT, addr),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            notifyChat(1000 + addr.hashCode() % 1000, "Сообщение от клиента", (text ?: "") + "\n$addr", open)
+            notifyChat(1000 + addr.hashCode() % 1000, tr("Сообщение от клиента"), (text ?: "") + "\n$addr", open)
         }.apply { isDaemon = true; start() }
     }
 
@@ -153,7 +154,7 @@ class YggService : VpnService() {
             .filter { it in State.chatServers || prefs.isChatServer(it) }
         for (srv in servers) {
             val lines = try { Chat.sync(srv, prefs.chatNotified(srv)) } catch (e: Exception) {
-                State.log("chat", "$srv: ответы не проверены — ${e.message}")
+                State.log("chat", tr("%1\$s: ответы не проверены — %2\$s", srv, e.message))
                 continue
             }
             val news = lines.filter { it.owner }
@@ -161,14 +162,14 @@ class YggService : VpnService() {
             prefs.setChatNotified(srv, lines.maxOf { it.t })
             val open = PendingIntent.getActivity(this, 4, Intent(this, SimpleActivity::class.java).putExtra(EXTRA_CHAT, srv),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-            notifyChat(2000 + srv.hashCode() % 1000, "Сообщение от сервера ${prefs.label(srv)}", news.joinToString("\n") { it.text }, open)
+            notifyChat(2000 + srv.hashCode() % 1000, tr("Сообщение от сервера %1\$s", prefs.label(srv)), news.joinToString("\n") { it.text }, open)
         }
     }
 
     private fun notifyChat(id: Int, title: String, text: String, open: PendingIntent) { try {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHAT_CHANNEL) == null) {
-            nm.createNotificationChannel(NotificationChannel(CHAT_CHANNEL, "Чат с сервером", NotificationManager.IMPORTANCE_HIGH))
+            nm.createNotificationChannel(NotificationChannel(CHAT_CHANNEL, tr("Чат с сервером"), NotificationManager.IMPORTANCE_HIGH))
         }
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHAT_CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
         nm.notify(id, b.setSmallIcon(R.drawable.ic_notif).setContentTitle(title).setContentText(text)
@@ -179,7 +180,7 @@ class YggService : VpnService() {
     private fun notifyAccess(server: String, title: String, text: String) { try {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(ACCESS_CHANNEL) == null) {
-            nm.createNotificationChannel(NotificationChannel(ACCESS_CHANNEL, "Доступ к серверам", NotificationManager.IMPORTANCE_DEFAULT))
+            nm.createNotificationChannel(NotificationChannel(ACCESS_CHANNEL, tr("Доступ к серверам"), NotificationManager.IMPORTANCE_DEFAULT))
         }
         val open = PendingIntent.getActivity(this, 2, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, ACCESS_CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
@@ -206,13 +207,13 @@ class YggService : VpnService() {
         State.serverPeers[server]?.let { p ->
             if (p != prefs.serverPeers(server)) {
                 prefs.setServerPeers(server, p)
-                State.log("peers", "пир сервера $server: ${p.joinToString(", ")}")
+                State.log("peers", tr("пир сервера %1\$s: %2\$s", server, p.joinToString(", ")))
             }
             if (lastTarget?.isNotEmpty() == true) writeServerPeers(server)
         }
         // The exit offers CKR now (or no longer): the VPN changes its mode.
         if (prefs.ckrFor(server) != ckrBefore) {
-            State.log("vpn", if (prefs.ckrFor(server)) "$server предлагает CKR — VPN переходит на туннель CKR" else "$server без CKR — VPN через прокси")
+            State.log("vpn", if (prefs.ckrFor(server)) tr("%1\$s предлагает CKR — VPN переходит на туннель CKR", server) else tr("%1\$s без CKR — VPN через прокси", server))
             requestReconcile()
         }
         if (last == null || last.first != sig || last.second != code) {
@@ -256,7 +257,7 @@ class YggService : VpnService() {
                     val tp = try { org.json.JSONObject(File(filesDir, "tracker-peers.json").readText()) } catch (_: Exception) { null }
                     val list = journal.preferList(prefs.customPeerList(), if (prefs.useTrackers) tp else null).joinToString("\n")
                     if (Ygg.writeIfChanged(preferFile, list)) {
-                        if (journalTicks == 6L) State.log("peers", "приоритет пиров: ${list.lines().count { it.isNotBlank() }} (свои лучшие и рейтинг трекеров)")
+                        if (journalTicks == 6L) State.log("peers", tr("приоритет пиров: %1\$s (свои лучшие и рейтинг трекеров)", list.lines().count { it.isNotBlank() }))
                     }
                 }
                 val now = System.currentTimeMillis() / 1000
@@ -266,21 +267,21 @@ class YggService : VpnService() {
                     if (n > 0) {
                         journal.lastReport = now
                         for (t in prefs.trackerList()) {
-                            if (Ygg.postTracker(t, "/report", rep) != null) { State.log("peers", "статистика $n пиров отправлена трекеру $t"); break }
+                            if (Ygg.postTracker(t, "/report", rep) != null) { State.log("peers", tr("статистика %1\$s пиров отправлена трекеру %2\$s", n, t)); break }
                         }
                     }
                 }
             }
         }
-    } catch (e: Exception) { State.log("peers", "журнал пиров: ${e.message}") } }
+    } catch (e: Exception) { State.log("peers", tr("журнал пиров: %1\$s", e.message)) } }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        foreground("Запуск…")
-        State.log("service", "команда: ${intent?.action?.substringAfterLast('.') ?: "перезапуск системой (START_STICKY)"}")
+        foreground(tr("Запуск…"))
+        State.log("service", tr("команда: %1\$s", intent?.action?.substringAfterLast('.') ?: tr("перезапуск системой (START_STICKY)")))
         when (intent?.action) {
             SERVICE_INTERFACE -> if (VpnService.prepare(this) == null) prefs.vpnEnabled = true // always-on VPN
             ACTION_STOP -> {
-                State.log("service", "«Остановить» в уведомлении")
+                State.log("service", tr("«Остановить» в уведомлении"))
                 prefs.vpnEnabled = false; prefs.serverEnabled = false
                 State.stoppedByUser = true
             }
@@ -291,24 +292,24 @@ class YggService : VpnService() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        State.log("service", "приложение убрано из недавних (сервис продолжает работать)")
+        State.log("service", tr("приложение убрано из недавних (сервис продолжает работать)"))
         super.onTaskRemoved(rootIntent)
     }
 
     override fun onTrimMemory(level: Int) {
-        if (level >= TRIM_MEMORY_RUNNING_LOW) State.log("service", "мало памяти (уровень $level)")
+        if (level >= TRIM_MEMORY_RUNNING_LOW) State.log("service", tr("мало памяти (уровень %1\$s)", level))
         super.onTrimMemory(level)
     }
 
     override fun onRevoke() {
-        State.log("vpn", "VPN отозван системой или другим VPN")
+        State.log("vpn", tr("VPN отозван системой или другим VPN"))
         prefs.vpnEnabled = false
         exec.execute { reconcile() }
     }
 
     override fun onDestroy() {
-        State.log("service", "onDestroy: сервис уничтожен системой или остановлен")
-        stopAll("сервис завершён (onDestroy)")
+        State.log("service", tr("onDestroy: сервис уничтожен системой или остановлен"))
+        stopAll(tr("сервис завершён (onDestroy)"))
         exec.shutdownNow()
         journalTimer.shutdownNow()
         accessTimer.shutdownNow()
@@ -342,9 +343,9 @@ class YggService : VpnService() {
     private fun reconcileInner() {
         val only = prefs.yggOnly
         val target = if (only) null else clientTarget()
-        if (prefs.vpnEnabled && target == null && !only) State.error("vpn", "не задан адрес сервера выхода")
+        if (prefs.vpnEnabled && target == null && !only) State.error("vpn", tr("не задан адрес сервера выхода"))
         if (prefs.vpnEnabled && VpnService.prepare(this) != null) {
-            State.error("vpn", "нет разрешения на VPN: откройте приложение и нажмите «Подключить»")
+            State.error("vpn", tr("нет разрешения на VPN: откройте приложение и нажмите «Подключить»"))
             prefs.vpnEnabled = false
         }
         val wantVpn = prefs.vpnEnabled && (target != null || only)
@@ -353,8 +354,8 @@ class YggService : VpnService() {
         // With the app on screen the node runs anyway: it pings the saved servers and the root.
         val wantNode = State.uiVisible || (prefs.keepNode && !State.stoppedByUser)
         if (!wantVpn && !wantExit && !wantNode) {
-            State.log("service", "нет включённых ролей (VPN и сервер выключены) — сервис завершается")
-            stopAll("VPN и сервер выключены, приложение закрыто")
+            State.log("service", tr("нет включённых ролей (VPN и сервер выключены) — сервис завершается"))
+            stopAll(tr("VPN и сервер выключены, приложение закрыто"))
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
             return
@@ -371,14 +372,14 @@ class YggService : VpnService() {
             Ygg.writeIfChanged(connectFile, connectLine)
             if (lastTarget != null) State.serverRtt = null
             lastTarget = connectLine
-            if (target != null && wantVpn) State.log("vpn", "сервер выхода: ${target.first} (узел не перезапускается)")
+            if (target != null && wantVpn) State.log("vpn", tr("сервер выхода: %1\$s (узел не перезапускается)", target.first))
         }
         val nodeCmd = nodeArgs(wantExit)
         // The node reads its peer file only at start: a changed peer choice needs a restart.
         val peers = prefs.usePublicPeers to prefs.customPeerList()
         if (node?.cmd != nodeCmd || (node != null && peers != nodePeers)) {
             nodePeers = peers
-            node?.stop("новые параметры узла")
+            node?.stop(tr("новые параметры узла"))
             node = ManagedProcess("node", nodeCmd, filesDir,
                 onStart = { State.nodeRunning = true; State.nodeStartedAt = System.currentTimeMillis() },
                 onExit = { State.nodeRunning = false },
@@ -405,13 +406,13 @@ class YggService : VpnService() {
                 add("-v"); add("warn")
             }
             if (exitProc?.cmd != cmd) {
-                exitProc?.stop("новые параметры прокси")
+                exitProc?.stop(tr("новые параметры прокси"))
                 exitProc = ManagedProcess("exit", cmd, filesDir,
                     onExit = { State.exitActive = false },
                     onLine = { l -> helperLine("exit", l) { if (it.startsWith("READY")) State.exitActive = true } }).start()
             }
         } else {
-            exitProc?.stop("сервер выключен"); exitProc = null
+            exitProc?.stop(tr("сервер выключен")); exitProc = null
             State.exitActive = false
         }
         if (wantExit) acquireWakeLock() else releaseWakeLock()
@@ -479,7 +480,7 @@ class YggService : VpnService() {
     }
 
     private fun restartNode() {
-        node?.stop("перезапуск узла"); node = null
+        node?.stop(tr("перезапуск узла")); node = null
         State.lanStatus = null
         State.serverRtt = null
         reconcile()
@@ -511,8 +512,8 @@ class YggService : VpnService() {
         when {
             l.startsWith("STAT ") -> State.parseStat(l)
             l.startsWith("ERROR ") -> State.error(tag, l.removePrefix("ERROR "))
-            l.startsWith("ACCESS bind ") -> l.split(' ').let { State.log("access", "ключ ${it.getOrNull(2)} привязан к устройству ${it.getOrNull(3)}") }
-            l.startsWith("ACCESS request ") -> State.log("access", "запрос доступа от ${l.substringAfterLast(' ')} — см. «Сервер»")
+            l.startsWith("ACCESS bind ") -> l.split(' ').let { State.log("access", tr("ключ %1\$s привязан к устройству %2\$s", it.getOrNull(2), it.getOrNull(3))) }
+            l.startsWith("ACCESS request ") -> State.log("access", tr("запрос доступа от %1\$s — см. «Сервер»", l.substringAfterLast(' ')))
             l.startsWith("CHAT ") -> ownerChatMessage(l.removePrefix("CHAT ").trim())
             else -> State.log(tag, l)
         }
@@ -528,10 +529,10 @@ class YggService : VpnService() {
             if (force || stale) {
                 try {
                     Ygg.downloadPeers(publicPeers)
-                    State.log("peers", "публичный список загружен (${publicPeers.length() / 1024} КБ)")
+                    State.log("peers", tr("публичный список загружен (%1\$s КБ)", publicPeers.length() / 1024))
                 } catch (e: Exception) {
-                    State.error("peers", "не удалось скачать публичный список: ${e.message}" +
-                        if (publicPeers.isFile) " — используется сохранённый" else "")
+                    State.error("peers", tr("не удалось скачать публичный список: %1\$s", e.message) +
+                        if (publicPeers.isFile) tr(" — используется сохранённый") else "")
                 }
             }
         }
@@ -540,7 +541,7 @@ class YggService : VpnService() {
         // Tracker peers are public peers too: with the public list off, only while no own peer is set.
         val fromTrackers = File(filesDir, "tracker-peers.json").takeIf { prefs.useTrackers && it.isFile && (prefs.usePublicPeers || custom.isEmpty()) }
         Ygg.writePeerFile(peerFile, custom, pub, fromTrackers)
-        if (custom.isEmpty() && (pub == null || !pub.isFile) && fromTrackers == null) State.error("peers", "нет ни одного пира: добавьте свои или включите публичный список")
+        if (custom.isEmpty() && (pub == null || !pub.isFile) && fromTrackers == null) State.error("peers", tr("нет ни одного пира: добавьте свои или включите публичный список"))
     }
 
     // ---------------------------------------------------------------------------------------
@@ -567,12 +568,12 @@ class YggService : VpnService() {
         b.addDisallowedApplication(packageName)
         for (app in prefs.excludedAppList()) {
             try { b.addDisallowedApplication(app) } catch (e: PackageManager.NameNotFoundException) {
-                State.log("vpn", "исключение: приложение $app не найдено")
+                State.log("vpn", tr("исключение: приложение %1\$s не найдено", app))
             }
         }
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
         b.setConfigureIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-        val pfd = b.establish() ?: throw IllegalStateException("VPN не установлен (нет разрешения)")
+        val pfd = b.establish() ?: throw IllegalStateException(tr("VPN не установлен (нет разрешения)"))
         vpnPfd = pfd
         State.resetTraffic()
         State.vpnTarget = target?.first
@@ -600,8 +601,8 @@ class YggService : VpnService() {
                     }
                 }
             }).start()
-        State.log("vpn", if (target == null) "интерфейс поднят: только сайты Yggdrasil и ALFIS"
-            else "интерфейс поднят, выход через [${target.first}]:${target.second}" + if (prefs.yggSites) ", сайты Yggdrasil и ALFIS — через свой узел" else "")
+        State.log("vpn", if (target == null) tr("интерфейс поднят: только сайты Yggdrasil и ALFIS")
+            else tr("интерфейс поднят, выход через [%1\$s]:%2\$s", target.first, target.second) + if (prefs.yggSites) tr(", сайты Yggdrasil и ALFIS — через свой узел") else "")
     }
 
     /**
@@ -628,20 +629,20 @@ class YggService : VpnService() {
         b.addDisallowedApplication(packageName)
         for (app in prefs.excludedAppList()) {
             try { b.addDisallowedApplication(app) } catch (e: PackageManager.NameNotFoundException) {
-                State.log("vpn", "исключение: приложение $app не найдено")
+                State.log("vpn", tr("исключение: приложение %1\$s не найдено", app))
             }
         }
         if (Build.VERSION.SDK_INT >= 29) b.setMetered(false)
         b.setConfigureIntent(PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE))
-        val pfd = b.establish() ?: throw IllegalStateException("VPN не установлен (нет разрешения)")
+        val pfd = b.establish() ?: throw IllegalStateException(tr("VPN не установлен (нет разрешения)"))
         vpnPfd = pfd
         ckrVpn = true
         State.vpnCkr = true
         State.resetTraffic()
         State.vpnTarget = target.first
         Thread { sendCkrFd() }.start()
-        State.log("vpn", "туннель CKR (весь IP-трафик) через [${target.first}], адрес ${prefs.ckrAddress}" +
-            if (ygg == null) " — IPv6 появится, когда узел сообщит свой адрес" else "")
+        State.log("vpn", tr("туннель CKR (весь IP-трафик) через [%1\$s], адрес %2\$s", target.first, prefs.ckrAddress) +
+            if (ygg == null) tr(" — IPv6 появится, когда узел сообщит свой адрес") else "")
     }
 
     /** Hand the CKR interface to the node over its --ckr-ctl socket (retried while it starts). */
@@ -659,7 +660,7 @@ class YggService : VpnService() {
                 ctl = s // kept open: closing it detaches the tunnel from the node
                 return
             } catch (e: Exception) {
-                if (i == 29) State.error("vpn", "не удалось передать туннель CKR узлу: ${e.message}")
+                if (i == 29) State.error("vpn", tr("не удалось передать туннель CKR узлу: %1\$s", e.message))
                 Thread.sleep(500)
             }
         }
@@ -677,7 +678,7 @@ class YggService : VpnService() {
             s.outputStream.flush()
             ctl = s // kept open: closing it stops the helper
         } catch (e: Exception) {
-            State.error("tun", "не удалось передать VPN-интерфейс: ${e.message}")
+            State.error("tun", tr("не удалось передать VPN-интерфейс: %1\$s", e.message))
         }
     }
 
@@ -689,7 +690,7 @@ class YggService : VpnService() {
     private fun stopVpn() {
         ckrVpn = false
         closeCtl()
-        tunProc?.stop("VPN выключен"); tunProc = null
+        tunProc?.stop(tr("VPN выключен")); tunProc = null
         try { vpnPfd?.close() } catch (_: Exception) {}
         vpnPfd = null
         vpnSig = null
@@ -727,7 +728,7 @@ class YggService : VpnService() {
                     wifiNet = network
                     // The first callbacks right after registering report networks the node already saw.
                     if (android.os.SystemClock.elapsedRealtime() - registeredAt < 5000 || prev == network) return
-                    State.log("lan", "новая сеть Wi-Fi/Ethernet — перезапуск узла для поиска пиров в LAN")
+                    State.log("lan", tr("новая сеть Wi-Fi/Ethernet — перезапуск узла для поиска пиров в LAN"))
                     try { exec.execute { restartNode() } } catch (_: Exception) {}
                 }
                 override fun onLost(network: Network) { if (wifiNet == network) wifiNet = null }
@@ -791,7 +792,7 @@ class YggService : VpnService() {
             .setContentText(text)
             .setContentIntent(open)
             .setOngoing(true)
-            .addAction(Notification.Action.Builder(null, "Остановить", stop).build())
+            .addAction(Notification.Action.Builder(null, tr("Остановить"), stop).build())
             .build()
     }
 
@@ -804,8 +805,8 @@ class YggService : VpnService() {
     private fun updateNotification() {
         val parts = mutableListOf<String>()
         if (vpnPfd != null) parts += "VPN → ${State.vpnTarget}"
-        if (exitProc != null) parts += "сервер выхода"
-        if (parts.isEmpty() && node != null) parts += "проверка серверов"
+        if (exitProc != null) parts += tr("сервер выхода")
+        if (parts.isEmpty() && node != null) parts += tr("проверка серверов")
         if (parts.isEmpty()) return
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         nm.notify(NOTIF_ID, notification(parts.joinToString(" · ")))

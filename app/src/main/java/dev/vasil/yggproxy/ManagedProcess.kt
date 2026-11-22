@@ -38,7 +38,7 @@ class ManagedProcess(
                 val p = pb.start()
                 proc = p
                 startedAt = SystemClock.elapsedRealtime()
-                State.log(tag, "запущен: " + cmd.joinToString(" ") { it.substringAfterLast('/') })
+                State.log(tag, tr("запущен: ") + cmd.joinToString(" ") { it.substringAfterLast('/') })
                 onStart()
                 try {
                     p.inputStream.bufferedReader().forEachLine(onLine)
@@ -48,14 +48,14 @@ class ManagedProcess(
                 proc = null
                 onExit(code)
                 if (stopping) break
-                State.error(tag, "процесс завершился (код $code), перезапуск через ${backoff / 1000} с")
+                State.error(tag, tr("процесс завершился (код %1\$s), перезапуск через %2\$s с", code, backoff / 1000))
                 if (SystemClock.elapsedRealtime() - startedAt > 60_000) backoff = 1000
             } catch (e: InterruptedException) {
                 break
             } catch (e: Exception) {
                 proc = null
                 if (stopping) break
-                State.error(tag, "не запускается: ${e.message}")
+                State.error(tag, tr("не запускается: %1\$s", e.message))
             }
             restarts++
             try { Thread.sleep(backoff) } catch (_: InterruptedException) { break }
@@ -76,6 +76,6 @@ class ManagedProcess(
             while (p.isAlive && SystemClock.elapsedRealtime() < deadline) SystemClock.sleep(50)
             if (p.isAlive) p.destroyForcibly()
         }
-        State.log(tag, if (why.isEmpty()) "остановлен" else "остановлен: $why")
+        State.log(tag, if (why.isEmpty()) tr("остановлен") else tr("остановлен: %1\$s", why))
     }
 }

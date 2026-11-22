@@ -35,7 +35,7 @@ object State {
     @Volatile var access: Triple<String, String, Long>? = null
     /** Our access requests: server → status code (`pending`, then `ok` or `denied`). */
     val requests = java.util.concurrent.ConcurrentHashMap<String, String>()
-    @Volatile var trackerStatus: String = "ещё не запрашивались"
+    @Volatile var trackerStatus: String = tr("ещё не запрашивались")
     @Volatile var trackerAt = 0L
     /** Last time public peers were taken from a tracker (hourly). */
     @Volatile var trackerPeersAt = 0L
@@ -80,7 +80,7 @@ object State {
 
     fun error(tag: String, msg: String) {
         lastError = "[$tag] $msg"
-        log(tag, "ОШИБКА: $msg")
+        log(tag, tr("ОШИБКА: %1\$s", msg))
     }
 
     fun logsText(): String = synchronized(logs) { logs.joinToString("\n") }

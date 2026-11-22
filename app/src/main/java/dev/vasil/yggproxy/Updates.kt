@@ -65,8 +65,8 @@ object Updates {
                 if (a.isFinishing) return@runOnUiThread
                 val cur = current(a)
                 when {
-                    r == null -> if (manual) toast(a, "Не удалось проверить обновления (нет связи с GitHub)")
-                    !newer(r.version, cur) -> if (manual) toast(a, "У вас последняя версия ($cur)")
+                    r == null -> if (manual) toast(a, tr("Не удалось проверить обновления (нет связи с GitHub)"))
+                    !newer(r.version, cur) -> if (manual) toast(a, tr("У вас последняя версия (%1\$s)", cur))
                     !manual && r.version == prefs.updateSkipped -> {}
                     else -> offer(a, prefs, r, cur)
                 }
@@ -77,14 +77,14 @@ object Updates {
     private fun offer(a: Activity, prefs: Prefs, r: Release, cur: String) {
         val notes = r.notes.substringBefore("## Установка").replace(Regex("[*`#]"), "").trim().take(1500)
         AlertDialog.Builder(a)
-            .setTitle("Доступна версия ${r.version}")
-            .setMessage("Установлена $cur.\n\n$notes")
-            .setPositiveButton("Скачать") { _, _ ->
+            .setTitle(tr("Доступна версия %1\$s", r.version))
+            .setMessage(tr("Установлена %1\$s.\n\n%2\$s", cur, notes))
+            .setPositiveButton(tr("Скачать")) { _, _ ->
                 try { a.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(r.apkUrl ?: r.page))) }
-                catch (_: Exception) { toast(a, "Нет браузера: ${r.page}") }
+                catch (_: Exception) { toast(a, tr("Нет браузера: %1\$s", r.page)) }
             }
-            .setNegativeButton("Позже", null)
-            .setNeutralButton("Пропустить версию") { _, _ -> prefs.updateSkipped = r.version }
+            .setNegativeButton(tr("Позже"), null)
+            .setNeutralButton(tr("Пропустить версию")) { _, _ -> prefs.updateSkipped = r.version }
             .show()
     }
 

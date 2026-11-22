@@ -46,6 +46,7 @@ class SimpleActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = Prefs(this)
+        I18n.init(this)
         if (prefs.advancedMode) {
             openAdvanced()
             return
@@ -62,7 +63,7 @@ class SimpleActivity : Activity() {
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         root.addView(top)
         root.addView(TextView(this).apply {
-            text = "Интернет через Yggdrasil"; textSize = 14f; setTextColor(Color.DKGRAY); setPadding(0, 0, 0, dp(16))
+            text = tr("Интернет через Yggdrasil"); textSize = 14f; setTextColor(Color.DKGRAY); setPadding(0, 0, 0, dp(16))
         })
         tvState = TextView(this).apply { textSize = 17f; setTextColor(Color.BLACK); setPadding(0, 0, 0, dp(12)) }
         root.addView(tvState)
@@ -79,11 +80,11 @@ class SimpleActivity : Activity() {
         // Below: the servers and keys, and the way into the full app.
         val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         bottom.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = "Серверы и ключи"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
+            text = tr("Серверы и ключи"); isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
             setOnClickListener { serversScreen() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         bottom.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
-            text = "Эксперт ›"; isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
+            text = tr("Эксперт ›"); isAllCaps = false; textSize = 15f; setTextColor(ACCENT)
             setOnClickListener {
                 prefs.advancedMode = true
                 openAdvanced()
@@ -109,8 +110,8 @@ class SimpleActivity : Activity() {
 
     /** Chat with [server]'s owner (any server we have access to or asked for it). */
     private fun openChat(server: String) {
-        Chat.open(this, "Чат: ${prefs.label(server)}",
-            "Напишите владельцу сервера — ответ придёт сюда и уведомлением.", mineIsOwner = false,
+        Chat.open(this, tr("Чат: %1\$s", prefs.label(server)),
+            tr("Напишите владельцу сервера — ответ придёт сюда и уведомлением."), mineIsOwner = false,
             load = { Chat.sync(server, it) }, send = { Chat.send(server, it) },
             seen = { prefs.setChatSeen(server, it); prefs.setChatNotified(server, maxOf(it, prefs.chatNotified(server))) })
     }
@@ -128,18 +129,18 @@ class SimpleActivity : Activity() {
         list.addView(status)
         val rows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         list.addView(rows)
-        val d = android.app.AlertDialog.Builder(this).setTitle("Серверы и ключи")
+        val d = android.app.AlertDialog.Builder(this).setTitle(tr("Серверы и ключи"))
             .setView(ScrollView(this).apply { addView(list) })
-            .setNegativeButton("Закрыть", null).show()
+            .setNegativeButton(tr("Закрыть"), null).show()
         fun headButton(t: String, f: () -> Unit) = head.addView(Button(this, null, android.R.attr.borderlessButtonStyle).apply {
             text = t; isAllCaps = false; textSize = 14f; setTextColor(ACCENT)
             setOnClickListener { d.dismiss(); f() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        headButton("Сканировать QR") {
+        headButton(tr("Сканировать QR")) {
             @Suppress("DEPRECATION")
             startActivityForResult(Intent(this, ScanActivity::class.java), REQ_SCAN)
         }
-        headButton("Ввести ключ") { keyDialog() }
+        headButton(tr("Ввести ключ")) { keyDialog() }
 
         /** One row: the server, its ping and status, and the button for what can be done. */
         fun row(addr: String, ping: Long?, code: String?, expires: Long) {
@@ -152,17 +153,17 @@ class SimpleActivity : Activity() {
             val public = addr in State.trackerPublic
             val mark = when { code == "ok" && prefs.keyFor(addr) == null && public -> "🌐"; code == "ok" -> "🔑"; else -> "🔒" }
             val what = when {
-                code == null -> "проверяю доступ…"
-                code == "ok" && expires > 0 -> "доступ есть" + Ygg.keyLeft(expires)
-                code == "ok" -> if (public) "публичный" else "доступ есть"
-                code == "closed" -> "закрыт"
-                code == "pending" -> "запрос отправлен, ждёт ответа"
-                code.startsWith("error") -> "нет связи"
+                code == null -> tr("проверяю доступ…")
+                code == "ok" && expires > 0 -> tr("доступ есть") + Ygg.keyLeft(expires)
+                code == "ok" -> if (public) tr("публичный") else tr("доступ есть")
+                code == "closed" -> tr("закрыт")
+                code == "pending" -> tr("запрос отправлен, ждёт ответа")
+                code.startsWith("error") -> tr("нет связи")
                 else -> Ygg.accessText(code)
             }
             box.addView(TextView(this).apply {
                 val name = prefs.serverNameOf(addr)
-                text = "$mark ${name ?: addr}\n${if (name != null) "$addr\n" else ""}${ping?.let { "$it мс · " } ?: ""}$what"
+                text = "$mark ${name ?: addr}\n${if (name != null) "$addr\n" else ""}${ping?.let { tr("%1\$s мс · ", it) } ?: ""}$what"
                 textSize = 13f; typeface = Typeface.MONOSPACE
                 setTextColor(when (code) { "ok" -> ACCENT; "denied", "bad_key", "other_device" -> Color.parseColor("#B03020"); else -> Color.DKGRAY })
             }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -171,24 +172,24 @@ class SimpleActivity : Activity() {
                 setOnClickListener { f() }
             })
             when (code) {
-                "ok" -> action("Подключиться") {
+                "ok" -> action(tr("Подключиться")) {
                     d.dismiss()
-                    if (VpnService.prepare(this) != null || flow != null) { prefs.server = addr; toast("Сервер выбран — нажмите «Подключиться»") }
+                    if (VpnService.prepare(this) != null || flow != null) { prefs.server = addr; toast(tr("Сервер выбран — нажмите «Подключиться»")) }
                     else startFlow { switchFlow(addr) }
                 }
-                "closed", "expired" -> action(if (code == "expired") "Продлить" else "Запросить доступ") {
+                "closed", "expired" -> action(if (code == "expired") tr("Продлить") else tr("Запросить доступ")) {
                     messageDialog(addr) { c -> row(addr, ping, c, 0) }
                 }
                 // While the owner decides: a word to them, if the server takes chat messages.
-                "pending" -> if (addr in State.chatServers) action("Написать") { openChat(addr) } else action("Ждёт ответа", enabled = false)
-                "denied" -> action("Отклонён", enabled = false)
+                "pending" -> if (addr in State.chatServers) action(tr("Написать")) { openChat(addr) } else action(tr("Ждёт ответа"), enabled = false)
+                "denied" -> action(tr("Отклонён"), enabled = false)
                 else -> {}
             }
         }
 
         val known = (prefs.serverList() + State.trackerExits.map { it.first }).distinct()
         known.forEach { row(it, null, State.requests[it].takeIf { c -> c == "pending" || c == "denied" }, 0) }
-        status.text = if (known.isEmpty()) "Загружаю список серверов от трекеров…" else "Серверов: ${known.size}. Доступ проверяется без отправки запросов."
+        status.text = if (known.isEmpty()) tr("Загружаю список серверов от трекеров…") else tr("Серверов: %1\$s. Доступ проверяется без отправки запросов.", known.size)
         Thread {
             var all = known
             if (State.trackerExits.isEmpty() && State.nodeRunning) {
@@ -207,11 +208,11 @@ class SimpleActivity : Activity() {
                 all = (prefs.serverList() + exits.keys).distinct()
                 ui.post {
                     all.forEach { row(it, exits[it]?.takeIf { p -> p >= 0 }, null, 0) }
-                    status.text = if (all.isEmpty()) "Серверов не найдено: трекеры не ответили. Можно ввести ключ или отсканировать QR."
-                        else "Серверов: ${all.size}. Доступ проверяется без отправки запросов."
+                    status.text = if (all.isEmpty()) tr("Серверов не найдено: трекеры не ответили. Можно ввести ключ или отсканировать QR.")
+                        else tr("Серверов: %1\$s. Доступ проверяется без отправки запросов.", all.size)
                 }
             }
-            if (!State.nodeRunning) { ui.post { status.text = "Узел Yggdrasil ещё запускается — откройте этот список чуть позже." }; return@Thread }
+            if (!State.nodeRunning) { ui.post { status.text = tr("Узел Yggdrasil ещё запускается — откройте этот список чуть позже.") }; return@Thread }
             val rtt = Ygg.rttByAddr(Ygg.fetchRtt())
             val trackerPing = State.trackerExits.toMap()
             all.take(20).map { a ->
@@ -230,37 +231,37 @@ class SimpleActivity : Activity() {
     private fun keyDialog() {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
         box.addView(TextView(this).apply {
-            text = "Серверы закрыты: нужен ключ от владельца сервера. Отсканируйте его QR-код или введите адрес и ключ."
+            text = tr("Серверы закрыты: нужен ключ от владельца сервера. Отсканируйте его QR-код или введите адрес и ключ.")
             setTextColor(Color.DKGRAY)
         })
-        val etAddr = android.widget.EditText(this).apply { hint = "адрес сервера 200:… или ссылка"; textSize = 14f }
-        val etKey = android.widget.EditText(this).apply { hint = "ключ доступа"; textSize = 14f }
+        val etAddr = android.widget.EditText(this).apply { hint = tr("адрес сервера 200:… или ссылка"); textSize = 14f }
+        val etKey = android.widget.EditText(this).apply { hint = tr("ключ доступа"); textSize = 14f }
         box.addView(etAddr); box.addView(etKey)
-        android.app.AlertDialog.Builder(this).setTitle("Ключ доступа").setView(box)
-            .setPositiveButton("Сохранить") { _, _ -> saveKey(etAddr.text.toString(), etKey.text.toString()) }
-            .setNeutralButton("Сканировать QR") { _, _ ->
+        android.app.AlertDialog.Builder(this).setTitle(tr("Ключ доступа")).setView(box)
+            .setPositiveButton(tr("Сохранить")) { _, _ -> saveKey(etAddr.text.toString(), etKey.text.toString()) }
+            .setNeutralButton(tr("Сканировать QR")) { _, _ ->
                 @Suppress("DEPRECATION")
                 startActivityForResult(Intent(this, ScanActivity::class.java), REQ_SCAN)
             }
-            .setNegativeButton("Отмена", null).show()
+            .setNegativeButton(tr("Отмена"), null).show()
     }
 
     /** The request itself: a message to the owner, sent through the node (no VPN needed). */
     private fun messageDialog(server: String, onDone: (String) -> Unit = {}) {
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
         box.addView(TextView(this).apply {
-            text = "Владелец сервера увидит название вашего устройства (${Ygg.deviceName()}) и сообщение. Когда он одобрит запрос, подключение заработает само."
+            text = tr("Владелец сервера увидит название вашего устройства (%1\$s) и сообщение. Когда он одобрит запрос, подключение заработает само.", Ygg.deviceName())
             setTextColor(Color.DKGRAY)
         })
         val et = android.widget.EditText(this).apply {
-            hint = "сообщение владельцу: кто вы и зачем"; textSize = 14f; minLines = 2
+            hint = tr("сообщение владельцу: кто вы и зачем"); textSize = 14f; minLines = 2
             filters = arrayOf(android.text.InputFilter.LengthFilter(200))
         }
         box.addView(et)
         android.app.AlertDialog.Builder(this).setTitle(server).setView(box)
-            .setPositiveButton("Отправить запрос") { _, _ ->
+            .setPositiveButton(tr("Отправить запрос")) { _, _ ->
                 val msg = et.text.toString()
-                say("Отправляю запрос доступа к $server")
+                say(tr("Отправляю запрос доступа к %1\$s", server))
                 Thread {
                     val (code, exp) = Ygg.probeAccess(server, null, ask = true, message = msg)
                     prefs.noteAccess(server, code, exp)
@@ -270,24 +271,24 @@ class SimpleActivity : Activity() {
                         // Followed in the background: a notification when the owner answers.
                         if (code == "pending") prefs.addPending(server)
                         Ygg.writeMonitors(filesDir, prefs)
-                        if (code == "pending") finish("отправлен — придёт уведомление, когда владелец ответит")
+                        if (code == "pending") finish(tr("отправлен — придёт уведомление, когда владелец ответит"))
                         else finish(Ygg.accessText(code), ok = code == "ok")
                         onDone(code)
                     }
                 }.apply { isDaemon = true; start() }
             }
-            .setNegativeButton("Отмена", null).show()
+            .setNegativeButton(tr("Отмена"), null).show()
     }
 
     private fun saveKey(text: String, typedKey: String) {
-        val server = Ygg.serverFromText(text) ?: run { toast("Это не адрес сервера Ratatoskr"); return }
+        val server = Ygg.serverFromText(text) ?: run { toast(tr("Это не адрес сервера Ratatoskr")); return }
         val key = Ygg.keyFromText(text) ?: Ygg.normKey(typedKey).takeIf { it.isNotEmpty() }
-        if (key == null) { toast("Нет ключа: попросите у владельца QR-код или ключ"); return }
+        if (key == null) { toast(tr("Нет ключа: попросите у владельца QR-код или ключ")); return }
         prefs.setKey(server, key)
         prefs.addServer(server)
         prefs.setServerPeers(server, Ygg.peersFromText(text))
         Ygg.writeMonitors(filesDir, prefs)
-        say("Ключ для $server сохранён — нажмите «Подключиться»", Mark.DONE)
+        say(tr("Ключ для %1\$s сохранён — нажмите «Подключиться»", server), Mark.DONE)
         if (prefs.vpnEnabled && flow == null) startFlow { switchFlow(server) }
     }
 
@@ -301,7 +302,7 @@ class SimpleActivity : Activity() {
         super.onStart()
         State.uiShown()
         State.stoppedByUser = false
-        try { YggService.send(this, YggService.ACTION_RECONCILE) } catch (e: Exception) { State.log("simple", "сервис не запустился: ${e.message}") }
+        try { YggService.send(this, YggService.ACTION_RECONCILE) } catch (e: Exception) { State.log("simple", tr("сервис не запустился: %1\$s", e.message)) }
         ui.post(tick)
         Updates.check(this, prefs)
     }
@@ -365,17 +366,17 @@ class SimpleActivity : Activity() {
         tvSpeed = line(15f).also { dash.addView(it) }
         val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         buttons.addView(Button(this).apply {
-            text = "Сменить сервер"; isAllCaps = false; textSize = 16f
+            text = tr("Сменить сервер"); isAllCaps = false; textSize = 16f
             setOnClickListener { chooseServer() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         buttons.addView(Button(this).apply {
-            text = "Тест скорости"; isAllCaps = false; textSize = 16f
+            text = tr("Тест скорости"); isAllCaps = false; textSize = 16f
             setOnClickListener { speedTest() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         dash.addView(buttons, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(18) })
         dash.addView(Button(this).apply {
-            text = "Чат с сервером"; isAllCaps = false; textSize = 16f
-            setOnClickListener { Ygg.serverFromText(prefs.server)?.let { openChat(it) } ?: toast("Сервер не выбран") }
+            text = tr("Чат с сервером"); isAllCaps = false; textSize = 16f
+            setOnClickListener { Ygg.serverFromText(prefs.server)?.let { openChat(it) } ?: toast(tr("Сервер не выбран")) }
         }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         return dash
     }
@@ -402,8 +403,8 @@ class SimpleActivity : Activity() {
     }
 
     private fun mbit(bytesPerSec: Double) = when {
-        bytesPerSec * 8 >= 1_000_000 -> "%.1f Мбит/с".format(bytesPerSec * 8 / 1_000_000)
-        else -> "%.0f кбит/с".format(bytesPerSec * 8 / 1000)
+        bytesPerSec * 8 >= 1_000_000 -> tr("%.1f Мбит/с").format(bytesPerSec * 8 / 1_000_000)
+        else -> tr("%.0f кбит/с").format(bytesPerSec * 8 / 1000)
     }
 
     /** The panel shown while connected (instead of the steps). */
@@ -421,26 +422,26 @@ class SimpleActivity : Activity() {
             return maxOf(0.0, (b[1] - a[1]) / dt) to maxOf(0.0, (b[2] - a[2]) / dt)
         }
         val peers = dPeers
-        tvNet.text = "Сеть Yggdrasil: " + when {
-            peers < 0 -> "узел не отвечает ✖"
-            peers == 0 -> "нет пиров ✖"
-            !dRootOk -> "пиров $peers, ищу сеть…"
-            else -> "подключено ✔ · пиров $peers"
+        tvNet.text = tr("Сеть Yggdrasil: ") + when {
+            peers < 0 -> tr("узел не отвечает ✖")
+            peers == 0 -> tr("нет пиров ✖")
+            !dRootOk -> tr("пиров %1\$s, ищу сеть…", peers)
+            else -> tr("подключено ✔ · пиров %1\$s", peers)
         }
         val acc = State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
         val srv = Ygg.serverFromText(prefs.server)
         val srvName = srv?.let { prefs.serverNameOf(it) }
-        tvExit.text = "Сервер выхода: " + (srvName?.let { "$it\n${prefs.server}" } ?: prefs.server) + "\n" + when {
-            dExitAt == 0L -> "проверяю…"
-            dExitMs != null -> "на связи ✔ (ответ ${dExitMs} мс)"
-            else -> "не отвечает ✖"
+        tvExit.text = tr("Сервер выхода: ") + (srvName?.let { "$it\n${prefs.server}" } ?: prefs.server) + "\n" + when {
+            dExitAt == 0L -> tr("проверяю…")
+            dExitMs != null -> tr("на связи ✔ (ответ %1\$s мс)", dExitMs)
+            else -> tr("не отвечает ✖")
         } + (acc?.let { Ygg.keyLeft(it.third) } ?: "") + "\n" + Ygg.modeText().replaceFirstChar { it.uppercase() }
-        tvPing.text = "Пинг: " + (dRtt?.let { "$it мс" } ?: "—") + (dAvg?.let { "  (средний $it мс)" } ?: "")
+        tvPing.text = tr("Пинг: ") + (dRtt?.let { tr("%1\$s мс", it) } ?: "—") + (dAvg?.let { tr("  (средний %1\$s мс)", it) } ?: "")
         val n = rate(1)
-        tvNow.text = "Сейчас: " + (n?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
+        tvNow.text = tr("Сейчас: ") + (n?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
         val m = rate(60)
-        tvAvg.text = "В среднем за минуту: " + (m?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
-        tvTotal.text = "Передано: ↓ ${Ygg.human(State.tunRx)}   ↑ ${Ygg.human(State.tunTx)}"
+        tvAvg.text = tr("В среднем за минуту: ") + (m?.let { "↓ ${mbit(it.first)}   ↑ ${mbit(it.second)}" } ?: "—")
+        tvTotal.text = tr("Передано: ↓ %1\$s   ↑ %2\$s", Ygg.human(State.tunRx), Ygg.human(State.tunTx))
     }
 
     /** Speed to the exit server: 8 s download, then 8 s upload, shown as it goes. */
@@ -449,11 +450,11 @@ class SimpleActivity : Activity() {
         speedRunning = true
         Thread {
             val done = mutableListOf<String>()
-            fun show(extra: String?) = ui.post { tvSpeed.text = "Скорость до сервера:\n" + (done + listOfNotNull(extra)).joinToString("\n") }
+            fun show(extra: String?) = ui.post { tvSpeed.text = tr("Скорость до сервера:\n") + (done + listOfNotNull(extra)).joinToString("\n") }
             for (download in listOf(true, false)) {
-                val dir = if (download) "↓ приём" else "↑ отдача"
+                val dir = if (download) tr("↓ приём") else tr("↑ отдача")
                 show("$dir: …")
-                done += Ygg.speedTest(download, 8) { show("$dir: %.1f Мбит/с …".format(it)) }
+                done += Ygg.speedTest(download, 8) { show(tr("%1\$s: %%.1f Мбит/с …", dir).format(it)) }
                 show(null)
             }
             speedRunning = false
@@ -467,39 +468,39 @@ class SimpleActivity : Activity() {
         for ((addr, o) in dRttMap) if (!o.isNull("avg_ms")) ping[addr] = o.optLong("avg_ms")
         val all = (State.trackerExits.map { it.first } + prefs.serverList()).mapNotNull { Ygg.serverFromText(it) }.distinct()
         val others = all.filter { it != cur }.sortedWith(compareBy({ prefs.ckrWanted && it !in State.ckrServers }, { ping[it] ?: Long.MAX_VALUE }))
-        if (others.isEmpty()) { toast("Других серверов пока нет"); return }
-        val labels = listOf("Автоматически: лучший по пингу") + others.map { s ->
-            (if (prefs.isOwn(s)) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + prefs.label(s) + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") +
+        if (others.isEmpty()) { toast(tr("Других серверов пока нет")); return }
+        val labels = listOf(tr("Автоматически: лучший по пингу")) + others.map { s ->
+            (if (prefs.isOwn(s)) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + prefs.label(s) + "  —  " + (ping[s]?.let { tr("%1\$s мс", it) } ?: tr("нет ответа")) +
                 (if (s in State.ckrServers) "  · CKR" else "")
         }
         android.app.AlertDialog.Builder(this)
-            .setTitle("Сменить сервер")
+            .setTitle(tr("Сменить сервер"))
             .setItems(labels.toTypedArray()) { _, i ->
                 val usable = others.filter { prefs.isOwn(it) || it in State.trackerPublic }
-                val target = if (i == 0) usable.firstOrNull { ping.containsKey(it) } ?: usable.firstOrNull() ?: run { toast("Нет других серверов с доступом"); return@setItems }
+                val target = if (i == 0) usable.firstOrNull { ping.containsKey(it) } ?: usable.firstOrNull() ?: run { toast(tr("Нет других серверов с доступом")); return@setItems }
                     else others[i - 1]
                 startFlow { switchFlow(target) }
             }
-            .setNegativeButton("Отмена", null)
+            .setNegativeButton(tr("Отмена"), null)
             .show()
     }
 
     /** Switch the exit without touching the node (it keeps its peers and paths). */
     private fun switchFlow(server: String) {
-        headline("Переключаю сервер…")
-        say("Переключаю на $server")
-        say("Проверяю доступ")
+        headline(tr("Переключаю сервер…"))
+        say(tr("Переключаю на %1\$s", server))
+        say(tr("Проверяю доступ"))
         val (acc, accExp) = Ygg.probeAccess(server, prefs.keyFor(server), ask = false)
         prefs.noteAccess(server, acc, accExp)
         if (acc != "ok") throw Stop("$server: ${Ygg.accessText(acc)}")
-        finish("доступ есть")
-        if (!useServer(server)) throw Stop("VPN к серверу $server не поднялся")
-        waitFor(45) { Ygg.probeExit() } ?: throw Stop("сервер $server не отвечает через туннель")
-        finish("на связи")
-        say("Проверяю выход в интернет")
+        finish(tr("доступ есть"))
+        if (!useServer(server)) throw Stop(tr("VPN к серверу %1\$s не поднялся", server))
+        waitFor(45) { Ygg.probeExit() } ?: throw Stop(tr("сервер %1\$s не отвечает через туннель", server))
+        finish(tr("на связи"))
+        say(tr("Проверяю выход в интернет"))
         val net = Ygg.checkInternet()
-        if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
-        finish("работает")
+        if (!net.startsWith("OK")) throw Stop(tr("интернет через сервер не открывается: %1\$s", net))
+        finish(tr("работает"))
         connectedNow()
     }
 
@@ -515,9 +516,9 @@ class SimpleActivity : Activity() {
         if (!::btn.isInitialized) return
         val busy = flow != null
         btn.text = when {
-            busy -> "Отменить"
-            prefs.vpnEnabled -> "Отключиться"
-            else -> "Подключиться"
+            busy -> tr("Отменить")
+            prefs.vpnEnabled -> tr("Отключиться")
+            else -> tr("Подключиться")
         }
         val connected = !busy && prefs.vpnEnabled && State.vpnActive
         dash.visibility = if (connected) android.view.View.VISIBLE else android.view.View.GONE
@@ -525,10 +526,10 @@ class SimpleActivity : Activity() {
         if (busy) return
         if (connected) renderDash()
         tvState.text = when {
-            prefs.vpnEnabled && State.vpnActive -> "Подключено ✔"
-            prefs.vpnEnabled -> "VPN включается…"
-            !State.nodeRunning -> "Не подключено"
-            else -> "Не подключено · узел Yggdrasil работает"
+            prefs.vpnEnabled && State.vpnActive -> tr("Подключено ✔")
+            prefs.vpnEnabled -> tr("VPN включается…")
+            !State.nodeRunning -> tr("Не подключено")
+            else -> tr("Не подключено · узел Yggdrasil работает")
         }
     }
 
@@ -539,7 +540,7 @@ class SimpleActivity : Activity() {
                 prefs.vpnEnabled = false
                 YggService.send(this, YggService.ACTION_RECONCILE)
                 stepsBox.removeAllViews()
-                say("VPN отключён", Mark.DONE)
+                say(tr("VPN отключён"), Mark.DONE)
                 render()
             }
             else -> {
@@ -555,7 +556,7 @@ class SimpleActivity : Activity() {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQ_VPN) {
-            if (resultCode == RESULT_OK) startFlow() else toast("Без разрешения на VPN подключиться нельзя")
+            if (resultCode == RESULT_OK) startFlow() else toast(tr("Без разрешения на VPN подключиться нельзя"))
         }
         if (requestCode == REQ_SCAN && resultCode == RESULT_OK) {
             data?.getStringExtra(ScanActivity.EXTRA_TEXT)?.let { saveKey(it, "") }
@@ -588,7 +589,7 @@ class SimpleActivity : Activity() {
         YggService.send(this, YggService.ACTION_RECONCILE)
         stepsBox.removeAllViews()
         current = null
-        State.log("simple", "подключение отменено")
+        State.log("simple", tr("подключение отменено"))
         render()
     }
 
@@ -646,19 +647,19 @@ class SimpleActivity : Activity() {
                 body()
             } catch (e: Stop) {
                 finish(e.message ?: "", ok = false)
-                say(e.message ?: "не удалось", Mark.FAIL)
-                headline("Не подключено")
+                say(e.message ?: tr("не удалось"), Mark.FAIL)
+                headline(tr("Не подключено"))
                 if (e is NoAccess && alive()) ui.post {
                     stepsBox.addView(Button(this).apply {
-                        text = "Запросить доступ у владельца…"; isAllCaps = false
+                        text = tr("Запросить доступ у владельца…"); isAllCaps = false
                         setOnClickListener { serversScreen() }
                     })
                 }
             } catch (e: InterruptedException) {
                 // cancelled: cancelFlow has already reset the screen
             } catch (e: Exception) {
-                finish("ошибка: ${e.message}", ok = false)
-                headline("Не подключено")
+                finish(tr("ошибка: %1\$s", e.message), ok = false)
+                headline(tr("Не подключено"))
             } finally {
                 if (alive()) {
                     flow = null
@@ -692,62 +693,62 @@ class SimpleActivity : Activity() {
         return (0 until a.length()).map { a.getJSONObject(it) }
     }
 
-    private fun host(p: org.json.JSONObject) = p.optString("uri").substringAfter("://").substringBefore('?').ifEmpty { "входящий" }
+    private fun host(p: org.json.JSONObject) = p.optString("uri").substringAfter("://").substringBefore('?').ifEmpty { tr("входящий") }
 
     private fun connectFlow() {
-        headline("Подключаюсь…")
+        headline(tr("Подключаюсь…"))
         // 1. The node.
-        say("Запускаю узел Yggdrasil")
-        val stats = waitFor(40) { Ygg.fetchStats() } ?: throw Stop("узел не запустился (см. логи в расширенном режиме)")
-        finish("адрес ${stats.optJSONObject("node")?.optString("address") ?: "?"}")
+        say(tr("Запускаю узел Yggdrasil"))
+        val stats = waitFor(40) { Ygg.fetchStats() } ?: throw Stop(tr("узел не запустился (см. логи в расширенном режиме)"))
+        finish(tr("адрес %1\$s", stats.optJSONObject("node")?.optString("address") ?: "?"))
 
         // 2. The network.
-        say("Жду подключения к сети Yggdrasil")
+        say(tr("Жду подключения к сети Yggdrasil"))
         val joined = waitFor(90) {
             val n = Ygg.fetchStats()?.optJSONObject("node") ?: return@waitFor null
             val peers = peersList().size
             if (peers > 0 && n.optString("root") != n.optString("public_key")) peers else null
-        } ?: throw Stop("нет связи с сетью: ни один пир не отвечает (проверьте интернет)")
-        finish("пиров на связи: $joined")
+        } ?: throw Stop(tr("нет связи с сетью: ни один пир не отвечает (проверьте интернет)"))
+        finish(tr("пиров на связи: %1\$s", joined))
 
         // A server we hold a key for: that one (and its own peer), no search among the others.
         if (keyedFlow()) return
 
         // 3. Peers.
-        say("Ищу лучший пир для подключения")
+        say(tr("Ищу лучший пир для подключения"))
         pause(3000) // the node measures fresh peers first
         val peers = peersList().filter { !it.isNull("rtt_ms") }.sortedBy { it.optLong("rtt_ms") }
-        if (peers.isEmpty()) finish("пинг пиров ещё измеряется") else {
-            finish("лучший ${host(peers[0])} (${peers[0].optLong("rtt_ms")} мс)")
-            for (p in peers.take(5)) say("${host(p)} — ${p.optLong("rtt_ms")} мс", Mark.INFO)
+        if (peers.isEmpty()) finish(tr("пинг пиров ещё измеряется")) else {
+            finish(tr("лучший %1\$s (%2\$s мс)", host(peers[0]), peers[0].optLong("rtt_ms")))
+            for (p in peers.take(5)) say(tr("%1\$s — %2\$s мс", host(p), p.optLong("rtt_ms")), Mark.INFO)
         }
 
         // 4. Trackers.
-        say("Жду информацию от трекера")
+        say(tr("Жду информацию от трекера"))
         val exits = LinkedHashMap<String, Long>()
         val public = HashSet<String>()
         var answered: String? = null
         for (t in prefs.trackerList()) {
             if (!alive()) throw InterruptedException()
-            say("спрашиваю трекер $t", Mark.INFO)
+            say(tr("спрашиваю трекер %1\$s", t), Mark.INFO)
             val v = Ygg.fetchTracker(t, "/exits") ?: Ygg.fetchTracker(t, "/exits") ?: continue
             answered = answered ?: t
             Ygg.parseExits(v, exits, public)
             if (exits.isNotEmpty()) break
         }
-        if (answered == null) finish("трекеры не ответили", ok = false) else finish("ответил $answered")
+        if (answered == null) finish(tr("трекеры не ответили"), ok = false) else finish(tr("ответил %1\$s", answered))
 
-        say("Получаю список серверов для выхода")
+        say(tr("Получаю список серверов для выхода"))
         prefs.serverList().forEach { exits.putIfAbsent(it, -1) }
-        if (exits.isEmpty()) throw Stop("серверов нет: трекеры не ответили, сохранённых серверов нет")
+        if (exits.isEmpty()) throw Stop(tr("серверов нет: трекеры не ответили, сохранённых серверов нет"))
         State.trackerExits = exits.map { it.key to it.value }
         if (answered != null) State.trackerPublic = public
         State.trackerAt = System.currentTimeMillis()
-        State.trackerStatus = "серверов ${exits.size}"
-        finish("серверов: ${exits.size}")
+        State.trackerStatus = tr("серверов %1\$s", exits.size)
+        finish(tr("серверов: %1\$s", exits.size))
 
         // 5. Ping to every server (the node pings everything in its monitor list).
-        say("Измеряю пинг до серверов")
+        say(tr("Измеряю пинг до серверов"))
         Ygg.writeMonitors(filesDir, prefs)
         val ping = HashMap<String, Long>()
         val deadline = System.currentTimeMillis() + 25_000
@@ -760,14 +761,14 @@ class SimpleActivity : Activity() {
         }
         // Exits with CKR first (the whole IP traffic through them), then by ping.
         val pinged = ping.entries.sortedWith(compareBy({ prefs.ckrWanted && it.key !in State.ckrServers }, { it.value }))
-        if (pinged.isEmpty()) throw Stop("ни один сервер не ответил на пинг")
-        finish("ответили ${pinged.size} из ${exits.size}")
-        for ((a, ms) in pinged) say("$a — $ms мс", Mark.INFO)
-        for (a in exits.keys.filter { it !in ping }) say("$a — нет ответа", Mark.INFO)
+        if (pinged.isEmpty()) throw Stop(tr("ни один сервер не ответил на пинг"))
+        finish(tr("ответили %1\$s из %2\$s", pinged.size, exits.size))
+        for ((a, ms) in pinged) say(tr("%1\$s — %2\$s мс", a, ms), Mark.INFO)
+        for (a in exits.keys.filter { it !in ping }) say(tr("%1\$s — нет ответа", a), Mark.INFO)
 
         // 5b. Access: servers are closed — ours are those with our key and the public ones.
         // Nothing is sent to a server we have no key for (no request behind the user's back).
-        say("Проверяю доступ к серверам")
+        say(tr("Проверяю доступ к серверам"))
         val access = java.util.concurrent.ConcurrentHashMap<String, String>()
         pinged.take(12).map { (a, _) ->
             Thread {
@@ -779,54 +780,54 @@ class SimpleActivity : Activity() {
         if (!alive()) throw InterruptedException()
         val ranked = pinged.filter { access[it.key] == "ok" }
         for ((a, code) in access) if (code != "ok" && (prefs.isOwn(a) || code == "pending")) say("$a: ${Ygg.accessText(code)}", Mark.INFO)
-        if (ranked.isEmpty()) throw NoAccess("нет серверов, к которым есть доступ. Серверы закрыты: получите ключ владельца или запросите доступ («Серверы и ключи» внизу)")
-        finish("доступ есть к ${ranked.size} из ${pinged.size}")
+        if (ranked.isEmpty()) throw NoAccess(tr("нет серверов, к которым есть доступ. Серверы закрыты: получите ключ владельца или запросите доступ («Серверы и ключи» внизу)"))
+        finish(tr("доступ есть к %1\$s из %2\$s", ranked.size, pinged.size))
 
         // 6. Speed of the best ones by ping: connect to each briefly and measure.
-        say("Ищу лучший сервер для выхода (пинг и скорость)")
+        say(tr("Ищу лучший сервер для выхода (пинг и скорость)"))
         val withCkr = ranked.filter { prefs.ckrWanted && it.key in State.ckrServers }
         val candidates = (withCkr.ifEmpty { ranked }).take(3).map { it.key }
         val speed = HashMap<String, Double>()
         for (a in candidates) {
-            headline("Проверяю сервер $a")
-            say("подключаюсь к $a", Mark.INFO)
-            if (!useServer(a)) { say("$a: VPN к нему не поднялся", Mark.INFO); continue }
+            headline(tr("Проверяю сервер %1\$s", a))
+            say(tr("подключаюсь к %1\$s", a), Mark.INFO)
+            if (!useServer(a)) { say(tr("%1\$s: VPN к нему не поднялся", a), Mark.INFO); continue }
             val ok = waitFor(45) { Ygg.probeExit() }
-            if (ok == null) { say("$a: через туннель не отвечает", Mark.INFO); continue }
+            if (ok == null) { say(tr("%1\$s: через туннель не отвечает", a), Mark.INFO); continue }
             var mbps = 0.0
             Ygg.speedTest(true, 4) { mbps = it }
             speed[a] = mbps
-            say("$a: пинг ${ping[a]} мс, приём %.1f Мбит/с".format(mbps), Mark.INFO)
+            say(tr("%1\$s: пинг %2\$s мс, приём %%.1f Мбит/с", a, ping[a]).format(mbps), Mark.INFO)
         }
         val best = candidates.maxByOrNull { (speed[it] ?: -1.0) * 1000 - (ping[it] ?: 9999) } ?: candidates.first()
-        finish("$best · ${ping[best]} мс" + (speed[best]?.let { " · %.1f Мбит/с".format(it) } ?: ""))
+        finish(tr("%1\$s · %2\$s мс", best, ping[best]) + (speed[best]?.let { tr(" · %.1f Мбит/с").format(it) } ?: ""))
 
         // 7. The VPN through the chosen server.
-        say("Подключаю VPN через $best")
-        headline("Подключаю VPN…")
-        if (!useServer(best)) throw Stop("VPN не поднялся (см. логи в расширенном режиме)")
-        waitFor(45) { Ygg.probeExit() } ?: throw Stop("сервер $best не отвечает через туннель")
-        finish("туннель работает")
+        say(tr("Подключаю VPN через %1\$s", best))
+        headline(tr("Подключаю VPN…"))
+        if (!useServer(best)) throw Stop(tr("VPN не поднялся (см. логи в расширенном режиме)"))
+        waitFor(45) { Ygg.probeExit() } ?: throw Stop(tr("сервер %1\$s не отвечает через туннель", best))
+        finish(tr("туннель работает"))
 
         // 8. The best peer towards the server: the node swaps peers while the ping is high.
-        say("Подбираю пир с меньшим пингом и лучшей скоростью до сервера")
+        say(tr("Подбираю пир с меньшим пингом и лучшей скоростью до сервера"))
         val swap0 = State.lastSwap
         val until = System.currentTimeMillis() + 25_000
         var lastRtt: String? = null
         while (System.currentTimeMillis() < until) {
             val r = State.serverRtt
-            if (r != null && r != lastRtt) { lastRtt = r; headline("Пинг до сервера: $r") }
-            if (State.lastSwap != null && State.lastSwap != swap0) say("замена пира: ${State.lastSwap}", Mark.INFO)
+            if (r != null && r != lastRtt) { lastRtt = r; headline(tr("Пинг до сервера: %1\$s", r)) }
+            if (State.lastSwap != null && State.lastSwap != swap0) say(tr("замена пира: %1\$s", State.lastSwap), Mark.INFO)
             pause(2500)
         }
         val busiest = peersList().maxByOrNull { it.optLong("rx_bps") + it.optLong("tx_bps") }
-        finish("пинг до сервера ${State.serverRtt ?: "?"}" + (busiest?.let { " через ${host(it)}" } ?: ""))
+        finish(tr("пинг до сервера %1\$s", State.serverRtt ?: "?") + (busiest?.let { tr(" через %1\$s", host(it)) } ?: ""))
 
         // 9. Internet.
-        say("Проверяю выход в интернет")
+        say(tr("Проверяю выход в интернет"))
         val net = Ygg.checkInternet()
-        if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
-        finish("работает")
+        if (!net.startsWith("OK")) throw Stop(tr("интернет через сервер не открывается: %1\$s", net))
+        finish(tr("работает"))
         connectedNow()
     }
 
@@ -840,7 +841,7 @@ class SimpleActivity : Activity() {
         val cur = Ygg.serverFromText(prefs.server)
         val keyed = (listOfNotNull(cur) + prefs.serverList().mapNotNull { Ygg.serverFromText(it) }).distinct().filter { prefs.isOwn(it) }
         if (keyed.isEmpty()) return false
-        say("Есть свой сервер (ключ или одобренный доступ) — другие не ищу")
+        say(tr("Есть свой сервер (ключ или одобренный доступ) — другие не ищу"))
         var server: String? = null
         for (a in keyed) {
             val (code, exp) = Ygg.probeAccess(a, prefs.keyFor(a), ask = false)
@@ -850,32 +851,32 @@ class SimpleActivity : Activity() {
             say("$a: ${Ygg.accessText(code)}", Mark.INFO)
         }
         if (server == null) {
-            finish("ни один не пускает — ищу другие серверы", ok = false)
+            finish(tr("ни один не пускает — ищу другие серверы"), ok = false)
             return false
         }
         // The peer the server announced in its answer: saved now, so the node gets it at once.
         State.serverPeers[server]?.let { if (it != prefs.serverPeers(server)) prefs.setServerPeers(server, it) }
         val own = prefs.serverPeers(server)
-        finish(server + if (own.isNotEmpty()) " · свой пир" else "")
+        finish(server + if (own.isNotEmpty()) tr(" · свой пир") else "")
 
-        say("Подключаю VPN через $server")
-        headline("Подключаю VPN…")
-        if (!useServer(server)) throw Stop("VPN не поднялся (см. логи в расширенном режиме)")
-        waitFor(45) { Ygg.probeExit() } ?: throw Stop("сервер $server не отвечает через туннель")
-        finish("туннель работает · ${Ygg.modeText()}")
+        say(tr("Подключаю VPN через %1\$s", server))
+        headline(tr("Подключаю VPN…"))
+        if (!useServer(server)) throw Stop(tr("VPN не поднялся (см. логи в расширенном режиме)"))
+        waitFor(45) { Ygg.probeExit() } ?: throw Stop(tr("сервер %1\$s не отвечает через туннель", server))
+        finish(tr("туннель работает · %1\$s", Ygg.modeText()))
 
         if (own.isNotEmpty()) {
-            say("Подключаюсь к пиру сервера")
+            say(tr("Подключаюсь к пиру сервера"))
             val hosts = own.map { it.substringAfter("://").substringBefore('?') }
             val p = waitFor(40) { peersList().firstOrNull { host(it) in hosts } }
-            if (p != null) finish("${host(p)}" + (if (!p.isNull("rtt_ms")) " (${p.optLong("rtt_ms")} мс)" else ""))
-            else finish("пир сервера не отвечает — работаю через обычные пиры", ok = false)
+            if (p != null) finish("${host(p)}" + (if (!p.isNull("rtt_ms")) tr(" (%1\$s мс)", p.optLong("rtt_ms")) else ""))
+            else finish(tr("пир сервера не отвечает — работаю через обычные пиры"), ok = false)
         }
 
-        say("Проверяю выход в интернет")
+        say(tr("Проверяю выход в интернет"))
         val net = Ygg.checkInternet()
-        if (!net.startsWith("OK")) throw Stop("интернет через сервер не открывается: $net")
-        finish("работает")
+        if (!net.startsWith("OK")) throw Stop(tr("интернет через сервер не открывается: %1\$s", net))
+        finish(tr("работает"))
         connectedNow()
         return true
     }

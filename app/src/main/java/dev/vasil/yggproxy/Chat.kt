@@ -41,7 +41,7 @@ object Chat {
         var o = 0
         while (o < n) {
             val r = i.read(b, o, n - o)
-            if (r < 0) throw ChatError("сервер закрыл соединение")
+            if (r < 0) throw ChatError(tr("сервер закрыл соединение"))
             o += r
         }
         return b
@@ -57,20 +57,20 @@ object Chat {
             val i = s.getInputStream()
             o.write(byteArrayOf(5, 1, 0)); readN(i, 2)
             o.write(byteArrayOf(5, 1, 0, 4) + a + byteArrayOf((Ygg.PORT shr 8).toByte(), (Ygg.PORT and 0xff).toByte()))
-            if (readN(i, 22)[1].toInt() != 0) throw ChatError("сервер недоступен")
+            if (readN(i, 22)[1].toInt() != 0) throw ChatError(tr("сервер недоступен"))
             o.write(byteArrayOf(5, 1, 0x80.toByte()))
-            if (readN(i, 2)[1].toInt() and 0xff != 0x80) throw ChatError("сервер не поддерживает чат")
+            if (readN(i, 2)[1].toInt() and 0xff != 0x80) throw ChatError(tr("сервер не поддерживает чат"))
             return body(o, i)
         }
     }
 
     private fun status(i: InputStream) {
         val r = readN(i, 2)
-        if (r[0].toInt() != 2) throw ChatError("сервер не поддерживает чат — его нужно обновить")
+        if (r[0].toInt() != 2) throw ChatError(tr("сервер не поддерживает чат — его нужно обновить"))
         when (r[1].toInt()) {
             0 -> {}
-            1 -> throw ChatError("чат открыт тем, у кого есть доступ или запрос доступа")
-            else -> throw ChatError("сообщение слишком длинное или их слишком много — подождите минуту")
+            1 -> throw ChatError(tr("чат открыт тем, у кого есть доступ или запрос доступа"))
+            else -> throw ChatError(tr("сообщение слишком длинное или их слишком много — подождите минуту"))
         }
     }
 
@@ -92,7 +92,7 @@ object Chat {
     fun send(server: String, text: String) {
         val b = text.trim().toByteArray(Charsets.UTF_8)
         if (b.isEmpty()) return
-        if (b.size > 1000) throw ChatError("сообщение длиннее 1000 байт")
+        if (b.size > 1000) throw ChatError(tr("сообщение длиннее 1000 байт"))
         exchange(server) { o, i ->
             o.write(byteArrayOf(2, 2, (b.size shr 8).toByte(), b.size.toByte()) + b)
             status(i)
@@ -104,7 +104,7 @@ object Chat {
         val p = ProcessBuilder(listOf("${ctx.applicationInfo.nativeLibraryDir}/libygghelper.so", "chat", File(ctx.filesDir, "access.json").path) + args)
             .redirectErrorStream(true).start()
         val out = p.inputStream.bufferedReader().readText().trim()
-        if (p.waitFor() != 0) throw ChatError(out.removePrefix("ygghelper: ").ifEmpty { "ошибка" })
+        if (p.waitFor() != 0) throw ChatError(out.removePrefix("ygghelper: ").ifEmpty { tr("ошибка") })
         return out
     }
 
@@ -137,10 +137,10 @@ object Chat {
         val scroll = ScrollView(act).apply { addView(list) }
         val status = TextView(act).apply { textSize = 12.5f; setTextColor(Color.DKGRAY); setPadding(dp(12), dp(2), dp(12), dp(2)); text = hint }
         val input = EditText(act).apply {
-            this.hint = "сообщение"; textSize = 15f; maxLines = 4
+            this.hint = tr("сообщение"); textSize = 15f; maxLines = 4
             filters = arrayOf(android.text.InputFilter.LengthFilter(500))
         }
-        val btn = Button(act).apply { text = "Отправить"; isAllCaps = false }
+        val btn = Button(act).apply { text = tr("Отправить"); isAllCaps = false }
         val bottom = LinearLayout(act).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), 0, dp(8), 0)
             addView(input, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -200,17 +200,17 @@ object Chat {
             val text = input.text.toString().trim()
             if (text.isEmpty()) return@setOnClickListener
             btn.isEnabled = false
-            status.text = "отправляю…"
+            status.text = tr("отправляю…")
             Thread {
                 try {
                     send(text)
                     ui.post { input.setText(""); btn.isEnabled = true; status.text = ""; refresh() }
                 } catch (e: Exception) {
-                    ui.post { btn.isEnabled = true; status.text = "не отправлено: " + (e.message ?: e.javaClass.simpleName) }
+                    ui.post { btn.isEnabled = true; status.text = tr("не отправлено: ") + (e.message ?: e.javaClass.simpleName) }
                 }
             }.apply { isDaemon = true; start() }
         }
-        val d = AlertDialog.Builder(act).setTitle(title).setView(root).setNegativeButton("Закрыть", null).create()
+        val d = AlertDialog.Builder(act).setTitle(title).setView(root).setNegativeButton(tr("Закрыть"), null).create()
         d.setOnDismissListener { open = false; ui.removeCallbacks(poll) }
         d.show()
         ui.post(poll)
