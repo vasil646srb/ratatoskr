@@ -26,6 +26,9 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy access revoke ID    удалить ключ (доступ сразу закрыт)
   yggproxy access public on|off  сделать сервер публичным (после предупреждения) или закрыть
   yggproxy clients             подключённые клиенты и их трафик
+  yggproxy chat                чат с клиентами: в терминале — список разговоров, номер, ответ
+  yggproxy chat list           разговоры (для скриптов)
+  yggproxy chat send АДРЕС ТЕКСТ  ответить клиенту
   yggproxy limit               показать ограничения скорости
   yggproxy limit total|client DOWN UP
                                ограничить, Мбит/с (0 — без ограничения): весь сервер или
@@ -38,6 +41,8 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
   yggproxy set ckr_exit on|off  Linux: ещё и выход CKR — IP-туннель, совместимый с Yggdrasil-ng
                                (пересылка и NAT на этой машине; доступ — те же ключи)
   yggproxy set ckr_exit_ipv6 on|off  выход CKR и для IPv6 (включает пересылку IPv6)
+  yggproxy set server_name НАЗВАНИЕ  название сервера: клиенты видят его вместо адреса
+                               (до 40 символов; убрать: yggproxy set server_name -)
 
 Клиент (VPN):
   yggproxy servers             серверы выхода: сохранённые и от трекеров, с пингом
@@ -137,6 +142,9 @@ fn status() -> Result<(), String> {
             human(sv["tx"].as_u64().unwrap_or(0)),
             human(sv["rx"].as_u64().unwrap_or(0))
         );
+        if let Some(n) = sv["name"].as_str().filter(|n| !n.is_empty()) {
+            println!("  название: {n}");
+        }
         if sv["ckr"].as_bool() == Some(true) {
             println!("  выход CKR: включён (IP-туннель, клиенты {}){}", "10.77.0.0/16", if sv["ckr_ipv6"].as_bool() == Some(true) { ", и IPv6" } else { ", только IPv4" });
         }
@@ -177,6 +185,9 @@ fn status() -> Result<(), String> {
             human(c["rx"].as_u64().unwrap_or(0)),
             human(c["tx"].as_u64().unwrap_or(0))
         );
+        if let Some(n) = c["server_name"].as_str() {
+            println!("  сервер: «{n}»");
+        }
         if c["ckr"].as_bool() == Some(true) {
             println!("  режим: туннель CKR (весь IP-трафик), адрес {}", c["ckr_address"].as_str().unwrap_or("?"));
         } else if c["ckr_mode"].as_str() == Some("auto") {
@@ -574,6 +585,97 @@ fn access_action(r: &Value, item: &AccessItem) -> Option<Value> {
     }
 }
 
+/// When a chat line was written, for the console.
+fn chat_time(t_ms: u64, now_ms: u64) -> String {
+    let ago = now_ms.saturating_sub(t_ms) / 1000;
+    if ago < 60 { "только что".into() } else { format!("{} назад", dur(ago)) }
+}
+
+fn print_lines(lines: &[Value], now: u64) {
+    for l in lines {
+        let who = if l["owner"].as_bool() == Some(true) { "Вы" } else { "Клиент" };
+        println!("  [{}] {who}: {}", chat_time(l["t"].as_u64().unwrap_or(0), now), l["text"].as_str().unwrap_or("").replace('\n', "\n      "));
+    }
+}
+
+/// `yggproxy chat`: the owner's side of the chat with clients.
+fn chat(args: &[String]) -> Result<(), String> {
+    use std::io::IsTerminal;
+    let a = |i: usize| args.get(i).map(|s| s.as_str());
+    match a(1) {
+        Some("send") => {
+            let addr = a(2).ok_or("yggproxy chat send АДРЕС ТЕКСТ")?;
+            let text = args.get(3..).map(|t| t.join(" ")).unwrap_or_default();
+            api::request(json!({"cmd": "chat", "op": "send", "addr": addr, "text": text}))?;
+            println!("Отправлено.");
+            return Ok(());
+        }
+        Some("list") | None if !(a(1).is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) => {
+            let r = api::request(json!({"cmd": "chat", "op": "list"}))?;
+            let now = r["now"].as_u64().unwrap_or(0);
+            let chats = r["chats"].as_array().cloned().unwrap_or_default();
+            if chats.is_empty() {
+                println!("Сообщений от клиентов нет.");
+            }
+            for c in chats {
+                println!("{}  {}  [{}] {}", c["addr"].as_str().unwrap_or(""), c["name"].as_str().unwrap_or(""),
+                    chat_time(c["last"]["t"].as_u64().unwrap_or(0), now), c["last"]["text"].as_str().unwrap_or(""));
+            }
+            return Ok(());
+        }
+        None => {}
+        Some(o) => return Err(format!("неизвестная команда chat {o}")),
+    }
+    loop {
+        let r = api::request(json!({"cmd": "chat", "op": "list"}))?;
+        let now = r["now"].as_u64().unwrap_or(0);
+        let chats = r["chats"].as_array().cloned().unwrap_or_default();
+        println!();
+        if chats.is_empty() {
+            println!("Сообщений от клиентов пока нет. Клиент пишет из приложения: «Чат с сервером».");
+            return Ok(());
+        }
+        println!("Разговоры ({}):", chats.len());
+        for (i, c) in chats.iter().enumerate() {
+            let last = &c["last"];
+            let who = if last["owner"].as_bool() == Some(true) { "вы: " } else { "" };
+            let text: String = last["text"].as_str().unwrap_or("").chars().take(60).collect();
+            println!("{:>3}. {}\n     [{}] {who}{}", i + 1, c["name"].as_str().unwrap_or(""), chat_time(last["t"].as_u64().unwrap_or(0), now), text.replace('\n', " "));
+        }
+        println!("\nНомер — открыть разговор · Enter — выход");
+        let Some(c) = ask("> ") else { return Ok(()) };
+        if c.is_empty() {
+            return Ok(());
+        }
+        let Some(chat) = c.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| chats.get(i)) else {
+            println!("Нет такого номера.");
+            continue;
+        };
+        let addr = chat["addr"].as_str().unwrap_or("").to_string();
+        let h = api::request(json!({"cmd": "chat", "op": "history", "addr": addr}))?;
+        println!("\n{}:", h["name"].as_str().unwrap_or(&addr));
+        let mut last_t = 0;
+        let lines = h["lines"].as_array().cloned().unwrap_or_default();
+        print_lines(&lines, now);
+        last_t = lines.last().and_then(|l| l["t"].as_u64()).unwrap_or(last_t);
+        loop {
+            let Some(text) = ask("Ответ (Enter — к списку): ") else { return Ok(()) };
+            if text.is_empty() {
+                break;
+            }
+            if let Err(e) = api::request(json!({"cmd": "chat", "op": "send", "addr": addr, "text": text})) {
+                println!("Ошибка: {e}");
+                continue;
+            }
+            // What arrived meanwhile, and the answer itself.
+            let h = api::request(json!({"cmd": "chat", "op": "history", "addr": addr, "since": last_t}))?;
+            let lines = h["lines"].as_array().cloned().unwrap_or_default();
+            print_lines(&lines, crate::chat::now_ms());
+            last_t = lines.last().and_then(|l| l["t"].as_u64()).unwrap_or(last_t);
+        }
+    }
+}
+
 fn approve(addr: &str, name: &str) -> Option<Value> {
     let days = ask_days(30)?;
     let n = ask(&format!("Имя (Enter — «{name}»): "))?;
@@ -639,10 +741,12 @@ fn set(key: &str, val: &str) -> Result<(), String> {
             "listen" => c.network.listen = if val.trim() == "off" { 0 } else { val.trim().parse().unwrap_or(c.network.listen) },
             "peer_host" => c.network.peer_host = if val.trim() == "auto" { String::new() } else { val.trim().to_string() },
             "ckr_exit_ipv6" => c.server.ckr_ipv6 = b.clone().unwrap_or(c.server.ckr_ipv6),
+            "server_name" if val.trim() == "-" => c.server.name.clear(),
+            "server_name" => c.server.name = val.chars().filter(|c| !c.is_control()).take(40).collect::<String>().trim().to_string(),
             _ => {}
         }
     })?;
-    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis", "ckr", "ckr_address", "ckr_dns", "ckr_exit", "ckr_exit_ipv6", "listen", "peer_host"];
+    let known = ["keep_node", "trackers", "use_trackers", "rtt_limit", "swap_interval", "swap_settle", "target", "lan_target", "lan_discovery", "public_peers", "peers", "extra_args", "udp", "ipv6", "ygg_sites", "alfis", "ckr", "ckr_address", "ckr_dns", "ckr_exit", "ckr_exit_ipv6", "server_name", "listen", "peer_host"];
     if !known.contains(&key) {
         return Err(format!("неизвестная настройка {key}"));
     }
@@ -755,6 +859,7 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "access" => access(args),
+        "chat" => chat(args),
         "request" => {
             let addr = a(1).and_then(|s| config::parse_server(s)).ok_or("yggproxy request АДРЕС [СООБЩЕНИЕ]")?;
             let msg = args.get(2..).map(|m| m.join(" ")).unwrap_or_default();
@@ -824,7 +929,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "set" => match (a(1), a(2)) {
-            (Some(k), Some(v)) => set(k, v),
+            // A server's name may have spaces: the rest of the line.
+            (Some(k), Some(_)) => set(k, &args[2..].join(" ")),
             _ => Err("yggproxy set КЛЮЧ ЗНАЧЕНИЕ".into()),
         },
         "exits" | "trackers" => {

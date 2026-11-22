@@ -97,7 +97,35 @@ class Prefs(ctx: Context) {
             }
             code in NO_ACCESS && addr in granted -> grantedText = granted.filter { it != addr }.joinToString("\n")
         }
+        // The name it told us, kept for the lists (also when it has none any more).
+        if (!code.startsWith("error")) {
+            val n = State.serverNames[addr] ?: ""
+            val m = mapOf(serverNamesText)
+            if ((m[addr] ?: "") != n) serverNamesText = mapText(if (n.isEmpty()) m - addr else m + (addr to n))
+        }
     }
+
+    /** Exit mode: what clients see instead of our address. */
+    var serverName: String get() = s("server_name", ""); set(v) = put { putString("server_name", v.trim().take(40)) }
+
+    /** Names the servers told us (one `address name` per line). */
+    private var serverNamesText: String get() = s("server_names", ""); set(v) = put { putString("server_names", v) }
+    private fun mapOf(text: String): Map<String, String> =
+        text.lines().mapNotNull { l -> l.indexOf(' ').takeIf { it > 0 }?.let { l.substring(0, it) to l.substring(it + 1) } }.toMap()
+    private fun mapText(m: Map<String, String>) = m.entries.joinToString("\n") { "${it.key} ${it.value}" }
+    fun serverNameOf(addr: String): String? = State.serverNames[addr] ?: mapOf(serverNamesText)[addr]?.takeIf { it.isNotEmpty() }
+    /** The server as people know it: its name, else its address. */
+    fun label(addr: String): String = serverNameOf(addr) ?: addr
+
+    /** Chat: the newest message time seen (opened) and notified about, per server. */
+    private var chatSeenText: String get() = s("chat_seen", ""); set(v) = put { putString("chat_seen", v) }
+    private var chatNotifiedText: String get() = s("chat_notified", ""); set(v) = put { putString("chat_notified", v) }
+    fun chatSeen(addr: String): Long = mapOf(chatSeenText)[addr]?.toLongOrNull() ?: 0L
+    fun setChatSeen(addr: String, t: Long) { if (t > chatSeen(addr)) chatSeenText = mapText(mapOf(chatSeenText) + (addr to t.toString())) }
+    fun chatNotified(addr: String): Long = maxOf(chatSeen(addr), mapOf(chatNotifiedText)[addr]?.toLongOrNull() ?: 0L)
+    fun setChatNotified(addr: String, t: Long) { chatNotifiedText = mapText(mapOf(chatNotifiedText) + (addr to t.toString())) }
+    /** Exit mode: client messages seen / notified (newest time). */
+    var ownerChatSeen: Long get() = s("owner_chat_seen", "0").toLongOrNull() ?: 0L; set(v) = put { putString("owner_chat_seen", v.toString()) }
 
     fun serverList(): List<String> = servers.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     fun addServer(addr: String) { if (addr !in serverList()) servers = (serverList() + addr).joinToString("\n") }

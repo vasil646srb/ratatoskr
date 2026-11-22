@@ -37,6 +37,7 @@
 //! `STAT server active=N total=N denied=N tx=N rx=N`, `READY ...`, `ERROR ...`.
 
 mod access;
+mod chat;
 mod limit;
 mod router;
 mod udpgw_server;
@@ -68,7 +69,8 @@ fn die(msg: &str) -> ! {
 const USAGE: &str = "usage:
   ygghelper server --socks ADDR [--udpgw ADDR] [--speedtest ADDR] [--allow-lan]
                    [--proxy-protocol] [--limits FILE] [--access FILE] [--fwmark N] [-v LEVEL]
-                   [--ckr] [--peer URI]...
+                   [--ckr] [--peer URI]... [--server-name NAME]
+  ygghelper chat ACCESS_FILE list [SEEN_MS]|history ADDR [SINCE_MS]|send ADDR TEXT
   ygghelper access FILE list|new NAME DAYS|approve ADDR DAYS [NAME]|renew ID [DAYS]|unbind ID|
                         revoke ID|deny ADDR|public on --accept-risk|public off
   ygghelper tun --ctl PATH --socks ADDR [--udpgw ADDR] [--mtu N] [--ipv6] [-v LEVEL]
@@ -102,11 +104,13 @@ struct Opts {
     ckr: bool,
     /// `--peer URI` (repeatable): this node accepts Yggdrasil peers there (told to clients).
     peers: Vec<String>,
+    /// `--server-name`: what clients see instead of the bare address (told to them).
+    server_name: Option<String>,
     verbosity: String,
 }
 
 fn parse(args: &[String]) -> Opts {
-    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, ygg_socks: None, alfis: Vec::new(), no_exit: false, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, ckr: false, peers: Vec::new(), verbosity: "info".into() };
+    let mut o = Opts { socks: None, udpgw: None, speedtest: None, proxy_protocol: false, limits: None, access: None, ygg_socks: None, alfis: Vec::new(), no_exit: false, fwmark: 0, ctl: None, name: None, dns: "virtual".into(), dns_addr: "8.8.8.8".into(), mtu: 1500, ipv6: false, allow_lan: false, ckr: false, peers: Vec::new(), server_name: None, verbosity: "info".into() };
     let mut it = args.iter();
     let addr = |v: Option<&String>, f: &str| -> SocketAddr {
         v.and_then(|s| s.parse().ok()).unwrap_or_else(|| die(&format!("{f}: want IP:PORT")))
@@ -138,6 +142,9 @@ fn parse(args: &[String]) -> Opts {
             "--ipv6" => o.ipv6 = true,
             "--allow-lan" => o.allow_lan = true,
             "--ckr" => o.ckr = true,
+            "--server-name" => {
+                o.server_name = it.next().map(|n| n.chars().filter(|c| !c.is_control()).take(40).collect::<String>().trim().to_string()).filter(|n| !n.is_empty())
+            }
             "--peer" => o.peers.push(it.next().cloned().filter(|u| u.len() <= 255).unwrap_or_else(|| die("--peer: want URI"))),
             "-v" | "--verbosity" => o.verbosity = it.next().cloned().unwrap_or_else(|| die("-v: want level")),
             "-h" | "--help" => {
@@ -153,6 +160,13 @@ fn parse(args: &[String]) -> Opts {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { die(USAGE) };
+    if cmd == "chat" {
+        match chat_cli(&args[1..]) {
+            Ok(v) => out(&v),
+            Err(e) => die(&e),
+        }
+        return;
+    }
     if cmd == "access" {
         match access_cli(&args[1..]) {
             Ok(v) => out(&v),
@@ -254,7 +268,7 @@ async fn server_main(o: Opts) -> Result<(), String> {
         tokio::spawn(g.clone().watch());
         g
     });
-    let policy = Arc::new(Policy { allow_lan: o.allow_lan, local_ok: [o.udpgw, o.speedtest].into_iter().flatten().collect(), fwmark: o.fwmark, gate, ckr: o.ckr, peers: o.peers.clone() });
+    let policy = Arc::new(Policy { allow_lan: o.allow_lan, local_ok: [o.udpgw, o.speedtest].into_iter().flatten().collect(), fwmark: o.fwmark, gate, ckr: o.ckr, peers: o.peers.clone(), name: o.server_name.clone() });
     let limit = Arc::new(tokio::sync::Semaphore::new(1024));
     loop {
         let (conn, _) = listener.accept().await.map_err(|e| format!("accept: {e}"))?;
@@ -287,6 +301,8 @@ struct Policy {
     ckr: bool,
     /// `--peer`: where the node accepts Yggdrasil peers.
     peers: Vec<String>,
+    /// `--server-name`.
+    name: Option<String>,
 }
 
 /// The access file, re-read when it changes; the exit writes it on a bind or a request.
@@ -353,6 +369,11 @@ impl Gate {
         r.unwrap_or((access::Auth::Pending, 0))
     }
 
+    /// A request from `addr` waits for the owner.
+    fn pending(&self, addr: &str) -> bool {
+        self.cur.lock().unwrap().0.requests.iter().any(|r| r.addr == addr)
+    }
+
     fn expires_of(&self, addr: &str) -> u64 {
         self.cur.lock().unwrap().0.expires_of(addr, access::now()).unwrap_or(0)
     }
@@ -360,6 +381,103 @@ impl Gate {
     fn reload_now(&self) {
         let m = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
         *self.cur.lock().unwrap() = (access::Access::load(&self.path), m);
+    }
+}
+
+/// A chat request on the 0x80 method (the leading 2 already read; see chat.rs). Who may write:
+/// a client with access, or one whose request waits for the owner.
+async fn chat_request<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(c: &mut S, policy: &Policy, addr: &str) -> std::io::Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    // One writer of chat-in.json in this process; the minute's messages per client.
+    static WRITE: Mutex<()> = Mutex::new(());
+    static RATE: std::sync::OnceLock<Mutex<HashMap<String, Vec<Instant>>>> = std::sync::OnceLock::new();
+    let mut op = [0u8; 1];
+    c.read_exact(&mut op).await?;
+    let gate = policy.gate.as_ref();
+    let allowed = gate.is_some_and(|g| g.granted(addr) || g.pending(addr));
+    let path = gate.map(|g| g.path.clone()).unwrap_or_default();
+    match op[0] {
+        1 => {
+            let mut b = [0u8; 8];
+            c.read_exact(&mut b).await?;
+            if !allowed {
+                return c.write_all(&[2, chat::ST_DENIED]).await;
+            }
+            let since = u64::from_be_bytes(b);
+            let a = addr.to_string();
+            let lines = tokio::task::spawn_blocking(move || chat::conversation(&path, &a, since, chat::SYNC_MAX)).await.unwrap_or_default();
+            let mut r = vec![2, chat::ST_OK];
+            r.extend_from_slice(&chat::encode_lines(&lines));
+            c.write_all(&r).await
+        }
+        2 => {
+            let mut l = [0u8; 2];
+            c.read_exact(&mut l).await?;
+            let len = u16::from_be_bytes(l) as usize;
+            if len > chat::MAX_TEXT * 4 {
+                return c.write_all(&[2, chat::ST_LIMIT]).await;
+            }
+            let mut text = vec![0u8; len];
+            c.read_exact(&mut text).await?;
+            if !allowed {
+                return c.write_all(&[2, chat::ST_DENIED]).await;
+            }
+            let Some(text) = chat::clean(&String::from_utf8_lossy(&text)) else { return c.write_all(&[2, chat::ST_LIMIT]).await };
+            let limited = {
+                let mut rate = RATE.get_or_init(Default::default).lock().unwrap();
+                let v = rate.entry(addr.to_string()).or_default();
+                v.retain(|t| t.elapsed() < Duration::from_secs(60));
+                let full = v.len() >= chat::PER_MINUTE;
+                if !full {
+                    v.push(Instant::now());
+                }
+                full
+            };
+            if limited {
+                return c.write_all(&[2, chat::ST_LIMIT]).await;
+            }
+            let a = addr.to_string();
+            let t = tokio::task::spawn_blocking(move || {
+                let _w = WRITE.lock().unwrap();
+                chat::append(&chat::in_path(&path), &a, &text)
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            out(&format!("CHAT {addr}"));
+            let mut r = vec![2, chat::ST_OK];
+            r.extend_from_slice(&t.to_be_bytes());
+            c.write_all(&r).await
+        }
+        _ => c.write_all(&[2, chat::ST_LIMIT]).await,
+    }
+}
+
+/// `ygghelper chat ACCESS_FILE …`: the owner's side for the Android app (JSON out).
+fn chat_cli(args: &[String]) -> Result<String, String> {
+    let path = std::path::PathBuf::from(args.first().ok_or(USAGE)?);
+    let a = |i: usize| args.get(i).map(String::as_str);
+    let num = |s: Option<&str>| s.and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    match a(1).unwrap_or("list") {
+        "list" => {
+            let v: Vec<serde_json::Value> = chat::conversations(&path, num(a(2)))
+                .into_iter()
+                .map(|(addr, last, new)| serde_json::json!({"addr": addr, "last": last, "new": new}))
+                .collect();
+            Ok(serde_json::to_string(&v).unwrap_or_default())
+        }
+        "history" => {
+            let addr = a(2).and_then(access::norm_addr).ok_or("ADDR: a Yggdrasil address")?;
+            Ok(serde_json::to_string(&chat::conversation(&path, &addr, num(a(3)), 500)).unwrap_or_default())
+        }
+        "send" => {
+            let addr = a(2).and_then(access::norm_addr).ok_or("ADDR: a Yggdrasil address")?;
+            let text = chat::clean(&args.get(3..).map(|t| t.join(" ")).unwrap_or_default()).ok_or("TEXT: 1..1000 bytes")?;
+            let t = chat::append(&chat::out_path(&path), &addr, &text).map_err(|e| e.to_string())?;
+            Ok(serde_json::json!({"t": t}).to_string())
+        }
+        _ => Err(USAGE.into()),
     }
 }
 
@@ -548,7 +666,13 @@ async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, l
             // Ratatoskr client: check / key / request, with the key's end date (see access.rs).
             c.write_all(&[5, 0x80]).await?;
             let mut v = [0u8; 3];
-            c.read_exact(&mut v).await?;
+            c.read_exact(&mut v[..1]).await?;
+            if v[0] == 2 {
+                // Chat with the owner (chat.rs).
+                chat_request(&mut c, &policy, &addr).await?;
+                return Err(std::io::Error::other("chat"));
+            }
+            c.read_exact(&mut v[1..]).await?;
             let mut user = vec![0u8; v[2] as usize];
             c.read_exact(&mut user).await?;
             let mut l = [0u8; 1];
@@ -565,14 +689,22 @@ async fn socks_session(mut c: TcpStream, policy: &Policy, stats: &ServerStats, l
             // Then what this exit offers (older clients read only the first 10 bytes):
             // bit 0 = a crypto-key routing exit (IP tunnel) on the same node; bit 1 = the node
             // takes peers, followed by `[n, (len, URI) * n]` (clients then peer with it directly).
+            // bit 2: the server's name follows as `[len, UTF-8]`; bit 3: the owner takes chat
+            // messages (chat.rs).
             let peers: Vec<&String> = policy.peers.iter().take(8).collect();
-            r.push(policy.ckr as u8 | ((!peers.is_empty() as u8) << 1));
+            let name = policy.name.as_deref().unwrap_or("").as_bytes();
+            let name = &name[..name.len().min(120)];
+            r.push(policy.ckr as u8 | ((!peers.is_empty() as u8) << 1) | ((!name.is_empty() as u8) << 2) | ((policy.gate.is_some() as u8) << 3));
             if !peers.is_empty() {
                 r.push(peers.len() as u8);
                 for u in peers {
                     r.push(u.len() as u8);
                     r.extend_from_slice(u.as_bytes());
                 }
+            }
+            if !name.is_empty() {
+                r.push(name.len() as u8);
+                r.extend_from_slice(name);
             }
             c.write_all(&r).await?;
             return Err(std::io::Error::other(format!("access check: {}", res.name())));

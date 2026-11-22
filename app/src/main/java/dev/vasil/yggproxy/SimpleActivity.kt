@@ -93,6 +93,26 @@ class SimpleActivity : Activity() {
         setContentView(root)
         if (Build.VERSION.SDK_INT >= 21) window.statusBarColor = ACCENT
         render()
+        // Android 13+: without this the owner's answer to a request (and chat messages) would
+        // arrive silently — the simple mode never asked before.
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 1)
+        }
+        intent?.getStringExtra(YggService.EXTRA_CHAT)?.let { openChat(it) }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        intent.getStringExtra(YggService.EXTRA_CHAT)?.let { openChat(it) }
+    }
+
+    /** Chat with [server]'s owner (any server we have access to or asked for it). */
+    private fun openChat(server: String) {
+        Chat.open(this, "Чат: ${prefs.label(server)}",
+            "Напишите владельцу сервера — ответ придёт сюда и уведомлением.", mineIsOwner = false,
+            load = { Chat.sync(server, it) }, send = { Chat.send(server, it) },
+            seen = { prefs.setChatSeen(server, it); prefs.setChatNotified(server, maxOf(it, prefs.chatNotified(server))) })
     }
 
     /**
@@ -141,7 +161,8 @@ class SimpleActivity : Activity() {
                 else -> Ygg.accessText(code)
             }
             box.addView(TextView(this).apply {
-                text = "$mark $addr\n${ping?.let { "$it мс · " } ?: ""}$what"
+                val name = prefs.serverNameOf(addr)
+                text = "$mark ${name ?: addr}\n${if (name != null) "$addr\n" else ""}${ping?.let { "$it мс · " } ?: ""}$what"
                 textSize = 13f; typeface = Typeface.MONOSPACE
                 setTextColor(when (code) { "ok" -> ACCENT; "denied", "bad_key", "other_device" -> Color.parseColor("#B03020"); else -> Color.DKGRAY })
             }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -158,7 +179,8 @@ class SimpleActivity : Activity() {
                 "closed", "expired" -> action(if (code == "expired") "Продлить" else "Запросить доступ") {
                     messageDialog(addr) { c -> row(addr, ping, c, 0) }
                 }
-                "pending" -> action("Ждёт ответа", enabled = false)
+                // While the owner decides: a word to them, if the server takes chat messages.
+                "pending" -> if (addr in State.chatServers) action("Написать") { openChat(addr) } else action("Ждёт ответа", enabled = false)
                 "denied" -> action("Отклонён", enabled = false)
                 else -> {}
             }
@@ -270,7 +292,8 @@ class SimpleActivity : Activity() {
     }
 
     private fun openAdvanced() {
-        startActivity(Intent(this, MainActivity::class.java))
+        // A notification's chat request goes along.
+        startActivity(Intent(this, MainActivity::class.java).also { i -> intent?.extras?.let { i.putExtras(it) } })
         finish()
     }
 
@@ -350,6 +373,10 @@ class SimpleActivity : Activity() {
             setOnClickListener { speedTest() }
         }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
         dash.addView(buttons, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(18) })
+        dash.addView(Button(this).apply {
+            text = "Чат с сервером"; isAllCaps = false; textSize = 16f
+            setOnClickListener { Ygg.serverFromText(prefs.server)?.let { openChat(it) } ?: toast("Сервер не выбран") }
+        }, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         return dash
     }
 
@@ -401,7 +428,9 @@ class SimpleActivity : Activity() {
             else -> "подключено ✔ · пиров $peers"
         }
         val acc = State.access?.takeIf { it.first == Ygg.serverFromText(prefs.server) }
-        tvExit.text = "Сервер выхода: ${prefs.server}\n" + when {
+        val srv = Ygg.serverFromText(prefs.server)
+        val srvName = srv?.let { prefs.serverNameOf(it) }
+        tvExit.text = "Сервер выхода: " + (srvName?.let { "$it\n${prefs.server}" } ?: prefs.server) + "\n" + when {
             dExitAt == 0L -> "проверяю…"
             dExitMs != null -> "на связи ✔ (ответ ${dExitMs} мс)"
             else -> "не отвечает ✖"
@@ -440,7 +469,7 @@ class SimpleActivity : Activity() {
         val others = all.filter { it != cur }.sortedWith(compareBy({ prefs.ckrWanted && it !in State.ckrServers }, { ping[it] ?: Long.MAX_VALUE }))
         if (others.isEmpty()) { toast("Других серверов пока нет"); return }
         val labels = listOf("Автоматически: лучший по пингу") + others.map { s ->
-            (if (prefs.isOwn(s)) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + s + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") +
+            (if (prefs.isOwn(s)) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + prefs.label(s) + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") +
                 (if (s in State.ckrServers) "  · CKR" else "")
         }
         android.app.AlertDialog.Builder(this)

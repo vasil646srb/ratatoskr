@@ -38,6 +38,10 @@ class YggService : VpnService() {
         private const val NOTIF_ID = 1
         private const val CHANNEL = "ygg"
         private const val ACCESS_CHANNEL = "access"
+        private const val CHAT_CHANNEL = "chat"
+        /** Intent extras: open the chat with this server (client) / client (exit mode). */
+        const val EXTRA_CHAT = "chat_server"
+        const val EXTRA_OWNER_CHAT = "chat_client"
         private const val PEERS_MAX_AGE = 6 * 3600 * 1000L
 
         /** The running service (same process), for calls that must not start it. */
@@ -125,6 +129,46 @@ class YggService : VpnService() {
         }
     }
 
+    /** Exit mode: a client wrote to us — a notification that opens the chat. */
+    private fun ownerChatMessage(addr: String) {
+        State.log("chat", "сообщение от $addr")
+        Thread {
+            val text = try { Chat.ownerHistory(this, addr, prefs.ownerChatSeen).lastOrNull { !it.owner }?.text } catch (_: Exception) { null }
+            val open = PendingIntent.getActivity(this, 3, Intent(this, MainActivity::class.java).putExtra(EXTRA_OWNER_CHAT, addr),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            notifyChat(1000 + addr.hashCode() % 1000, "Сообщение от клиента", (text ?: "") + "\n$addr", open)
+        }.apply { isDaemon = true; start() }
+    }
+
+    /** Client: new answers from the owners of our servers, checked once a minute. */
+    private var chatAt = 0L
+    private fun chatTick() {
+        val now = System.currentTimeMillis()
+        if (now - chatAt < 60_000 || !State.nodeRunning) return
+        chatAt = now
+        val cur = Ygg.serverFromText(prefs.server)
+        val servers = (listOfNotNull(cur?.takeIf { prefs.isOwn(it) }) + prefs.pendingList()).distinct().filter { it in State.chatServers }
+        for (srv in servers) {
+            val lines = try { Chat.sync(srv, prefs.chatNotified(srv)) } catch (_: Exception) { continue }
+            val news = lines.filter { it.owner }
+            if (news.isEmpty()) continue
+            prefs.setChatNotified(srv, lines.maxOf { it.t })
+            val open = PendingIntent.getActivity(this, 4, Intent(this, SimpleActivity::class.java).putExtra(EXTRA_CHAT, srv),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            notifyChat(2000 + srv.hashCode() % 1000, "Сообщение от сервера ${prefs.label(srv)}", news.joinToString("\n") { it.text }, open)
+        }
+    }
+
+    private fun notifyChat(id: Int, title: String, text: String, open: PendingIntent) { try {
+        val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= 26 && nm.getNotificationChannel(CHAT_CHANNEL) == null) {
+            nm.createNotificationChannel(NotificationChannel(CHAT_CHANNEL, "Чат с сервером", NotificationManager.IMPORTANCE_HIGH))
+        }
+        val b = if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHAT_CHANNEL) else @Suppress("DEPRECATION") Notification.Builder(this)
+        nm.notify(id, b.setSmallIcon(R.drawable.ic_notif).setContentTitle(title).setContentText(text)
+            .setStyle(Notification.BigTextStyle().bigText(text)).setContentIntent(open).setAutoCancel(true).build())
+    } catch (_: Exception) {} }
+
     /** A notification the user sees even with the app closed (the owner answered a request). */
     private fun notifyAccess(server: String, title: String, text: String) { try {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
@@ -139,6 +183,7 @@ class YggService : VpnService() {
 
     private fun accessTick() { try {
         requestsTick()
+        chatTick()
         val server = Ygg.serverFromText(prefs.server)
         if (!prefs.vpnEnabled || prefs.yggOnly || server == null || !State.nodeRunning) { accessLast = null; return }
         val key = prefs.keyFor(server) ?: ""
@@ -350,6 +395,7 @@ class YggService : VpnService() {
                 if (prefs.allowLan) add("--allow-lan")
                 // Clients learn where we take peers and then peer with us directly.
                 Ygg.peerUris(prefs).forEach { add("--peer"); add(it) }
+                if (prefs.serverName.isNotBlank()) { add("--server-name"); add(prefs.serverName) }
                 add("-v"); add("warn")
             }
             if (exitProc?.cmd != cmd) {
@@ -461,6 +507,7 @@ class YggService : VpnService() {
             l.startsWith("ERROR ") -> State.error(tag, l.removePrefix("ERROR "))
             l.startsWith("ACCESS bind ") -> l.split(' ').let { State.log("access", "ключ ${it.getOrNull(2)} привязан к устройству ${it.getOrNull(3)}") }
             l.startsWith("ACCESS request ") -> State.log("access", "запрос доступа от ${l.substringAfterLast(' ')} — см. «Сервер»")
+            l.startsWith("CHAT ") -> ownerChatMessage(l.removePrefix("CHAT ").trim())
             else -> State.log(tag, l)
         }
         extra(l)

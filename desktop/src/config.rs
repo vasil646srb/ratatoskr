@@ -89,6 +89,8 @@ pub struct Server {
     pub ckr: bool,
     /// The CKR exit carries IPv6 too (IPv6 forwarding on this machine).
     pub ckr_ipv6: bool,
+    /// What clients see instead of the bare address (sent with every access check).
+    pub name: String,
 }
 
 

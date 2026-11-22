@@ -186,12 +186,68 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
+        handleChat(intent)
     }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleLink(intent)
+        handleChat(intent)
+    }
+
+    /** A chat notification was tapped. */
+    private fun handleChat(i: Intent?) {
+        i?.getStringExtra(YggService.EXTRA_CHAT)?.let { openClientChat(it) }
+        i?.getStringExtra(YggService.EXTRA_OWNER_CHAT)?.let { openOwnerChat(it, it) }
+    }
+
+    /** Client: chat with [server]'s owner. */
+    private fun openClientChat(server: String) {
+        Chat.open(this, "Чат: ${prefs.label(server)}",
+            "Напишите владельцу сервера — ответ придёт сюда и уведомлением.", mineIsOwner = false,
+            load = { Chat.sync(server, it) }, send = { Chat.send(server, it) },
+            seen = { prefs.setChatSeen(server, it); prefs.setChatNotified(server, maxOf(it, prefs.chatNotified(server))) })
+    }
+
+    /** Exit mode: chat with the client at [addr]. */
+    private fun openOwnerChat(addr: String, title: String) {
+        Chat.open(this, title, "Сообщений пока нет.", mineIsOwner = true,
+            load = { Chat.ownerHistory(this, addr, it) }, send = { Chat.ownerSend(this, addr, it) },
+            seen = { prefs.ownerChatSeen = maxOf(prefs.ownerChatSeen, it) })
+    }
+
+    /** Exit mode: conversations with clients, newest first; a tap opens one. */
+    private fun ownerChats() {
+        Thread {
+            val chats = try { Chat.ownerList(this, prefs.ownerChatSeen) } catch (e: Exception) {
+                runOnUiThread { toast("Чат: ${e.message}") }; return@Thread
+            }
+            // Clients by name: their key's name and device, or their request's device name.
+            val names = HashMap<String, String>()
+            Ygg.accessCmd(this, "list").getOrNull()?.let { a ->
+                a.optJSONArray("keys")?.let { k -> for (j in 0 until k.length()) k.getJSONObject(j).let { o ->
+                    val ad = o.optString("addr"); if (ad.isNotEmpty()) names[ad] = listOf(o.optString("name"), o.optString("device")).filter { it.isNotEmpty() }.distinct().joinToString(" — ")
+                } }
+                a.optJSONArray("requests")?.let { r -> for (j in 0 until r.length()) r.getJSONObject(j).let { o -> names.putIfAbsent(o.optString("addr"), o.optString("name") + " (ждёт доступа)") } }
+            }
+            runOnUiThread {
+                if (chats.isEmpty()) { toast("Сообщений от клиентов пока нет"); return@runOnUiThread }
+                val labels = chats.map { c ->
+                    val addr = c.optString("addr")
+                    val last = c.optJSONObject("last")
+                    val new = c.optInt("new")
+                    (if (new > 0) "● " else "") + (names[addr]?.ifEmpty { null } ?: addr) + "\n" +
+                        (if (last?.optBoolean("owner") == true) "вы: " else "") + (last?.optString("text") ?: "").take(60).replace('\n', ' ')
+                }
+                android.app.AlertDialog.Builder(this).setTitle("Чат с клиентами")
+                    .setItems(labels.toTypedArray()) { _, i ->
+                        val addr = chats[i].optString("addr")
+                        openOwnerChat(addr, names[addr]?.ifEmpty { null } ?: addr)
+                    }
+                    .setNegativeButton("Закрыть", null).show()
+            }
+        }.apply { isDaemon = true; start() }
     }
 
     /** Edge-to-edge (forced on Android 15): pad the root by the system bars, keyboard included. */
@@ -278,6 +334,7 @@ class MainActivity : Activity() {
         tvRoot = mono("Корень сети: …").also { addView(it) }
         btnVpn = bigButton("") { toggleVpn() }.also { addView(it) }
         btnApps = smallButton("Приложения без VPN") { pickApps() }.also { addView(it) }
+        addView(smallButton("Чат с сервером") { Ygg.serverFromText(prefs.server)?.let { openClientChat(it) } ?: toast("Сервер не выбран") })
         tvClientState = mono("").also { addView(it) }
     }
 
@@ -286,6 +343,19 @@ class MainActivity : Activity() {
         addView(note("Телефон раздаёт свой интернет через Yggdrasil. Сервер закрыт: пользоваться им могут только устройства с ключом — у каждого устройства свой. Локальные сети и loopback закрыты."))
         tvIdentity = mono("").also { addView(it) }
         addView(row(smallButton("Копировать адрес") { copy(State.address) }))
+        addView(label("Название сервера: клиенты видят его вместо адреса"))
+        val etName = edit("например, «Сервер Маши»", prefs.serverName)
+        addView(LinearLayout(this@MainActivity).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            addView(etName, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(smallButton("Сохранить") {
+                prefs.serverName = etName.text.toString()
+                etName.setText(prefs.serverName)
+                if (State.serviceRunning) YggService.send(this@MainActivity, YggService.ACTION_RECONCILE)
+                toast(if (prefs.serverName.isEmpty()) "Название убрано" else "Название сохранено")
+            })
+        })
+        addView(smallButton("Чат с клиентами") { ownerChats() })
         addView(h2("Доступ"))
         tvAccess = mono("…").also { addView(it) }
         addView(label("Новый ключ: для кого и на сколько дней (1–365)"))
@@ -730,7 +800,7 @@ class MainActivity : Activity() {
                 val sel = a == prefs.server
                 val mark = when { sel && prefs.vpnEnabled && State.vpnActive -> "● подключено"; sel && prefs.vpnEnabled -> "◐ подключается"; sel -> "○ выбран"; else -> "" }
                 val kind = (if (prefs.isOwn(a)) "🔑 " else if (a in State.trackerPublic) "🌐 " else "") + (if (a in State.ckrServers) "CKR " else "")
-                serversBox.addView(mono("$kind$a\n    пинг: $ping  $mark").apply {
+                serversBox.addView(mono("$kind${prefs.serverNameOf(a)?.let { "$it\n    $a" } ?: a}\n    пинг: $ping  $mark").apply {
                     setTextIsSelectable(false)
                     if (sel) setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
                     setBackgroundResource(android.R.drawable.list_selector_background)

@@ -172,6 +172,14 @@ object Ygg {
                         }
                         serverFromText(server)?.let { if (peers.isNotEmpty()) State.serverPeers[it] = peers }
                     } catch (_: Exception) {}
+                    // 0.1.24+: bit 2 — the server's name follows as [len, UTF-8]; bit 3 — chat.
+                    serverFromText(server)?.let { a ->
+                        if (f >= 0 && f and 8 == 8) State.chatServers.add(a) else State.chatServers.remove(a)
+                        val n = if (f >= 0 && f and 4 == 4) try {
+                            String(readN(i, i.read()), Charsets.UTF_8).filter { !it.isISOControl() }.trim()
+                        } catch (_: Exception) { "" } else ""
+                        if (n.isNotEmpty()) State.serverNames[a] = n else State.serverNames.remove(a)
+                    }
                     codeName(r[1].toInt()) to exp
                 }
                 2 -> {

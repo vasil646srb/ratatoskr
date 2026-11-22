@@ -3,6 +3,8 @@
 
 #[path = "../../ygghelper/src/access.rs"]
 mod access;
+#[path = "../../ygghelper/src/chat.rs"]
+mod chat;
 mod api;
 mod cli;
 mod config;

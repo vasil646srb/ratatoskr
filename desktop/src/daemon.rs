@@ -761,6 +761,9 @@ fn helper_line(st: &Shared, tag: &str, l: &str) {
             ["request", addr] => log(st, "access", &format!("запрос доступа от {addr} — одобрить: yggproxy access")),
             _ => log(st, "access", a),
         }
+    } else if let Some(addr) = l.strip_prefix("CHAT ") {
+        let who = client_name(addr.trim());
+        log(st, "chat", &format!("сообщение от {who} — ответить: yggproxy chat"));
     } else if l.starts_with("ygghelper: ") {
         // stderr copy of an ERROR line
     } else {
@@ -1071,6 +1074,9 @@ impl Daemon {
             for u in peer_uris(cfg) {
                 cmd.extend(["--peer".into(), u]);
             }
+            if !cfg.server.name.trim().is_empty() {
+                cmd.extend(["--server-name".into(), cfg.server.name.trim().to_string()]);
+            }
             if client {
                 // Exit traffic must not loop into our own VPN.
                 cmd.extend(["--fwmark".into(), format!("0x{:x}", config::FWMARK)]);
@@ -1139,6 +1145,15 @@ const CKR_EXIT_TUN: &str = "ygg-ckr";
 static CKR_SERVERS: std::sync::LazyLock<Mutex<HashMap<String, bool>>> = std::sync::LazyLock::new(Default::default);
 
 /// The exits' own peers, as they told us in the access check (kept across restarts).
+/// Names the servers told us in their access answers (address → name).
+static SERVER_NAMES: std::sync::LazyLock<Mutex<HashMap<String, String>>> = std::sync::LazyLock::new(Default::default);
+
+/// A server's name, if it told us one.
+pub fn server_name(addr: &str) -> Option<String> {
+    let a = config::parse_server(addr)?.to_string();
+    SERVER_NAMES.lock().unwrap().get(&a).cloned().filter(|n| !n.is_empty())
+}
+
 static SERVER_PEERS: std::sync::LazyLock<Mutex<HashMap<String, Vec<String>>>> = std::sync::LazyLock::new(|| {
     Mutex::new(std::fs::read_to_string(server_peers_path()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default())
 });
@@ -1454,6 +1469,57 @@ fn access_summary() -> Value {
            "requests": a.requests.len()})
 }
 
+/// A client's name for the owner: its key's name and device, or its request's device name.
+fn client_name(addr: &str) -> String {
+    let a = crate::access::Access::load(&config::access_path());
+    if let Some(k) = a.keys.iter().find(|k| k.addr.as_deref() == Some(addr)) {
+        let dev = k.device.as_str();
+        return match (k.name.is_empty() || k.name == dev, dev.is_empty()) {
+            (true, true) => addr.to_string(),
+            (true, false) => format!("{dev} ({addr})"),
+            (false, true) => format!("{} ({addr})", k.name),
+            (false, false) => format!("{} — {dev} ({addr})", k.name),
+        };
+    }
+    if let Some(r) = a.requests.iter().find(|r| r.addr == addr) {
+        return format!("{} ({addr}, ждёт доступа)", r.name);
+    }
+    addr.to_string()
+}
+
+/// `{"cmd":"chat","op":…}`, the owner's side: list (conversations, `seen` ms), history (`addr`,
+/// `since`), send (`addr`, `text`).
+fn chat_cmd(req: &Value, st: &Shared) -> Value {
+    use crate::chat;
+    let path = config::access_path();
+    let addr = crate::access::norm_addr(req["addr"].as_str().unwrap_or(""));
+    match req["op"].as_str().unwrap_or("list") {
+        "list" => {
+            let v: Vec<Value> = chat::conversations(&path, req["seen"].as_u64().unwrap_or(0))
+                .into_iter()
+                .map(|(a, last, new)| json!({"addr": a, "name": client_name(&a), "last": last, "new": new}))
+                .collect();
+            json!({"chats": v, "now": chat::now_ms()})
+        }
+        "history" => match addr {
+            Some(a) => json!({"lines": chat::conversation(&path, &a, req["since"].as_u64().unwrap_or(0), 500), "name": client_name(&a)}),
+            None => json!({"error": "нужен адрес Yggdrasil"}),
+        },
+        "send" => {
+            let Some(a) = addr else { return json!({"error": "нужен адрес Yggdrasil"}) };
+            let Some(text) = chat::clean(req["text"].as_str().unwrap_or("")) else { return json!({"error": "сообщение пустое или длиннее 1000 байт"}) };
+            match chat::append(&chat::out_path(&path), &a, &text) {
+                Ok(t) => {
+                    log(st, "chat", &format!("ответ для {a}"));
+                    json!({"t": t})
+                }
+                Err(e) => json!({"error": e.to_string()}),
+            }
+        }
+        other => json!({"error": format!("неизвестная операция {other:?}")}),
+    }
+}
+
 /// `{"cmd":"access","op":…}`: list (default), new, approve, renew, unbind, revoke, deny, public.
 fn access_cmd(req: &Value, st: &Shared, cfg: &Config) -> Value {
     use crate::access::{self, Access};
@@ -1578,6 +1644,16 @@ pub fn probe_access(server: &str, key: &str, device: &str, message: &str, record
                 }
             }
             server_peers_known(&ip.to_string(), peers);
+            // 0.1.24+: the server's name (bit 2).
+            if flags & 4 == 4 && s.read_exact(&mut f).is_ok() {
+                let mut n = vec![0u8; f[0] as usize];
+                if s.read_exact(&mut n).is_ok() {
+                    let n = String::from_utf8_lossy(&n).chars().filter(|c| !c.is_control()).collect::<String>();
+                    SERVER_NAMES.lock().unwrap().insert(ip.to_string(), n.trim().to_string());
+                }
+            } else {
+                SERVER_NAMES.lock().unwrap().remove(&ip.to_string());
+            }
             Ok((a, u64::from_be_bytes(r[2..10].try_into().unwrap())))
         }
         2 => {
@@ -1822,9 +1898,9 @@ fn status_json(st: &Shared, cfg: &Config) -> Value {
                    "link": s.address.as_ref().map(|a| config::with_peers(&config::connect_link(a), &peer_uris(cfg))),
                    "listen": cfg.network.listen, "peer_uris": peer_uris(cfg),
                    "active_conns": s.srv[0], "total": s.srv[1], "denied": s.srv[2], "tx": s.srv[3], "rx": s.srv[4],
-                   "clients": clients, "limits": cfg.server.limits, "ckr": ckr_exit_wanted(cfg), "ckr_ipv6": cfg.server.ckr_ipv6,
+                   "clients": clients, "limits": cfg.server.limits, "ckr": ckr_exit_wanted(cfg), "ckr_ipv6": cfg.server.ckr_ipv6, "name": cfg.server.name,
                    "access": access_summary()},
-        "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "active": s.vpn_active,
+        "client": {"enabled": cfg.client.enabled, "server": cfg.client.server, "server_name": server_name(&cfg.client.server), "active": s.vpn_active,
                    "rx": s.tun_rx, "tx": s.tun_tx, "server_rtt": s.server_rtt, "last_swap": s.last_swap,
                    "servers": cfg.client.servers, "ygg_sites": cfg.client.ygg_sites, "ygg_only": cfg.client.ygg_only,
                    "ckr": ckr_effective(cfg, &s.failover.as_ref().filter(|f| f.0 == cfg.client.server.trim()).map(|f| f.1.clone()).unwrap_or_else(|| cfg.client.server.trim().to_string())),
@@ -1882,6 +1958,7 @@ fn handle_conn(conn: platform::Stream, st: Shared, cfg: Arc<Mutex<Config>>, tx: 
                 json!({"ok": true})
             }
             "access" => access_cmd(&req, &st, &cfg.lock().unwrap().clone()),
+            "chat" => chat_cmd(&req, &st),
             // Client: an access request with a message to a server's owner.
             "request_access" => {
                 let server = req["server"].as_str().unwrap_or("").to_string();
