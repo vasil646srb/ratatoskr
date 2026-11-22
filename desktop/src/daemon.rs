@@ -956,6 +956,11 @@ impl Daemon {
                     "--ckr-allow-file".into(),
                     d.join("ckr-allow.txt").display().to_string(),
                 ]);
+                // No IPv6 for clients: their IPv6 gets an immediate ICMPv6 error instead of
+                // vanishing (apps that try IPv6 first then fall back to IPv4 at once).
+                if !cfg.server.ckr_ipv6 {
+                    a.push("--ckr-no-ipv6".into());
+                }
             }
         }
         // The CKR VPN hands its TUN over this socket whenever it comes up (no node restart).
