@@ -564,7 +564,12 @@ class YggService : VpnService() {
             .addRoute("0.0.0.0", 0)
         if (ygg != null) {
             b.addAddress(ygg, 128)
-            if (prefs.ipv6) b.addRoute("::", 0) else if (prefs.yggSites) b.addRoute("200::", 7)
+            // Internet IPv6 stays out of the tunnel: an exit need not have IPv6, and a route to
+            // :: made Android report IPv6 as working while the exit dropped it — the YouTube and
+            // Twitch apps waited on IPv6, the browser fell back to IPv4. With only 200::/7 the
+            // phone sees no IPv6 internet; other IPv6 fails at once (Android blocks it for
+            // the VPN's apps, nothing leaks over the Wi-Fi's own IPv6) and apps use IPv4.
+            if (prefs.yggSites) b.addRoute("200::", 7)
         }
         try { b.addDnsServer(prefs.ckrDns.ifEmpty { "1.1.1.1" }) } catch (e: IllegalArgumentException) { b.addDnsServer("1.1.1.1") }
         b.addDisallowedApplication(packageName)
