@@ -14,7 +14,8 @@ pub const USAGE: &str = "yggproxy — интернет через Yggdrasil (с�
 Сервер выхода:
   yggproxy server on|off       включить/выключить раздачу интернета
   yggproxy qr                  адрес сервера (сервер закрыт: клиенту нужен ключ)
-  yggproxy access              ключи доступа и запросы устройств
+  yggproxy access              ключи доступа и запросы: в терминале — меню, номер строки, затем действие
+  yggproxy access list         только список (для скриптов)
   yggproxy access new ИМЯ ДНЕЙ новый ключ (1–365 дней) — QR-код и ссылка для одного устройства
   yggproxy access qr ID        снова показать QR-код ключа
   yggproxy access approve АДРЕС ДНЕЙ [ИМЯ]   одобрить запрос устройства
@@ -324,6 +325,11 @@ fn logs(follow: bool) -> Result<(), String> {
 }
 
 fn access(args: &[String]) -> Result<(), String> {
+    use std::io::IsTerminal;
+    // `yggproxy access` in a terminal: the numbered menu; with a subcommand (or piped), as before.
+    if args.len() <= 1 && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return access_menu();
+    }
     let a = |i: usize| args.get(i).map(|s| s.as_str());
     let days = |s: Option<&str>| -> Result<u64, String> {
         s.and_then(|d| d.parse::<u64>().ok()).filter(|d| (1..=365).contains(d)).ok_or_else(|| "срок: от 1 до 365 дней".to_string())
@@ -359,62 +365,220 @@ fn access(args: &[String]) -> Result<(), String> {
         Some(other) => return Err(format!("неизвестная команда access {other}")),
     };
     let r = api::request(req)?;
-    let now = r["now"].as_u64().unwrap_or(0);
     let keys = r["keys"].as_array().cloned().unwrap_or_default();
-    let show_qr = |k: &Value| {
-        if let Some(l) = k["link"].as_str() {
-            print_qr(l);
-            println!("Ссылка: {l}");
-        }
-        println!("Адрес: {}\nКлюч:  {}", r["server"].as_str().unwrap_or("? (узел не запущен)"), k["key"].as_str().unwrap_or(""));
-        println!("Ключ подходит одному устройству и действует {} дн.", k["days"]);
-    };
     match a(1) {
         Some("new") => {
             if let Some(k) = keys.last() {
-                show_qr(k);
+                show_key_qr(&r, k);
             }
             return Ok(());
         }
         Some("qr") => {
             let id = a(2).ok_or("yggproxy access qr ID")?;
             let k = keys.iter().find(|k| k["id"].as_str() == Some(id)).ok_or("нет такого ключа")?;
-            show_qr(k);
+            show_key_qr(&r, k);
             return Ok(());
         }
         _ => {}
     }
+    print_access(&r, false);
+    Ok(())
+}
+
+/// QR code, link, server address and key for one key of an `access` reply.
+fn show_key_qr(r: &Value, k: &Value) {
+    if let Some(l) = k["link"].as_str() {
+        print_qr(l);
+        println!("Ссылка: {l}");
+    }
+    println!("Адрес: {}\nКлюч:  {}", r["server"].as_str().unwrap_or("? (узел не запущен)"), k["key"].as_str().unwrap_or(""));
+    println!("Ключ подходит одному устройству и действует {} дн.", k["days"]);
+}
+
+/// One line of the `access` list the menu can act on.
+enum AccessItem {
+    Key { id: String, name: String },
+    Request { addr: String, name: String },
+    Denied { addr: String, name: String },
+}
+
+/// Print keys, requests and denied devices; `numbered`: with the numbers the menu takes.
+fn print_access(r: &Value, numbered: bool) -> Vec<AccessItem> {
+    let now = r["now"].as_u64().unwrap_or(0);
+    let mut items = Vec::new();
+    let mut mark = |item: AccessItem| -> String {
+        items.push(item);
+        if numbered { format!("{:>3}.", items.len()) } else { " ".into() }
+    };
+    let s = |v: &Value| v.as_str().unwrap_or("").to_string();
     println!("Сервер: {}", if r["public"].as_bool() == Some(true) { "ПУБЛИЧНЫЙ — пользоваться может любой" } else { "закрытый — только по ключам" });
+    let keys = r["keys"].as_array().cloned().unwrap_or_default();
     println!("Ключи ({}):", keys.len());
-    for k in &keys {
+    let left = |k: &Value| {
         let exp = k["expires"].as_u64().unwrap_or(0);
-        let left = if exp > now { format!("ещё {}", dur(exp - now)) } else { "ИСТЁК".into() };
+        if exp > now { format!("ещё {}", dur(exp - now)) } else { "ИСТЁК".into() }
+    };
+    // Columns as wide as their longest entry (names up to 24 characters).
+    let nw = keys.iter().map(|k| s(&k["name"]).chars().count()).max().unwrap_or(0).min(24);
+    let lw = keys.iter().map(|k| left(k).chars().count()).max().unwrap_or(0);
+    for k in &keys {
         let dev = match k["addr"].as_str() {
             Some(ad) => format!("{} {ad}", k["device"].as_str().unwrap_or("")),
             None => "не использован".into(),
         };
-        println!("  {}  {:<16} {:<12} {}", k["id"].as_str().unwrap_or(""), k["name"].as_str().unwrap_or(""), left, dev);
+        let m = mark(AccessItem::Key { id: s(&k["id"]), name: s(&k["name"]) });
+        let name: String = s(&k["name"]).chars().take(24).collect();
+        println!("{m} {}  {name:<nw$}  {:<lw$}  {}", s(&k["id"]), left(k), dev.trim());
     }
     let reqs = r["requests"].as_array().cloned().unwrap_or_default();
     if !reqs.is_empty() {
-        println!("Запросы доступа ({}) — yggproxy access approve АДРЕС ДНЕЙ:", reqs.len());
+        if numbered {
+            println!("Запросы доступа ({}):", reqs.len());
+        } else {
+            println!("Запросы доступа ({}) — yggproxy access approve АДРЕС ДНЕЙ:", reqs.len());
+        }
         for q in reqs {
-            println!("  {}  {}  {} назад, попыток {}", q["addr"].as_str().unwrap_or(""), q["name"].as_str().unwrap_or(""),
+            let m = mark(AccessItem::Request { addr: s(&q["addr"]), name: s(&q["name"]) });
+            println!("{m} {}  {}  {} назад, попыток {}", s(&q["addr"]), s(&q["name"]),
                 dur(now.saturating_sub(q["last"].as_u64().unwrap_or(0))), q["count"]);
-            if let Some(m) = q["message"].as_str().filter(|m| !m.is_empty()) {
-                println!("      «{m}»");
+            if let Some(msg) = q["message"].as_str().filter(|m| !m.is_empty()) {
+                println!("      «{msg}»");
             }
         }
     }
     let den = r["denied"].as_array().cloned().unwrap_or_default();
     if !den.is_empty() {
-        println!("Отклонённые ({}) — снова разрешить запрос: yggproxy access forget АДРЕС, или approve:", den.len());
+        if numbered {
+            println!("Отклонённые ({}):", den.len());
+        } else {
+            println!("Отклонённые ({}) — снова разрешить запрос: yggproxy access forget АДРЕС, или approve:", den.len());
+        }
         for d in den {
-            println!("  {}  {}  {} назад", d["addr"].as_str().unwrap_or(""), d["name"].as_str().unwrap_or(""),
+            let m = mark(AccessItem::Denied { addr: s(&d["addr"]), name: s(&d["name"]) });
+            println!("{m} {}  {}  {} назад", s(&d["addr"]), s(&d["name"]),
                 dur(now.saturating_sub(d["time"].as_u64().unwrap_or(0))));
         }
     }
-    Ok(())
+    items
+}
+
+/// One line from the terminal, trimmed; `None` at the end of input (Ctrl+D).
+fn ask(prompt: &str) -> Option<String> {
+    print!("{prompt}");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut l = String::new();
+    match std::io::stdin().read_line(&mut l) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(l.trim().to_string()),
+    }
+}
+
+/// Days for a key, asked until valid; Enter takes `default`. `None`: input ended or «0» (cancel).
+fn ask_days(default: u64) -> Option<u64> {
+    loop {
+        let l = ask(&format!("Срок, дней (1–365, Enter — {default}, 0 — отмена): "))?;
+        if l.is_empty() {
+            return Some(default);
+        }
+        match l.parse::<u64>() {
+            Ok(0) => return None,
+            Ok(d) if d <= 365 => return Some(d),
+            _ => println!("Нужно число от 1 до 365."),
+        }
+    }
+}
+
+fn yes(prompt: &str) -> bool {
+    matches!(ask(prompt).as_deref().map(str::to_lowercase).as_deref(), Some("да" | "д" | "y" | "yes"))
+}
+
+/// `yggproxy access` in a terminal: pick a line by number, then what to do with it.
+fn access_menu() -> Result<(), String> {
+    loop {
+        let r = api::request(json!({"cmd": "access", "op": "list"}))?;
+        println!();
+        let items = print_access(&r, true);
+        println!("\nНомер — выбрать · н — новый ключ · Enter — выход");
+        let Some(c) = ask("> ") else { return Ok(()) };
+        let c = c.to_lowercase();
+        let req = match c.as_str() {
+            "" | "q" | "в" | "выход" => return Ok(()),
+            "н" | "n" => {
+                let Some(name) = ask("Имя ключа (кому): ") else { return Ok(()) };
+                let Some(days) = ask_days(30) else { continue };
+                json!({"cmd": "access", "op": "new", "name": name, "days": days})
+            }
+            _ => {
+                let Some(item) = c.parse::<usize>().ok().and_then(|n| n.checked_sub(1)).and_then(|i| items.get(i)) else {
+                    println!("Нет такого номера.");
+                    continue;
+                };
+                match access_action(&r, item) {
+                    Some(req) => req,
+                    None => continue,
+                }
+            }
+        };
+        let new = req["op"] == "new";
+        match api::request(req) {
+            Ok(r) => {
+                println!("Готово.");
+                if new {
+                    if let Some(k) = r["keys"].as_array().and_then(|k| k.last()) {
+                        show_key_qr(&r, k);
+                        let _ = ask("Enter — к списку ");
+                    }
+                }
+            }
+            Err(e) => println!("Ошибка: {e}"),
+        }
+    }
+}
+
+/// The action menu for one line; `None`: back to the list (or the QR code was shown).
+fn access_action(r: &Value, item: &AccessItem) -> Option<Value> {
+    match item {
+        AccessItem::Key { id, name } => {
+            println!("\nКлюч {id} «{name}»:\n  1. QR-код и ссылка\n  2. продлить\n  3. отвязать от устройства (для переустановки)\n  4. удалить (доступ сразу закрыт)");
+            match ask("Действие (Enter — назад): ")?.as_str() {
+                "1" => {
+                    let k = r["keys"].as_array()?.iter().find(|k| k["id"].as_str() == Some(id))?;
+                    show_key_qr(r, k);
+                    let _ = ask("Enter — к списку ");
+                    None
+                }
+                "2" => ask_days(30).map(|d| json!({"cmd": "access", "op": "renew", "id": id, "days": d})),
+                "3" => yes(&format!("Отвязать ключ «{name}» от устройства? (да/нет): "))
+                    .then(|| json!({"cmd": "access", "op": "unbind", "id": id})),
+                "4" => yes(&format!("Удалить ключ «{name}»? Устройство сразу потеряет доступ. (да/нет): "))
+                    .then(|| json!({"cmd": "access", "op": "revoke", "id": id})),
+                _ => None,
+            }
+        }
+        AccessItem::Request { addr, name } => {
+            println!("\nЗапрос {addr} «{name}»:\n  1. одобрить\n  2. отклонить (устройство узнает; снова просить 30 дней не сможет)");
+            match ask("Действие (Enter — назад): ")?.as_str() {
+                "1" => approve(addr, name),
+                "2" => yes(&format!("Отклонить запрос «{name}»? (да/нет): ")).then(|| json!({"cmd": "access", "op": "deny", "addr": addr})),
+                _ => None,
+            }
+        }
+        AccessItem::Denied { addr, name } => {
+            println!("\nОтклонённый {addr} «{name}»:\n  1. разрешить снова запросить доступ\n  2. одобрить сразу");
+            match ask("Действие (Enter — назад): ")?.as_str() {
+                "1" => Some(json!({"cmd": "access", "op": "forget", "addr": addr})),
+                "2" => approve(addr, name),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn approve(addr: &str, name: &str) -> Option<Value> {
+    let days = ask_days(30)?;
+    let n = ask(&format!("Имя (Enter — «{name}»): "))?;
+    let n = if n.is_empty() { name.to_string() } else { n };
+    Some(json!({"cmd": "access", "op": "approve", "addr": addr, "days": days, "name": n}))
 }
 
 fn mbit_arg(s: &str) -> Result<u64, String> {
