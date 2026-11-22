@@ -97,13 +97,21 @@ class Prefs(ctx: Context) {
             }
             code in NO_ACCESS && addr in granted -> grantedText = granted.filter { it != addr }.joinToString("\n")
         }
-        // The name it told us, kept for the lists (also when it has none any more).
+        // The name it told us, kept for the lists (also when it has none any more); and whether
+        // its owner takes chat messages.
         if (!code.startsWith("error")) {
+            val chat = addr in State.chatServers
+            if (chat != isChatServer(addr)) chatServersText = (chatServerList().filter { it != addr } + listOfNotNull(addr.takeIf { chat })).joinToString("\n")
             val n = State.serverNames[addr] ?: ""
             val m = mapOf(serverNamesText)
             if ((m[addr] ?: "") != n) serverNamesText = mapText(if (n.isEmpty()) m - addr else m + (addr to n))
         }
     }
+
+    /** Servers whose owner takes chat messages (from their access answers). */
+    private var chatServersText: String get() = s("chat_servers", ""); set(v) = put { putString("chat_servers", v) }
+    private fun chatServerList() = chatServersText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+    fun isChatServer(addr: String) = addr in chatServerList()
 
     /** Exit mode: what clients see instead of our address. */
     var serverName: String get() = s("server_name", ""); set(v) = put { putString("server_name", v.trim().take(40)) }

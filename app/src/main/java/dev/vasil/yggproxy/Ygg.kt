@@ -308,7 +308,8 @@ object Ygg {
         val a = reply.optJSONArray("exits") ?: return
         for (k in 0 until a.length()) {
             val o = a.getJSONObject(k)
-            serverFromText(o.optString("address"))?.let {
+            // Our own exit (this phone also serves) is not a server to connect to.
+            serverFromText(o.optString("address"))?.takeIf { it != State.address?.let { a -> serverFromText(a) } }?.let {
                 into.putIfAbsent(it, if (o.isNull("rtt_ms")) -1 else o.optLong("rtt_ms"))
                 if (o.optBoolean("public")) public?.add(it)
                 if (o.has("ckr")) { if (o.optBoolean("ckr")) State.ckrServers.add(it) else State.ckrServers.remove(it) }

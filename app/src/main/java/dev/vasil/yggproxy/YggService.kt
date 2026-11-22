@@ -147,9 +147,15 @@ class YggService : VpnService() {
         if (now - chatAt < 60_000 || !State.nodeRunning) return
         chatAt = now
         val cur = Ygg.serverFromText(prefs.server)
-        val servers = (listOfNotNull(cur?.takeIf { prefs.isOwn(it) }) + prefs.pendingList()).distinct().filter { it in State.chatServers }
+        // Also with the VPN off (the access check then does not run): what we learned about
+        // the server's chat is kept.
+        val servers = (listOfNotNull(cur?.takeIf { prefs.isOwn(it) }) + prefs.pendingList()).distinct()
+            .filter { it in State.chatServers || prefs.isChatServer(it) }
         for (srv in servers) {
-            val lines = try { Chat.sync(srv, prefs.chatNotified(srv)) } catch (_: Exception) { continue }
+            val lines = try { Chat.sync(srv, prefs.chatNotified(srv)) } catch (e: Exception) {
+                State.log("chat", "$srv: ответы не проверены — ${e.message}")
+                continue
+            }
             val news = lines.filter { it.owner }
             if (news.isEmpty()) continue
             prefs.setChatNotified(srv, lines.maxOf { it.t })
