@@ -689,7 +689,8 @@ class MainActivity : Activity() {
                         .setPositiveButton("Отправить") { _, _ ->
                             val msg = e.text.toString()
                             bg.execute {
-                                val (code, _) = Ygg.probeAccess(addr, null, ask = true, message = msg)
+                                val (code, exp) = Ygg.probeAccess(addr, null, ask = true, message = msg)
+                                prefs.noteAccess(addr, code, exp)
                                 State.requests[addr] = code
                                 if (code == "pending") prefs.addPending(addr)
                                 ui.post { toast(if (code == "pending") "Запрос отправлен — придёт уведомление, когда владелец ответит" else Ygg.accessText(code)) }
@@ -728,7 +729,7 @@ class MainActivity : Activity() {
                 }
                 val sel = a == prefs.server
                 val mark = when { sel && prefs.vpnEnabled && State.vpnActive -> "● подключено"; sel && prefs.vpnEnabled -> "◐ подключается"; sel -> "○ выбран"; else -> "" }
-                val kind = (if (prefs.keyFor(a) != null) "🔑 " else if (a in State.trackerPublic) "🌐 " else "") + (if (a in State.ckrServers) "CKR " else "")
+                val kind = (if (prefs.isOwn(a)) "🔑 " else if (a in State.trackerPublic) "🌐 " else "") + (if (a in State.ckrServers) "CKR " else "")
                 serversBox.addView(mono("$kind$a\n    пинг: $ping  $mark").apply {
                     setTextIsSelectable(false)
                     if (sel) setTypeface(Typeface.MONOSPACE, Typeface.BOLD)

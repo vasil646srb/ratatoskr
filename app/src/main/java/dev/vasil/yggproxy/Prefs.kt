@@ -72,6 +72,33 @@ class Prefs(ctx: Context) {
     fun addPending(addr: String) { if (addr !in pendingList()) pendingRequests = (pendingList() + addr).joinToString("\n") }
     fun removePending(addr: String) { pendingRequests = pendingList().filter { it != addr }.joinToString("\n") }
 
+    /**
+     * Servers that let this device in personally without a key we hold: the owner approved our
+     * request (the access is bound to our address). They count as ours like the keyed ones: used
+     * first, with their own peer.
+     */
+    private var grantedText: String get() = s("granted_servers", ""); set(v) = put { putString("granted_servers", v) }
+    fun grantedList(): List<String> = grantedText.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+    fun isGranted(addr: String): Boolean = addr in grantedList()
+    /** Ours: a key, or access the owner gave us. */
+    fun isOwn(addr: String): Boolean = keyFor(addr) != null || isGranted(addr)
+
+    /**
+     * What a server answered about our access (see [Ygg.probeAccess]). Access with an end date is
+     * personal (a key or an approved request; a public server has none): the server becomes ours
+     * and the peer it announced is kept for it. A refusal takes the mark away.
+     */
+    fun noteAccess(addr: String, code: String, expires: Long) {
+        val granted = grantedList()
+        when {
+            code == "ok" && expires > 0 -> {
+                if (addr !in granted) grantedText = (granted + addr).joinToString("\n")
+                State.serverPeers[addr]?.let { if (it != serverPeers(addr)) setServerPeers(addr, it) }
+            }
+            code in NO_ACCESS && addr in granted -> grantedText = granted.filter { it != addr }.joinToString("\n")
+        }
+    }
+
     fun serverList(): List<String> = servers.lines().map { it.trim() }.filter { it.isNotEmpty() }.distinct()
     fun addServer(addr: String) { if (addr !in serverList()) servers = (serverList() + addr).joinToString("\n") }
     fun removeServer(addr: String) { servers = serverList().filter { it != addr }.joinToString("\n") }
@@ -125,3 +152,6 @@ class Prefs(ctx: Context) {
     fun customPeerList(): List<String> = customPeers.lines().map { it.trim() }.filter { it.isNotEmpty() && !it.startsWith("#") }
     fun excludedAppList(): List<String> = excludedApps.split(',', '\n', ' ').map { it.trim() }.filter { it.isNotEmpty() }
 }
+
+/** Access answers that mean this device is not let in (any more). */
+private val NO_ACCESS = setOf("bad_key", "expired", "denied", "closed", "other_device", "pending")

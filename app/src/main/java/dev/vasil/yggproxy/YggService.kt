@@ -113,7 +113,8 @@ class YggService : VpnService() {
         requestsAt = now
         for (srv in prefs.pendingList()) {
             State.requests.putIfAbsent(srv, "pending")
-            val (code, _) = Ygg.probeAccess(srv, prefs.keyFor(srv), ask = false)
+            val (code, exp) = Ygg.probeAccess(srv, prefs.keyFor(srv), ask = false)
+            prefs.noteAccess(srv, code, exp)
             if (code == "pending" || code.startsWith("error")) continue
             State.requests[srv] = code
             prefs.removePending(srv)
@@ -149,6 +150,7 @@ class YggService : VpnService() {
         if (last != null && last.first == sig && now - last.third < if (last.second == "ok") okEvery else 20_000) return
         val ckrBefore = prefs.ckrFor(server)
         val (code, exp) = Ygg.probeAccess(server, key, ask = true)
+        prefs.noteAccess(server, code, exp)
         // The exit told us where it takes peers: from now on it is our peer while reachable.
         State.serverPeers[server]?.let { p ->
             if (p != prefs.serverPeers(server)) {

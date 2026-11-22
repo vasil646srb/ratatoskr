@@ -195,6 +195,7 @@ class SimpleActivity : Activity() {
             all.take(20).map { a ->
                 Thread {
                     val (code, exp) = Ygg.probeAccess(a, prefs.keyFor(a), ask = false)
+                    prefs.noteAccess(a, code, exp)
                     val ping = rtt[a]?.takeIf { !it.isNull("rtt_ms") }?.optLong("rtt_ms") ?: trackerPing[a]?.takeIf { it >= 0 }
                     if (code == "pending" || code == "denied") State.requests[a] = code
                     ui.post { if (d.isShowing) row(a, ping, code, exp) }
@@ -239,7 +240,8 @@ class SimpleActivity : Activity() {
                 val msg = et.text.toString()
                 say("Отправляю запрос доступа к $server")
                 Thread {
-                    val (code, _) = Ygg.probeAccess(server, null, ask = true, message = msg)
+                    val (code, exp) = Ygg.probeAccess(server, null, ask = true, message = msg)
+                    prefs.noteAccess(server, code, exp)
                     ui.post {
                         prefs.addServer(server)
                         State.requests[server] = code
@@ -438,13 +440,13 @@ class SimpleActivity : Activity() {
         val others = all.filter { it != cur }.sortedWith(compareBy({ prefs.ckrWanted && it !in State.ckrServers }, { ping[it] ?: Long.MAX_VALUE }))
         if (others.isEmpty()) { toast("Других серверов пока нет"); return }
         val labels = listOf("Автоматически: лучший по пингу") + others.map { s ->
-            (if (prefs.keyFor(s) != null) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + s + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") +
+            (if (prefs.isOwn(s)) "🔑 " else if (s in State.trackerPublic) "🌐 " else "🔒 ") + s + "  —  " + (ping[s]?.let { "$it мс" } ?: "нет ответа") +
                 (if (s in State.ckrServers) "  · CKR" else "")
         }
         android.app.AlertDialog.Builder(this)
             .setTitle("Сменить сервер")
             .setItems(labels.toTypedArray()) { _, i ->
-                val usable = others.filter { prefs.keyFor(it) != null || it in State.trackerPublic }
+                val usable = others.filter { prefs.isOwn(it) || it in State.trackerPublic }
                 val target = if (i == 0) usable.firstOrNull { ping.containsKey(it) } ?: usable.firstOrNull() ?: run { toast("Нет других серверов с доступом"); return@setItems }
                     else others[i - 1]
                 startFlow { switchFlow(target) }
@@ -458,7 +460,8 @@ class SimpleActivity : Activity() {
         headline("Переключаю сервер…")
         say("Переключаю на $server")
         say("Проверяю доступ")
-        val acc = Ygg.probeAccess(server, prefs.keyFor(server), ask = false).first
+        val (acc, accExp) = Ygg.probeAccess(server, prefs.keyFor(server), ask = false)
+        prefs.noteAccess(server, acc, accExp)
         if (acc != "ok") throw Stop("$server: ${Ygg.accessText(acc)}")
         finish("доступ есть")
         if (!useServer(server)) throw Stop("VPN к серверу $server не поднялся")
@@ -738,11 +741,15 @@ class SimpleActivity : Activity() {
         say("Проверяю доступ к серверам")
         val access = java.util.concurrent.ConcurrentHashMap<String, String>()
         pinged.take(12).map { (a, _) ->
-            Thread { access[a] = Ygg.probeAccess(a, prefs.keyFor(a), ask = false).first }.apply { start() }
+            Thread {
+                val (code, exp) = Ygg.probeAccess(a, prefs.keyFor(a), ask = false)
+                prefs.noteAccess(a, code, exp)
+                access[a] = code
+            }.apply { start() }
         }.forEach { it.join(45_000) }
         if (!alive()) throw InterruptedException()
         val ranked = pinged.filter { access[it.key] == "ok" }
-        for ((a, code) in access) if (code != "ok" && (prefs.keyFor(a) != null || code == "pending")) say("$a: ${Ygg.accessText(code)}", Mark.INFO)
+        for ((a, code) in access) if (code != "ok" && (prefs.isOwn(a) || code == "pending")) say("$a: ${Ygg.accessText(code)}", Mark.INFO)
         if (ranked.isEmpty()) throw NoAccess("нет серверов, к которым есть доступ. Серверы закрыты: получите ключ владельца или запросите доступ («Серверы и ключи» внизу)")
         finish("доступ есть к ${ranked.size} из ${pinged.size}")
 
@@ -795,18 +802,20 @@ class SimpleActivity : Activity() {
     }
 
     /**
-     * Servers we hold a key for (the chosen one first): the first with access becomes the exit
+     * Our servers — a key we hold, or access the owner approved for this device (the chosen one
+     * first): the first with access becomes the exit
      * at once, without the trackers, the ping round and the speed comparison; its own peer (if
      * it has one) becomes the node's peer. False: none of them lets us in — the usual search.
      */
     private fun keyedFlow(): Boolean {
         val cur = Ygg.serverFromText(prefs.server)
-        val keyed = (listOfNotNull(cur) + prefs.serverList().mapNotNull { Ygg.serverFromText(it) }).distinct().filter { prefs.keyFor(it) != null }
+        val keyed = (listOfNotNull(cur) + prefs.serverList().mapNotNull { Ygg.serverFromText(it) }).distinct().filter { prefs.isOwn(it) }
         if (keyed.isEmpty()) return false
-        say("Есть сервер с ключом — другие не ищу")
+        say("Есть свой сервер (ключ или одобренный доступ) — другие не ищу")
         var server: String? = null
         for (a in keyed) {
-            val code = Ygg.probeAccess(a, prefs.keyFor(a), ask = false).first
+            val (code, exp) = Ygg.probeAccess(a, prefs.keyFor(a), ask = false)
+            prefs.noteAccess(a, code, exp)
             if (!alive()) throw InterruptedException()
             if (code == "ok") { server = a; break }
             say("$a: ${Ygg.accessText(code)}", Mark.INFO)
