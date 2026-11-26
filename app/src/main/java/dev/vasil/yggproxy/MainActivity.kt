@@ -78,6 +78,8 @@ class MainActivity : Activity() {
     private lateinit var etLimClientDown: EditText
     private lateinit var etLimClientUp: EditText
     private lateinit var tvClients: TextView
+    private lateinit var clientsBox: LinearLayout
+    private val clientRows = HashMap<String, TextView>()
     private val clientPrev = HashMap<String, LongArray>() // addr -> (tx, rx, at ms)
     private lateinit var cbLan: CheckBox
     private lateinit var cbPeer: CheckBox
@@ -387,7 +389,9 @@ class MainActivity : Activity() {
         addView(row(etLimClientDown, etLimClientUp))
         addView(smallButton(tr("Применить ограничения")) { applyLimits() })
         addView(h2(tr("Клиенты")))
+        addView(note(tr("Нажмите на клиента — написать ему.")))
         tvClients = mono("—").also { addView(it) }
+        clientsBox = LinearLayout(this@MainActivity).apply { orientation = LinearLayout.VERTICAL }.also { addView(it) }
         cbLan = check(tr("Разрешить клиентам доступ в мою LAN"), prefs.allowLan).also { addView(it) }
         cbPeer = check(tr("Принимать пиров: клиенты подключаются к серверу напрямую (TCP)"), prefs.listenPort > 0).also { addView(it) }
         etPeerPort = edit(tr("порт (%1\$s)", Ygg.PEER_PORT), if (prefs.listenPort > 0) prefs.listenPort.toString() else "", number = true).also { addView(it) }
@@ -937,6 +941,7 @@ class MainActivity : Activity() {
         if (!bound) items += tr("Показать QR-код") to { qrKeyId = id; renderButtons() }
         if (!bound) items += tr("Поделиться ссылкой") to { shareKey(k) }
         items += tr("Продлить на %1\$s дн. от сегодня", k.optInt("days")) to { accessOp(tr("Ключ продлён"), "renew", id) }
+        if (bound) items += tr("Написать") to { val a = k.optString("addr"); openOwnerChat(a, clientName(a) ?: a) }
         if (bound) items += tr("Отвязать от устройства") to { accessOp(tr("Ключ отвязан: им сможет войти новое устройство"), "unbind", id) }
         items += tr("Удалить (доступ сразу закрыт)") to { accessOp(tr("Ключ удалён"), "revoke", id) }
         AlertDialog.Builder(this).setTitle(tr("Ключ %1\$s", k.optString("name").ifEmpty { id }))
@@ -951,7 +956,7 @@ class MainActivity : Activity() {
                 r.optString("message").takeIf { it.isNotEmpty() }?.let { "\n\n«$it»" }.orEmpty())
             .setPositiveButton(tr("Одобрить на %1\$s дн.", days)) { _, _ -> accessOp(tr("Доступ одобрен"), "approve", addr, days.toString()) }
             .setNegativeButton(tr("Отклонить")) { _, _ -> accessOp(tr("Запрос отклонён — устройство получит уведомление"), "deny", addr) }
-            .setNeutralButton(tr("Отмена"), null).show()
+            .setNeutralButton(tr("Написать")) { _, _ -> openOwnerChat(addr, r.optString("name").ifEmpty { addr }) }.show()
     }
 
     private fun publicDialog() {
@@ -1140,18 +1145,49 @@ class MainActivity : Activity() {
 
     /** Exit clients seen in the last 10 s, with their current rate. */
     private fun renderClients() {
-        if (!prefs.serverEnabled) { tvClients.text = tr("сервер выключен"); return }
         val now = System.currentTimeMillis()
-        val rows = State.clients.entries.filter { now - it.value[3] < 10_000 }.sortedByDescending { it.value[1] + it.value[2] }
-        if (rows.isEmpty()) { tvClients.text = tr("нет подключённых клиентов"); return }
-        tvClients.text = rows.joinToString("\n") { (addr, v) ->
+        val rows = if (prefs.serverEnabled) State.clients.entries.filter { now - it.value[3] < 10_000 }.sortedByDescending { it.value[1] + it.value[2] } else emptyList()
+        tvClients.text = if (!prefs.serverEnabled) tr("сервер выключен") else tr("нет подключённых клиентов")
+        tvClients.visibility = if (rows.isEmpty()) View.VISIBLE else View.GONE
+        // Rows kept by address (rebuilt only when the set changes), so a tap is not lost to a refresh.
+        val addrs = rows.map { it.key }
+        if (addrs.toSet() != clientRows.keys) {
+            clientsBox.removeAllViews(); clientRows.clear()
+            for (addr in addrs) clientRows[addr] = mono("").apply {
+                setTextIsSelectable(false)
+                setBackgroundResource(android.R.drawable.list_selector_background)
+                setPadding(dp(4), dp(8), dp(4), dp(8))
+                setOnClickListener { clientMenu(addr) }
+            }.also { clientsBox.addView(it) }
+        }
+        for ((addr, v) in rows) {
             val prev = clientPrev[addr]
             val dt = if (prev != null) (v[3] - prev[2]).coerceAtLeast(1) else 0
             val down = if (prev != null && dt > 0) (v[1] - prev[0]) * 1000 / dt else 0
             val up = if (prev != null && dt > 0) (v[2] - prev[1]) * 1000 / dt else 0
             if (prev == null || prev[2] != v[3]) clientPrev[addr] = longArrayOf(v[1], v[2], v[3])
-            tr("%1\$s\n  соединений %2\$s · ↓ %3\$s ↑ %4\$s · всего ↓ %5\$s ↑ %6\$s", addr, v[0], Ygg.mbit(down.coerceAtLeast(0)), Ygg.mbit(up.coerceAtLeast(0)), Ygg.human(v[1]), Ygg.human(v[2]))
+            val name = clientName(addr)?.let { "$it\n" }.orEmpty()
+            clientRows[addr]?.text = name + tr("%1\$s\n  соединений %2\$s · ↓ %3\$s ↑ %4\$s · всего ↓ %5\$s ↑ %6\$s", addr, v[0], Ygg.mbit(down.coerceAtLeast(0)), Ygg.mbit(up.coerceAtLeast(0)), Ygg.human(v[1]), Ygg.human(v[2]))
         }
+    }
+
+    /** A client's name from its key (name — device) or its access request; null if unknown. */
+    private fun clientName(addr: String): String? {
+        keyList().firstOrNull { it.optString("addr") == addr }?.let { k ->
+            return listOf(k.optString("name"), k.optString("device")).filter { it.isNotEmpty() }.distinct().joinToString(" — ").ifEmpty { null }
+        }
+        val reqs = lastAccess?.optJSONArray("requests") ?: return null
+        for (i in 0 until reqs.length()) reqs.getJSONObject(i).let { if (it.optString("addr") == addr) return it.optString("name").ifEmpty { null } }
+        return null
+    }
+
+    /** A connected client was tapped. */
+    private fun clientMenu(addr: String) {
+        val name = clientName(addr)
+        AlertDialog.Builder(this).setTitle(name ?: tr("Клиент"))
+            .setMessage(addr)
+            .setPositiveButton(tr("Написать")) { _, _ -> openOwnerChat(addr, name ?: addr) }
+            .setNegativeButton(tr("Закрыть"), null).show()
     }
 
     private fun renderStatus() {

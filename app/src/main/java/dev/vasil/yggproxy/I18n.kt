@@ -190,6 +190,7 @@ object I18n {
         "Клиент ↔ сервер выхода через Yggdrasil, без интернета: 10 с приём, затем 10 с отдача." to "Client ↔ exit server over Yggdrasil, without the internet: 10 s download, then 10 s upload.",
         "Клиент: менять пиров, пока пинг до сервера выше, мс (10–5000)" to "Client: change peers while the ping to the server is above, ms (10–5000)",
         "Клиенты" to "Clients",
+        "Нажмите на клиента — написать ему." to "Tap a client to message them.",
         "Ключ %1\$s" to "Key %1\$s",
         "Ключ для %1\$s сохранён — нажмите «Подключиться»" to "Key for %1\$s saved — tap \"Connect\"",
         "Ключ доступа" to "Access key",
